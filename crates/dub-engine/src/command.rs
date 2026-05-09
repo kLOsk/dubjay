@@ -20,13 +20,14 @@ use std::sync::Arc;
 use dub_io::Track;
 
 /// One mutation request to the engine. Variants name the deck index where
-/// applicable; transport-wide commands use no index.
+/// applicable; engine-wide commands use no index.
 ///
 /// Field naming is uniform across variants: `idx` is the deck index,
 /// other fields name the property being set.
-// All v1 commands target a deck. Engine-wide commands (master gain etc.)
-// will land later and use a different prefix; the `Deck` prefix here is
-// load-bearing namespacing, not redundancy.
+//
+// `Deck` prefix on per-deck variants is load-bearing namespacing
+// (engine-wide commands such as `SetMasterGain` distinguish themselves
+// by *not* having it). Allow the `enum_variant_names` lint accordingly.
 #[allow(missing_docs, clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -52,6 +53,12 @@ pub enum Command {
     /// dropping the previous `Arc` — that goes back through the trash
     /// channel.
     DeckLoad { idx: u8, source: Arc<Track> },
+
+    /// Set the engine-wide master gain applied after deck summing in the
+    /// debug internal mixer. `1.0` = unity. PRD §5.3 calls for this only
+    /// in the debug/internal mixer mode; external-mixer mode (M5+) bypasses
+    /// the master and routes each deck to its own output pair raw.
+    SetMasterGain { gain: f32 },
 }
 
 #[cfg(test)]

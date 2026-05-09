@@ -65,21 +65,33 @@ fn print_help() {
     eprintln!("  rt-audit          stress the render path under assert_no_alloc");
     eprintln!("  version           print versions");
     eprintln!("  measure-latency   query the default output device for SR + buffer + latency");
-    eprintln!("  play <input>      [--realtime] [-o <output>] [--rate R] [--gain G]");
-    eprintln!("                    [--sr SR] [--block-size N] [--duration SECS]");
-    eprintln!("                    [--buffer-size FRAMES]");
-    eprintln!("                    [--pause-at SECS] [--resume-at SECS]");
-    eprintln!("                    [--seek-at WALL=POS_SECS]");
-    eprintln!("                    [--hot-swap-at WALL=PATH_TO_TRACK]");
+    eprintln!("  play <deck-a> [<deck-b>]");
+    eprintln!("                    [--realtime] [-o <output>] [--sr SR] [--block-size N]");
+    eprintln!("                    [--duration SECS] [--buffer-size FRAMES]");
+    eprintln!("                    [--master-gain G] [--master-gain-at WALL=G]");
+    eprintln!("                    [--rate R] [--gain G]                  (deck A defaults)");
+    eprintln!("                    [--pause-at SECS] [--resume-at SECS]   (deck A)");
+    eprintln!("                    [--seek-at WALL=POS_SECS]              (deck A)");
+    eprintln!("                    [--hot-swap-at WALL=PATH]              (deck A)");
+    eprintln!("                    [--deck-b-rate R] [--deck-b-gain G]");
+    eprintln!("                    [--deck-b-pause-at SECS] [--deck-b-resume-at SECS]");
+    eprintln!("                    [--deck-b-seek-at WALL=POS_SECS]");
+    eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
     eprintln!();
-    eprintln!("  play (offline, default): render to a 32-bit float WAV through the engine.");
+    eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
-    eprintln!("    --pause-at, --resume-at, --seek-at, --hot-swap-at drive the engine's");
-    eprintln!("    lock-free command channel from the main thread (M2/M3 transport).");
-    eprintln!("    All four flags work in BOTH offline and realtime modes — offline uses");
-    eprintln!("    virtual wall-clock derived from rendered frames so results are fully");
-    eprintln!("    deterministic and analyzable via `dub analyze`.");
+    eprintln!();
+    eprintln!("    Two-deck (M4): the second positional argument loads onto deck B (engine");
+    eprintln!("    deck 1) and is summed with deck A through the debug internal mixer.");
+    eprintln!("    --master-gain scales the summed bus; --master-gain-at WALL=G schedules");
+    eprintln!("    a master-gain change. Per-deck transport flags use the --deck-b- prefix");
+    eprintln!("    for deck B; bare flags target deck A for backward compat with single-deck");
+    eprintln!("    usage.");
+    eprintln!();
+    eprintln!("    Scheduled events (--*-at) work in BOTH offline and realtime modes —");
+    eprintln!("    offline uses a virtual wall-clock derived from rendered frames so results");
+    eprintln!("    are fully deterministic and analyzable via `dub analyze`.");
     eprintln!();
     eprintln!("  analyze: read a 32-bit float WAV (e.g. `dub play -o ...`) and report");
     eprintln!("    peak/RMS/DC, clipping count, max per-sample first-difference per");
@@ -183,89 +195,179 @@ fn measure_latency() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct PlayOpts {
+/// Per-deck CLI options. Two of these live inside [`PlayOpts`] — one
+/// for deck A (engine deck 0) and one for deck B (engine deck 1).
+///
+/// Backward-compat: the bare `--rate`, `--gain`, `--pause-at`,
+/// `--resume-at`, `--seek-at`, `--hot-swap-at` flags target deck A
+/// (matches the single-deck CLI shipped through M3.5). The deck-B
+/// equivalents use the `--deck-b-*` prefix.
+#[derive(Debug, Clone, Default)]
+struct DeckOpts {
     input: Option<PathBuf>,
+    rate: Option<f64>,
+    gain: Option<f32>,
+    pause_at: Option<f64>,
+    resume_at: Option<f64>,
+    seek_at: Option<(f64, f64)>,
+    hot_swap_at: Option<(f64, PathBuf)>,
+}
+
+impl DeckOpts {
+    fn rate_or(&self, default: f64) -> f64 {
+        self.rate.unwrap_or(default)
+    }
+    fn gain_or(&self, default: f32) -> f32 {
+        self.gain.unwrap_or(default)
+    }
+}
+
+struct PlayOpts {
+    deck_a: DeckOpts,
+    deck_b: DeckOpts,
     output: Option<PathBuf>,
-    rate: f64,
-    gain: f32,
     engine_sr: Option<f32>,
     block_size: usize,
     realtime: bool,
     duration: Option<f64>,
     buffer_size: Option<u32>,
-    /// Wall-clock seconds (since playback start) at which to send a
-    /// pause command. M2 demo for the lock-free command channel.
-    pause_at: Option<f64>,
-    /// Wall-clock seconds at which to send a play (resume) command.
-    resume_at: Option<f64>,
-    /// `WALL=POS` — at `WALL` wall-clock seconds, seek deck 0 to `POS`
-    /// track-seconds. M2 demo of the seek command.
-    seek_at: Option<(f64, f64)>,
-    /// `WALL=PATH` — at `WALL` wall-clock seconds, hot-load `PATH` onto
-    /// deck 0 via the lock-free command channel. M3 demo.
-    hot_swap_at: Option<(f64, PathBuf)>,
+    /// Initial master gain on the debug internal mixer. M4 addition.
+    master_gain: f32,
+    /// `WALL=G` — schedule a master-gain change at `WALL` seconds.
+    master_gain_at: Option<(f64, f32)>,
 }
 
 impl Default for PlayOpts {
     fn default() -> Self {
         Self {
-            input: None,
+            deck_a: DeckOpts::default(),
+            deck_b: DeckOpts::default(),
             output: None,
-            rate: 1.0,
-            gain: 1.0,
             engine_sr: None,
             block_size: 64,
             realtime: false,
             duration: None,
             buffer_size: None,
-            pause_at: None,
-            resume_at: None,
-            seek_at: None,
-            hot_swap_at: None,
+            master_gain: 1.0,
+            master_gain_at: None,
         }
     }
+}
+
+/// Read the next argument's string value, with a clearer error than
+/// `args.get(i+1).ok_or_else(...)` repeated everywhere.
+fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str> {
+    args.get(i + 1)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("{flag} expects a value"))
+}
+
+/// Parse a `WALL=VAL` pair where VAL is parsed by `f`.
+fn parse_wall_eq<T, F>(s: &str, flag: &str, f: F) -> Result<(f64, T)>
+where
+    F: FnOnce(&str) -> Result<T>,
+{
+    let (wall, val) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow!("{flag} expects WALL=VALUE, got {s}"))?;
+    let wall: f64 = wall
+        .parse()
+        .with_context(|| format!("{flag} WALL not a number"))?;
+    let val = f(val)?;
+    Ok((wall, val))
+}
+
+/// Apply a per-deck flag to the right [`DeckOpts`] based on whether the
+/// flag was prefixed with `--deck-b-`. Returns `Ok(true)` if the flag
+/// was recognized and consumed (caller should advance `i`); `Ok(false)`
+/// if it's a non-deck flag the caller should fall through to handle.
+fn parse_deck_flag(
+    deck: &mut DeckOpts,
+    args: &[String],
+    i: usize,
+    raw: &str,
+    suffix: &str,
+) -> Result<bool> {
+    match suffix {
+        "rate" => {
+            let v = next_value(args, i, raw)?;
+            deck.rate = Some(v.parse().with_context(|| format!("{raw} not a number"))?);
+        }
+        "gain" => {
+            let v = next_value(args, i, raw)?;
+            deck.gain = Some(v.parse().with_context(|| format!("{raw} not a number"))?);
+        }
+        "pause-at" => {
+            let v = next_value(args, i, raw)?;
+            deck.pause_at = Some(v.parse().with_context(|| format!("{raw} not a number"))?);
+        }
+        "resume-at" => {
+            let v = next_value(args, i, raw)?;
+            deck.resume_at = Some(v.parse().with_context(|| format!("{raw} not a number"))?);
+        }
+        "seek-at" => {
+            let v = next_value(args, i, raw)?;
+            let (wall, pos) = parse_wall_eq(v, raw, |s| {
+                s.parse::<f64>()
+                    .with_context(|| format!("{raw} POS not a number"))
+            })?;
+            deck.seek_at = Some((wall, pos));
+        }
+        "hot-swap-at" => {
+            let v = next_value(args, i, raw)?;
+            let (wall, path) = parse_wall_eq(v, raw, |s| Ok(PathBuf::from(s)))?;
+            deck.hot_swap_at = Some((wall, path));
+        }
+        "input" => {
+            let v = next_value(args, i, raw)?;
+            deck.input = Some(PathBuf::from(v));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 impl PlayOpts {
     fn parse(args: &[String]) -> Result<Self> {
         let mut opts = Self::default();
+        let mut positional: Vec<&str> = Vec::new();
         let mut i = 0;
         while i < args.len() {
-            match args[i].as_str() {
+            let raw = args[i].as_str();
+            // Deck-B namespaced flags first (otherwise --deck-b-rate
+            // would match nothing and we'd fall through to "unknown").
+            if let Some(suffix) = raw.strip_prefix("--deck-b-") {
+                if parse_deck_flag(&mut opts.deck_b, args, i, raw, suffix)? {
+                    i += 2;
+                    continue;
+                }
+            }
+            // Deck-A namespaced flags (explicit). Optional — bare flags
+            // below also target deck A.
+            if let Some(suffix) = raw.strip_prefix("--deck-a-") {
+                if parse_deck_flag(&mut opts.deck_a, args, i, raw, suffix)? {
+                    i += 2;
+                    continue;
+                }
+            }
+            // Bare flags — engine-wide AND deck-A backward-compat.
+            match raw {
                 "-o" | "--output" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--output expects a value"))?;
-                    opts.output = Some(PathBuf::from(v));
-                    i += 2;
-                }
-                "--rate" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--rate expects a value"))?;
-                    opts.rate = v.parse().context("--rate not a number")?;
-                    i += 2;
-                }
-                "--gain" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--gain expects a value"))?;
-                    opts.gain = v.parse().context("--gain not a number")?;
+                    opts.output = Some(PathBuf::from(next_value(args, i, raw)?));
                     i += 2;
                 }
                 "--sr" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--sr expects a value"))?;
-                    opts.engine_sr = Some(v.parse().context("--sr not a number")?);
+                    opts.engine_sr = Some(
+                        next_value(args, i, raw)?
+                            .parse()
+                            .context("--sr not a number")?,
+                    );
                     i += 2;
                 }
                 "--block-size" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--block-size expects a value"))?;
-                    opts.block_size = v.parse().context("--block-size not a number")?;
+                    opts.block_size = next_value(args, i, raw)?
+                        .parse()
+                        .context("--block-size not a number")?;
                     i += 2;
                 }
                 "--realtime" | "--live" => {
@@ -273,68 +375,72 @@ impl PlayOpts {
                     i += 1;
                 }
                 "--duration" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--duration expects seconds"))?;
-                    opts.duration = Some(v.parse().context("--duration not a number")?);
+                    opts.duration = Some(
+                        next_value(args, i, raw)?
+                            .parse()
+                            .context("--duration not a number")?,
+                    );
                     i += 2;
                 }
                 "--buffer-size" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--buffer-size expects frames"))?;
-                    opts.buffer_size = Some(v.parse().context("--buffer-size not an integer")?);
+                    opts.buffer_size = Some(
+                        next_value(args, i, raw)?
+                            .parse()
+                            .context("--buffer-size not a number")?,
+                    );
                     i += 2;
                 }
-                "--pause-at" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--pause-at expects seconds"))?;
-                    opts.pause_at = Some(v.parse().context("--pause-at not a number")?);
+                "--master-gain" => {
+                    opts.master_gain = next_value(args, i, raw)?
+                        .parse()
+                        .context("--master-gain not a number")?;
                     i += 2;
                 }
-                "--resume-at" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--resume-at expects seconds"))?;
-                    opts.resume_at = Some(v.parse().context("--resume-at not a number")?);
+                "--master-gain-at" => {
+                    let v = next_value(args, i, raw)?;
+                    let (wall, gain) = parse_wall_eq(v, raw, |s| {
+                        s.parse::<f32>().context("--master-gain-at G not a number")
+                    })?;
+                    opts.master_gain_at = Some((wall, gain));
                     i += 2;
                 }
-                "--seek-at" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--seek-at expects WALL=POS in seconds"))?;
-                    let (wall, pos) = v
-                        .split_once('=')
-                        .ok_or_else(|| anyhow!("--seek-at expects WALL=POS, got {v}"))?;
-                    let wall: f64 = wall.parse().context("--seek-at WALL not a number")?;
-                    let pos: f64 = pos.parse().context("--seek-at POS not a number")?;
-                    opts.seek_at = Some((wall, pos));
-                    i += 2;
-                }
-                "--hot-swap-at" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("--hot-swap-at expects WALL=PATH"))?;
-                    let (wall, path) = v
-                        .split_once('=')
-                        .ok_or_else(|| anyhow!("--hot-swap-at expects WALL=PATH, got {v}"))?;
-                    let wall: f64 = wall.parse().context("--hot-swap-at WALL not a number")?;
-                    opts.hot_swap_at = Some((wall, PathBuf::from(path)));
+                // Bare --rate / --gain / --pause-at / etc. → deck A.
+                bare if bare.starts_with("--")
+                    && parse_deck_flag(
+                        &mut opts.deck_a,
+                        args,
+                        i,
+                        bare,
+                        bare.trim_start_matches("--"),
+                    )? =>
+                {
                     i += 2;
                 }
                 s if s.starts_with('-') => {
                     return Err(anyhow!("unknown flag: {s}"));
                 }
                 _ => {
-                    if opts.input.is_none() {
-                        opts.input = Some(PathBuf::from(&args[i]));
-                    } else {
-                        return Err(anyhow!("unexpected positional arg: {}", args[i]));
-                    }
+                    positional.push(raw);
                     i += 1;
                 }
             }
+        }
+        // Up to two positional args: first → deck A input, second → deck B.
+        if let Some(first) = positional.first() {
+            if opts.deck_a.input.is_none() {
+                opts.deck_a.input = Some(PathBuf::from(first));
+            }
+        }
+        if let Some(second) = positional.get(1) {
+            if opts.deck_b.input.is_none() {
+                opts.deck_b.input = Some(PathBuf::from(second));
+            }
+        }
+        if positional.len() > 2 {
+            return Err(anyhow!(
+                "too many positional args: {} (expected at most 2: <deck-a> [<deck-b>])",
+                positional.len()
+            ));
         }
         Ok(opts)
     }
@@ -383,67 +489,104 @@ fn analyze_cmd(args: &[String]) -> Result<()> {
     analyze::run(&input, threshold)
 }
 
+/// One loaded deck ready to be configured into the engine.
+struct LoadedDeck {
+    /// Engine deck index this maps to (0 for A, 1 for B).
+    idx: usize,
+    track: std::sync::Arc<Track>,
+    rate: f64,
+    gain: f32,
+}
+
 fn play(args: &[String]) -> Result<()> {
     let opts = PlayOpts::parse(args)?;
-    let input = opts
-        .input
-        .clone()
-        .ok_or_else(|| anyhow!("usage: dub play <input> [--realtime] [-o <output>] ..."))?;
+    if opts.deck_a.input.is_none() {
+        return Err(anyhow!(
+            "usage: dub play <deck-a> [<deck-b>] [--realtime] [-o <output>] ..."
+        ));
+    }
 
-    let track = Track::load_from_path(&input).context("loading input")?;
-    println!(
-        "track loaded: {} frames @ {} Hz, {} ch ({:.3} s)",
-        track.frames(),
-        track.sample_rate(),
-        track.channels(),
-        track.duration_seconds()
-    );
+    // Load each deck's track off the audio thread.
+    let mut decks: Vec<LoadedDeck> = Vec::new();
+    for (idx, deck_opts, label) in [
+        (0usize, &opts.deck_a, "deck A"),
+        (1usize, &opts.deck_b, "deck B"),
+    ] {
+        let Some(input) = &deck_opts.input else {
+            continue;
+        };
+        let track =
+            Track::load_from_path(input).with_context(|| format!("loading {label} input"))?;
+        println!(
+            "{label} loaded: {} frames @ {} Hz, {} ch ({:.3} s)  [{}]",
+            track.frames(),
+            track.sample_rate(),
+            track.channels(),
+            track.duration_seconds(),
+            input.display()
+        );
+        decks.push(LoadedDeck {
+            idx,
+            track: std::sync::Arc::new(track),
+            rate: deck_opts.rate_or(1.0),
+            gain: deck_opts.gain_or(1.0),
+        });
+    }
 
     if opts.realtime {
-        play_realtime(track, &opts)
+        play_realtime(decks, &opts)
     } else {
-        play_offline(&input, track, &opts)
+        play_offline(decks, &opts)
     }
 }
 
-/// Pre-load deck 0 with `track`, set rate/gain/start-position, and
+/// Pre-load each deck with its track, set rate/gain/start-position, and
 /// mark it playing. Used after both `Engine::new` and
 /// `Engine::new_with_handle` so behavior is identical between offline
 /// and realtime paths.
-fn configure_deck0(engine: &mut Engine, track: &std::sync::Arc<Track>, opts: &PlayOpts) {
-    engine.deck_mut(0).set_source(track.clone());
-    engine.deck_mut(0).set_gain(opts.gain);
-    engine.deck_mut(0).set_rate(opts.rate);
-    engine.deck_mut(0).set_playing(true);
-    if opts.rate < 0.0 {
-        #[allow(clippy::cast_precision_loss)]
-        let last = (track.frames().saturating_sub(1)) as f64;
-        engine.deck_mut(0).set_position_frames(last);
+fn configure_decks(engine: &mut Engine, decks: &[LoadedDeck], master_gain: f32) {
+    engine.set_master_gain(master_gain);
+    for d in decks {
+        let deck = engine.deck_mut(d.idx);
+        deck.set_source(d.track.clone());
+        deck.set_gain(d.gain);
+        deck.set_rate(d.rate);
+        deck.set_playing(true);
+        if d.rate < 0.0 {
+            #[allow(clippy::cast_precision_loss)]
+            let last = (d.track.frames().saturating_sub(1)) as f64;
+            deck.set_position_frames(last);
+        }
     }
 }
 
-/// Build an engine + deck-0 pre-loaded with `track`, paired with an
+/// Build an engine + decks pre-loaded with `decks`, paired with an
 /// [`EngineHandle`] for transport commands. Used by both the offline
 /// renderer and the realtime CoreAudio player so the same scheduled
-/// events can be applied through either path with bit-identical engine
+/// events apply through either path with bit-identical engine
 /// behavior — only the wall-clock timing differs.
 fn build_configured_engine_with_handle(
-    track: Track,
+    decks: &[LoadedDeck],
     engine_sr: f32,
     block_size: usize,
     opts: &PlayOpts,
-) -> (Engine, EngineHandle, std::sync::Arc<Track>) {
-    let track = std::sync::Arc::new(track);
+) -> (Engine, EngineHandle) {
     let (mut engine, handle) = Engine::new_with_handle(engine_sr, block_size);
-    configure_deck0(&mut engine, &track, opts);
-    (engine, handle, track)
+    configure_decks(&mut engine, decks, opts.master_gain);
+    (engine, handle)
 }
 
-fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
+fn play_offline(decks: Vec<LoadedDeck>, opts: &PlayOpts) -> Result<()> {
+    let primary_input = opts
+        .deck_a
+        .input
+        .as_deref()
+        .or(opts.deck_b.input.as_deref())
+        .ok_or_else(|| anyhow!("no input"))?;
     let output = opts
         .output
         .clone()
-        .unwrap_or_else(|| default_output_path(input));
+        .unwrap_or_else(|| default_output_path(primary_input));
     let engine_sr = opts.engine_sr.unwrap_or(48_000.0);
     let engine_sr_f = f64::from(engine_sr);
 
@@ -451,14 +594,24 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
     println!("  output:     {}", output.display());
     println!("  engine SR:  {engine_sr} Hz");
     println!("  block size: {} frames", opts.block_size);
-    println!("  rate:       {}", opts.rate);
-    println!("  gain:       {}", opts.gain);
+    println!("  master gain: {}", opts.master_gain);
+    for d in &decks {
+        let label = if d.idx == 0 { "deck A" } else { "deck B" };
+        println!("  {label}: rate={} gain={}", d.rate, d.gain);
+    }
 
-    let track_sr = f64::from(track.sample_rate());
-    let track_frames = track.frames();
-    let abs_rate = opts.rate.abs().max(1e-12);
-    #[allow(clippy::cast_precision_loss)]
-    let natural_secs = (track_frames as f64) / track_sr / abs_rate;
+    // Render duration: longest natural duration across loaded decks (each
+    // deck is at its own track-SR with its own rate), or --duration if set.
+    // M4 deviation from the single-deck CLI: we can't preserve "natural
+    // length of THE track" because there are now two; deck A wins as a
+    // backwards-compatible default unless --duration is specified.
+    let primary_deck = decks.iter().find(|d| d.idx == 0).or_else(|| decks.first());
+    let natural_secs = primary_deck.map_or(0.0, |d| {
+        let track_sr = f64::from(d.track.sample_rate());
+        let abs_rate = d.rate.abs().max(1e-12);
+        #[allow(clippy::cast_precision_loss)]
+        ((d.track.frames() as f64) / track_sr / abs_rate)
+    });
     let play_secs = opts.duration.unwrap_or(natural_secs);
 
     // Use the same Engine/EngineHandle pattern as `play_realtime` so the
@@ -467,11 +620,10 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
     // a hot-swap scenario through `play_offline` then through
     // `dub analyze` should reveal any sample-discontinuity that the
     // realtime path produced, since the engine code path is identical.
-    let (mut engine, mut handle, _track_arc) =
-        build_configured_engine_with_handle(track, engine_sr, opts.block_size, opts);
+    let (mut engine, mut handle) =
+        build_configured_engine_with_handle(&decks, engine_sr, opts.block_size, opts);
 
-    #[allow(clippy::cast_possible_truncation)]
-    let schedule = build_transport_schedule(opts, play_secs, track_sr as f32)?;
+    let schedule = build_transport_schedule(opts, play_secs, &decks)?;
     if !schedule.is_empty() {
         println!("  schedule:");
         for ev in &schedule {
@@ -512,12 +664,18 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
                 let ev = sched_iter.next().expect("peeked Some");
                 let wall = ev.wall_secs();
                 let label = ev.describe();
+                let target_idx = ev.deck_idx();
                 ev.fire(&mut handle)?;
-                let snap = handle.deck_state(0).unwrap();
-                println!(
-                    "    @{wall:.3}s applied {label:<22} | pos={:.1}fr playing={}",
-                    snap.position_frames, snap.is_playing
-                );
+                if let Some(idx) = target_idx {
+                    let snap = handle.deck_state(idx).unwrap();
+                    let dlabel = if idx == 0 { "A" } else { "B" };
+                    println!(
+                        "    @{wall:.3}s applied {label:<24} | deck {dlabel} pos={:.1}fr playing={}",
+                        snap.position_frames, snap.is_playing
+                    );
+                } else {
+                    println!("    @{wall:.3}s applied {label}");
+                }
             } else {
                 break;
             }
@@ -560,7 +718,7 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
     Ok(())
 }
 
-fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
+fn play_realtime(decks: Vec<LoadedDeck>, opts: &PlayOpts) -> Result<()> {
     use std::thread;
     use std::time::Duration;
 
@@ -584,18 +742,23 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     if let Some(req) = opts.buffer_size {
         println!("  buffer (req): {req} frames");
     }
-    println!("  rate:         {}", opts.rate);
-    println!("  gain:         {}", opts.gain);
+    println!("  master gain:  {}", opts.master_gain);
+    for d in &decks {
+        let label = if d.idx == 0 { "deck A" } else { "deck B" };
+        println!("  {label}: rate={} gain={}", d.rate, d.gain);
+    }
 
-    let track_sr = f64::from(track.sample_rate());
-    let track_frames = track.frames();
-    let abs_rate = opts.rate.abs().max(1e-12);
-    #[allow(clippy::cast_precision_loss)]
-    let natural_secs = (track_frames as f64) / track_sr / abs_rate;
+    let primary_deck = decks.iter().find(|d| d.idx == 0).or_else(|| decks.first());
+    let natural_secs = primary_deck.map_or(0.0, |d| {
+        let track_sr = f64::from(d.track.sample_rate());
+        let abs_rate = d.rate.abs().max(1e-12);
+        #[allow(clippy::cast_precision_loss)]
+        ((d.track.frames() as f64) / track_sr / abs_rate)
+    });
     let play_secs = opts.duration.unwrap_or(natural_secs);
 
-    let (engine, mut handle, _track_arc) =
-        build_configured_engine_with_handle(track, engine_sr, opts.block_size, opts);
+    let (engine, mut handle) =
+        build_configured_engine_with_handle(&decks, engine_sr, opts.block_size, opts);
 
     println!("  playing:      {play_secs:.3} s");
 
@@ -603,8 +766,7 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     // and then fired in order from this (main) thread. Each fire is a
     // single ringbuf push; the audio thread observes the change at the
     // start of its next render block (≤ buffer-size latency later).
-    #[allow(clippy::cast_possible_truncation)]
-    let schedule = build_transport_schedule(opts, play_secs, track_sr as f32)?;
+    let schedule = build_transport_schedule(opts, play_secs, &decks)?;
     if !schedule.is_empty() {
         println!("  schedule:");
         for ev in &schedule {
@@ -628,12 +790,18 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
         thread::sleep(Duration::from_secs_f64(dt));
         let wall = ev.wall_secs();
         let label = ev.describe();
+        let target_idx = ev.deck_idx();
         ev.fire(&mut handle)?;
-        let snap = handle.deck_state(0).unwrap();
-        println!(
-            "    @{wall:.3}s applied {label:<22} | pos={:.1}fr playing={}",
-            snap.position_frames, snap.is_playing
-        );
+        if let Some(idx) = target_idx {
+            let snap = handle.deck_state(idx).unwrap();
+            let dlabel = if idx == 0 { "A" } else { "B" };
+            println!(
+                "    @{wall:.3}s applied {label:<24} | deck {dlabel} pos={:.1}fr playing={}",
+                snap.position_frames, snap.is_playing
+            );
+        } else {
+            println!("    @{wall:.3}s applied {label}");
+        }
         last_wall = wall;
     }
     let remaining = (play_secs - last_wall).max(0.0);
@@ -641,7 +809,8 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
 
     let elapsed = start.elapsed();
     let cb_count = output.callback_count();
-    let final_snap = handle.deck_state(0).unwrap();
+    let snap_a = handle.deck_state(0).unwrap();
+    let snap_b = handle.deck_state(1).unwrap();
     let reclaimed = handle.reclaim();
     let overflow = handle.trash_overflow_count();
     drop(output);
@@ -651,8 +820,12 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
         elapsed.as_secs_f64()
     );
     println!(
-        "  final state:  pos={:.1}fr playing={} at_end={}",
-        final_snap.position_frames, final_snap.is_playing, final_snap.at_end
+        "  deck A final: pos={:.1}fr playing={} at_end={}",
+        snap_a.position_frames, snap_a.is_playing, snap_a.at_end
+    );
+    println!(
+        "  deck B final: pos={:.1}fr playing={} at_end={}",
+        snap_b.position_frames, snap_b.is_playing, snap_b.at_end
     );
     if reclaimed > 0 || overflow > 0 {
         println!("  trash:        reclaimed={reclaimed} overflow={overflow}");
@@ -673,105 +846,170 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
 /// One transport event scheduled to fire from the main thread at a given
 /// wall-clock offset since playback start.
 ///
-/// `HotSwap` carries an `Arc<Track>` (the new track to load), so the enum
-/// itself is not `Copy`. The list is consumed by value when fired so the
-/// Arc moves into the load command without being cloned.
+/// Most variants name a target deck via `deck` (0 = A, 1 = B). The
+/// engine-wide `SetMasterGain` variant has no deck since the debug
+/// internal mixer's master applies to the whole summed bus.
+///
+/// `HotSwap` carries an `Arc<Track>`, so the enum itself is not `Copy`.
+/// The list is consumed by value when fired so the Arc moves into the
+/// load command without being cloned.
 #[derive(Debug)]
 enum ScheduledEvent {
     Pause {
         wall_secs: f64,
+        deck: u8,
     },
     Resume {
         wall_secs: f64,
+        deck: u8,
     },
     Seek {
         wall_secs: f64,
+        deck: u8,
         pos_frames: f64,
     },
     HotSwap {
         wall_secs: f64,
+        deck: u8,
         source: std::sync::Arc<Track>,
         path: PathBuf,
+    },
+    /// Engine-wide master gain change on the debug internal mixer.
+    SetMasterGain {
+        wall_secs: f64,
+        gain: f32,
     },
 }
 
 impl ScheduledEvent {
     fn wall_secs(&self) -> f64 {
         match self {
-            Self::Pause { wall_secs }
-            | Self::Resume { wall_secs }
+            Self::Pause { wall_secs, .. }
+            | Self::Resume { wall_secs, .. }
             | Self::Seek { wall_secs, .. }
-            | Self::HotSwap { wall_secs, .. } => *wall_secs,
+            | Self::HotSwap { wall_secs, .. }
+            | Self::SetMasterGain { wall_secs, .. } => *wall_secs,
+        }
+    }
+
+    /// Index of the deck this event targets, or `None` for engine-wide
+    /// events (e.g. master gain).
+    fn deck_idx(&self) -> Option<usize> {
+        match self {
+            Self::Pause { deck, .. }
+            | Self::Resume { deck, .. }
+            | Self::Seek { deck, .. }
+            | Self::HotSwap { deck, .. } => Some(*deck as usize),
+            Self::SetMasterGain { .. } => None,
         }
     }
 
     fn describe(&self) -> String {
+        let dlabel = |d: u8| if d == 0 { 'A' } else { 'B' };
         match self {
-            Self::Pause { .. } => "pause".to_string(),
-            Self::Resume { .. } => "resume".to_string(),
-            Self::Seek { pos_frames, .. } => format!("seek({pos_frames:.0}fr)"),
-            Self::HotSwap { path, .. } => {
-                format!(
-                    "load({})",
-                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
-                )
-            }
+            Self::Pause { deck, .. } => format!("pause({})", dlabel(*deck)),
+            Self::Resume { deck, .. } => format!("resume({})", dlabel(*deck)),
+            Self::Seek {
+                deck, pos_frames, ..
+            } => format!("seek({},{:.0}fr)", dlabel(*deck), pos_frames),
+            Self::HotSwap { deck, path, .. } => format!(
+                "load({},{})",
+                dlabel(*deck),
+                path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+            ),
+            Self::SetMasterGain { gain, .. } => format!("master_gain({gain:.3})"),
         }
     }
 
     fn fire(self, handle: &mut EngineHandle) -> Result<()> {
         match self {
-            Self::Pause { .. } => handle.deck(0).pause()?,
-            Self::Resume { .. } => handle.deck(0).play()?,
-            Self::Seek { pos_frames, .. } => handle.deck(0).seek(pos_frames)?,
-            Self::HotSwap { source, .. } => handle
-                .deck(0)
+            Self::Pause { deck, .. } => handle.deck(deck as usize).pause()?,
+            Self::Resume { deck, .. } => handle.deck(deck as usize).play()?,
+            Self::Seek {
+                deck, pos_frames, ..
+            } => handle.deck(deck as usize).seek(pos_frames)?,
+            Self::HotSwap { deck, source, .. } => handle
+                .deck(deck as usize)
                 .load(source)
                 .map_err(|(e, _arc)| e)
                 .context("hot-load command rejected")?,
+            Self::SetMasterGain { gain, .. } => handle.set_master_gain(gain)?,
         }
         Ok(())
     }
 }
 
+/// Build the full schedule: per-deck transport events from each
+/// [`DeckOpts`] plus engine-wide master-gain changes. Deck-B's
+/// seek-at uses deck-B's track sample-rate to convert position
+/// seconds → frames; same for deck A. Events are sorted by wall-clock
+/// time before being returned so the realtime path can sleep between
+/// them.
 fn build_transport_schedule(
     opts: &PlayOpts,
     play_secs: f64,
-    track_sr: f32,
+    decks: &[LoadedDeck],
 ) -> Result<Vec<ScheduledEvent>> {
     let mut events: Vec<ScheduledEvent> = Vec::new();
-    if let Some(t) = opts.pause_at {
-        if t >= 0.0 && t <= play_secs {
-            events.push(ScheduledEvent::Pause { wall_secs: t });
+
+    // Per-deck events. Walk both deck specs.
+    for (deck_u8, dopts) in [(0u8, &opts.deck_a), (1u8, &opts.deck_b)] {
+        let deck_track_sr = decks
+            .iter()
+            .find(|d| d.idx == deck_u8 as usize)
+            .map_or(48_000.0, |d| f64::from(d.track.sample_rate()));
+
+        if let Some(t) = dopts.pause_at {
+            if t >= 0.0 && t <= play_secs {
+                events.push(ScheduledEvent::Pause {
+                    wall_secs: t,
+                    deck: deck_u8,
+                });
+            }
+        }
+        if let Some(t) = dopts.resume_at {
+            if t >= 0.0 && t <= play_secs {
+                events.push(ScheduledEvent::Resume {
+                    wall_secs: t,
+                    deck: deck_u8,
+                });
+            }
+        }
+        if let Some((wall, pos_secs)) = dopts.seek_at {
+            if wall >= 0.0 && wall <= play_secs {
+                let pos_frames = pos_secs * deck_track_sr;
+                events.push(ScheduledEvent::Seek {
+                    wall_secs: wall,
+                    deck: deck_u8,
+                    pos_frames,
+                });
+            }
+        }
+        if let Some((wall, ref path)) = dopts.hot_swap_at {
+            if wall >= 0.0 && wall <= play_secs {
+                // Decode now (off the audio thread, on a not-yet-running
+                // playback) so the wall-clock fire is just a ringbuf push.
+                let track = Track::load_from_path(path)
+                    .with_context(|| format!("decoding hot-swap source {}", path.display()))?;
+                events.push(ScheduledEvent::HotSwap {
+                    wall_secs: wall,
+                    deck: deck_u8,
+                    source: std::sync::Arc::new(track),
+                    path: path.clone(),
+                });
+            }
         }
     }
-    if let Some(t) = opts.resume_at {
-        if t >= 0.0 && t <= play_secs {
-            events.push(ScheduledEvent::Resume { wall_secs: t });
-        }
-    }
-    if let Some((wall, pos_secs)) = opts.seek_at {
+
+    if let Some((wall, gain)) = opts.master_gain_at {
         if wall >= 0.0 && wall <= play_secs {
-            let pos_frames = pos_secs * f64::from(track_sr);
-            events.push(ScheduledEvent::Seek {
+            events.push(ScheduledEvent::SetMasterGain {
                 wall_secs: wall,
-                pos_frames,
+                gain,
             });
         }
     }
-    if let Some((wall, ref path)) = opts.hot_swap_at {
-        if wall >= 0.0 && wall <= play_secs {
-            // Decode now (off the audio thread, on a not-yet-running
-            // playback) so the wall-clock fire is just a ringbuf push.
-            let track = Track::load_from_path(path)
-                .with_context(|| format!("decoding hot-swap source {}", path.display()))?;
-            events.push(ScheduledEvent::HotSwap {
-                wall_secs: wall,
-                source: std::sync::Arc::new(track),
-                path: path.clone(),
-            });
-        }
-    }
+
     events.sort_by(|a, b| {
         a.wall_secs()
             .partial_cmp(&b.wall_secs())

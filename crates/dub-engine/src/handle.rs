@@ -152,6 +152,18 @@ impl EngineHandle {
         self.overflow_counter.load(Ordering::Relaxed)
     }
 
+    /// Set the engine-wide master gain on the debug internal mixer.
+    /// `1.0` is unity. PRD §5.3: external-mixer mode (M5+) bypasses the
+    /// master, so this command is a no-op there; for v1's debug mixer
+    /// it scales the summed-stereo bus.
+    ///
+    /// # Errors
+    /// [`CommandError::ChannelFull`] if the audio thread is not draining
+    /// (recoverable; retry on the next render block).
+    pub fn set_master_gain(&mut self, gain: f32) -> Result<(), CommandError> {
+        self.send(Command::SetMasterGain { gain })
+    }
+
     fn send(&mut self, cmd: Command) -> Result<(), CommandError> {
         self.tx.try_push(cmd).map_err(|_| CommandError::ChannelFull)
     }

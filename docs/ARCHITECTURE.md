@@ -204,6 +204,40 @@ hot-swap scenario can be rendered deterministically and audited
 mathematically — current measured worst-case delta on the M3.5 demo
 suite is 0.0187, against a click step of order 0.5+.
 
+### Two decks + debug internal mixer — M4
+
+The engine has always declared `DECK_COUNT = 2`; M4 makes the second
+deck driveable end-to-end and adds a master gain to the debug internal
+mixer. The mixer is intentionally minimal: each deck has its own
+linear `gain`, both decks render additively into one summed stereo
+bus, and `Engine::master_gain` (default 1.0) multiplies the bus once
+after the deck loop. The multiply is skipped when master is unity
+(`(g - 1.0).abs() <= f32::EPSILON`) so the common case has zero
+arithmetic cost.
+
+```text
+                   ┌────────────────────────────┐
+  Deck 0 ──gain──► │                            │
+                   │   Σ   ──── master_gain ──► │ ──► CoreAudio (one stereo bus)
+  Deck 1 ──gain──► │                            │
+                   └────────────────────────────┘
+```
+
+Master gain is mutable through the lock-free command channel via
+`Command::SetMasterGain` (engine-wide; carries no deck index). The
+public surface on `EngineHandle` is `set_master_gain(g)`; per-deck
+gain stays on `DeckCommand::set_gain`. Both compose multiplicatively
+inside the render loop — no separate "channel strip" abstraction —
+because v1's debug mixer doesn't need EQ/filters/sends and a flat
+implementation keeps the audio thread's data dependency graph tiny.
+
+External-mixer 4-channel routing (deck 0 → output channels 1+2,
+deck 1 → output channels 3+4) is **deliberately deferred** to M5/M6.
+That's the milestone where the timecode hardware (SL3, Audio 6) makes
+multi-channel routing actually testable. v1's debug mixer covers
+single-stereo-output development and is what every existing CLI
+analyze workflow runs against.
+
 ### Engine → UI (state snapshot) — implemented in M2
 
 Per-deck `Arc<DeckSharedState>` carrying:
@@ -218,11 +252,11 @@ synchronization guarantee across fields; tearing during a transport
 change is invisible at 60 fps and we deliberately avoid the cost of
 `SeqCst` here.
 
-### Engine → UI (events) — pending M4+
+### Engine → UI (events) — pending M5+
 
 `ringbuf::HeapRb<EngineEvent>` for discrete events (xrun detected, source
 mode changed, end-of-track reached, etc.). Not yet wired; the snapshot
-covers everything we need through M3.
+covers everything we need through M4.
 
 ## Build / link / ship
 

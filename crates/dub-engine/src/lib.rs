@@ -57,6 +57,12 @@ pub struct Engine {
     sample_rate: f32,
     block_size: usize,
     decks: [Deck; DECK_COUNT],
+    /// Engine-wide master gain applied after the deck sum in the debug
+    /// internal mixer (M4). `1.0` is unity. PRD §5.3: external-mixer mode
+    /// (M5+) bypasses the master since each deck would route to its own
+    /// physical output pair raw — for now the engine has only one summed
+    /// output bus, so the master always applies.
+    master_gain: f32,
     /// Optional consumer end of the UI → engine command channel. `None`
     /// for offline/test engines built via [`Engine::new`]; populated by
     /// [`Engine::new_with_handle`].
@@ -83,6 +89,7 @@ impl Engine {
             sample_rate,
             block_size,
             decks: std::array::from_fn(|_| Deck::new(envelope.clone())),
+            master_gain: 1.0,
             cmd_rx: None,
             trash_tx: None,
             trash_overflow: None,
@@ -107,11 +114,27 @@ impl Engine {
             sample_rate,
             block_size,
             decks,
+            master_gain: 1.0,
             cmd_rx: Some(side.cmd_rx),
             trash_tx: Some(side.trash_tx),
             trash_overflow: Some(side.overflow_counter),
         };
         (engine, handle)
+    }
+
+    /// Engine-wide master gain (linear, default 1.0). Used by the debug
+    /// internal mixer.
+    #[must_use]
+    pub fn master_gain(&self) -> f32 {
+        self.master_gain
+    }
+
+    /// Set the master gain. Off-RT (called from `Engine::new_with_handle`'s
+    /// owning thread, or via [`Command::SetMasterGain`] on the audio
+    /// thread). Negative values invert overall phase; out-of-range values
+    /// are accepted (the engine doesn't clamp — that's a UI concern).
+    pub fn set_master_gain(&mut self, gain: f32) {
+        self.master_gain = gain;
     }
 
     /// Sample rate this engine was configured for.
@@ -170,6 +193,18 @@ impl Engine {
         let sr = self.sample_rate;
         for deck in &mut self.decks {
             deck.render(rt, out, sr);
+        }
+
+        // Master gain (M4): single multiplicative scale across the entire
+        // summed stereo bus. Applied after deck mixing so per-deck gains
+        // and the master compose multiplicatively. Skipping the multiply
+        // when master==1.0 saves a per-block branch on the common case
+        // and lets future LTO inline this loop away entirely.
+        if (self.master_gain - 1.0).abs() > f32::EPSILON {
+            let g = self.master_gain;
+            for sample in out.iter_mut() {
+                *sample *= g;
+            }
         }
 
         // After render, harvest any Arc<Track> orphaned by completed
@@ -252,6 +287,9 @@ impl Engine {
                 // Arc may have been displaced into the deck's
                 // pending_disposal slot — sweep that immediately.
                 self.sweep_deck_disposal(idx as usize);
+            }
+            Command::SetMasterGain { gain } => {
+                self.master_gain = gain;
             }
         }
     }
@@ -603,5 +641,122 @@ mod tests {
         for s in buffer {
             assert!((s - 0.75).abs() < 1e-6);
         }
+    }
+
+    // ============================================================
+    //                       M4 mixer tests
+    // ============================================================
+
+    #[test]
+    fn master_gain_scales_summed_output() {
+        // Each deck contributes its raw value; master multiplies the sum.
+        // Deck 0 = 0.5, deck 1 = 0.25, master = 0.5 → output = 0.5 * 0.75 = 0.375.
+        let track_a = Arc::new(Track::from_interleaved(vec![0.5; 8], 48_000, 2).unwrap());
+        let track_b = Arc::new(Track::from_interleaved(vec![0.25; 8], 48_000, 2).unwrap());
+        let mut engine = Engine::new(48_000.0, 4);
+        engine.deck_mut(0).set_source(track_a);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.deck_mut(1).set_source(track_b);
+        engine.deck_mut(1).set_playing(true);
+        engine.deck_mut(1).quiesce_declick_for_test();
+        engine.set_master_gain(0.5);
+
+        let mut buffer = vec![0.0f32; 8];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buffer);
+        for s in buffer {
+            assert!((s - 0.375).abs() < 1e-6, "got {s} want 0.375");
+        }
+    }
+
+    #[test]
+    fn master_gain_unity_is_pass_through() {
+        // Default master_gain = 1.0; output equals raw deck sum.
+        let track_a = Arc::new(Track::from_interleaved(vec![0.5; 8], 48_000, 2).unwrap());
+        let mut engine = Engine::new(48_000.0, 4);
+        engine.deck_mut(0).set_source(track_a);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        let mut buffer = vec![0.0f32; 8];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buffer);
+        for s in buffer {
+            assert!((s - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn master_gain_command_applies_via_handle() {
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        // Send master gain = 0.25 via the lock-free channel.
+        handle.set_master_gain(0.25).unwrap();
+
+        let mut buffer = vec![0.0f32; 64 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buffer);
+
+        for s in buffer {
+            assert!(
+                (s - 0.125).abs() < 1e-6,
+                "got {s} want 0.125 (= 0.5 * 0.25)"
+            );
+        }
+    }
+
+    #[test]
+    fn two_decks_independent_transport_via_handle() {
+        // Deck 0 plays, deck 1 paused → output should be deck 0 only.
+        let track_a = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        let track_b = Arc::new(Track::from_interleaved(vec![0.25; 1024], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(track_a);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.deck_mut(1).set_source(track_b);
+        // Deck 1 source is loaded but not playing.
+        engine.deck_mut(1).quiesce_declick_for_test();
+
+        let mut buffer = vec![0.0f32; 64 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut buffer);
+        // Only deck 0 contributes.
+        for s in &buffer {
+            assert!((s - 0.5).abs() < 1e-6, "deck 1 should be silent: got {s}");
+        }
+
+        // Now play deck 1 too via handle.
+        handle.deck(1).play().unwrap();
+        let mut buffer = vec![0.0f32; 256 * 2];
+        engine.render(&mut rt, &mut buffer);
+        // Past the per-deck declick fade-in, output is 0.5 + 0.25 = 0.75.
+        for (i, s) in buffer.chunks_exact(2).enumerate().skip(100) {
+            assert!(
+                (s[0] - 0.75).abs() < 1e-6,
+                "post-fade frame {i}: got {} want 0.75",
+                s[0]
+            );
+        }
+    }
+
+    #[test]
+    fn master_gain_path_is_alloc_free() {
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 64);
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        handle.set_master_gain(0.5).unwrap();
+
+        let mut buffer = vec![0.0f32; 64 * 2];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.render(&mut rt, &mut buffer);
+        });
     }
 }

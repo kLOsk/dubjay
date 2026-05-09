@@ -57,29 +57,44 @@ fn run() -> Result<()> {
     let start = Instant::now();
     let mut total_commands_sent: u64 = 0;
     let mut total_loads_sent: u64 = 0;
+    let mut total_master_changes: u64 = 0;
     assert_no_alloc::assert_no_alloc(|| {
         for i in 0..BLOCKS {
-            // Every ~1000 blocks, push a small burst of commands. Sending
-            // through `EngineHandle` MUST be alloc-free — it's a try_push
-            // on a pre-allocated ringbuf, no boxing.
+            // Every ~1000 blocks, push a small burst of commands —
+            // alternating decks so the audit covers both the deck-A and
+            // deck-B paths through `apply_command`. Sending through
+            // `EngineHandle` MUST be alloc-free (try_push on a pre-allocated
+            // ringbuf, no boxing).
             if i.is_multiple_of(1_000) {
-                for _ in 0..COMMANDS_PER_INTERVAL {
-                    if handle.deck(0).set_gain(0.5).is_ok() {
+                for j in 0..COMMANDS_PER_INTERVAL {
+                    let deck = (j as usize) & 1;
+                    if handle.deck(deck).set_gain(0.5).is_ok() {
                         total_commands_sent += 1;
                     }
                 }
             }
-            // Every ~5000 blocks, hot-load a track. This exercises both
-            // the load command (sender side: try_push of an Arc<Track>)
+            // Master-gain churn (M4) — engine-wide command, no deck.
+            // Toggle between two values every ~1500 blocks to make sure
+            // the master path stays alloc-free under sustained traffic.
+            if i.is_multiple_of(1_500) {
+                let g = if i.is_multiple_of(3_000) { 1.0 } else { 0.7 };
+                if handle.set_master_gain(g).is_ok() {
+                    total_master_changes += 1;
+                }
+            }
+            // Every ~5000 blocks, hot-load a track on each deck —
+            // alternating which deck and which track. This exercises both
+            // decks' load command path (sender: try_push of an Arc<Track>)
             // and the trash channel (audio thread: take old Arc, push
             // it back through trash; main thread: reclaim drops it).
             if i.is_multiple_of(5_000) {
+                let target_deck = (i / 5_000) as usize & 1;
                 let next = if i.is_multiple_of(10_000) {
                     track_a.clone()
                 } else {
                     track_b.clone()
                 };
-                if handle.deck(0).load(next).is_ok() {
+                if handle.deck(target_deck).load(next).is_ok() {
                     total_loads_sent += 1;
                 }
             }
@@ -92,7 +107,8 @@ fn run() -> Result<()> {
     });
     let elapsed = start.elapsed();
     println!(
-        "rt-audit: drained {total_commands_sent} cmds + {total_loads_sent} hot-loads during render"
+        "rt-audit: drained {total_commands_sent} cmds + {total_loads_sent} hot-loads \
+         + {total_master_changes} master-gain changes during render"
     );
     let overflow = handle.trash_overflow_count();
     if overflow > 0 {
