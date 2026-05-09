@@ -204,6 +204,66 @@ hot-swap scenario can be rendered deterministically and audited
 mathematically — current measured worst-case delta on the M3.5 demo
 suite is 0.0187, against a click step of order 0.5+.
 
+### Timecode decoder, relative-mode-only — M5.1
+
+Lives in `dub-timecode`. Pure DSP, no I/O, no allocations on the hot
+path — designed to drop straight onto the audio thread when M5.3 wires
+it up to live audio input.
+
+**Signal model.** Both stereo channels carry the same nominal sinusoid
+at the format's carrier (1 kHz for Serato CV02), offset by 90° between
+L and R. Treating each frame as a complex sample `s = L + jR`, the
+input becomes a single complex exponential `s(t) = A · exp(j·2π·f·t)`
+whose frequency is positive when the record turns forward and negative
+when reversed. Magnitude `|s|² = L² + R²` is constant across rotation,
+which is what makes amplitude AGC unnecessary for the *phase* tracking
+(it'll matter later for AM-bitstream decoding in M6).
+
+**Per-block algorithm.**
+
+```text
+  for each stereo frame n:
+    s_n = L_n + j R_n
+    accum  += s_n * conj(s_{n-1})
+    amp_acc += |s_n|²
+  Δφ_block = arg(accum)                              # coherent phase diff
+  f_inst   = Δφ_block / (2π · Δt_per_sample)         # signed Hz
+  rate     = f_inst / carrier_hz                      # ±1.0 = ±unity
+  position += rate * block_seconds                   # seconds at unity
+  confidence = |accum| / amp_acc                      # 1.0 = pure carrier
+```
+
+The coherent sum is the key to robustness: noise (uncorrelated across
+samples) suppresses by `√N`, signal adds linearly. With a 64-sample
+block at 48 kHz that's a ~9 dB noise gain — easily good enough to lock
+onto a real cartridge, and orders of magnitude better than per-sample
+phase tracking (which is what naive PLLs do).
+
+Direction falls out for free: forward rotation → `f_inst > 0`, reverse
+→ `f_inst < 0`. No state machine, no quadrature flag, no zero-crossing
+parity tracking. The L/R quadrature relationship of the printed signal
+is the only direction encoding we need.
+
+**Limits.** Per-sample phase advance saturates at ±π, which puts a
+`Nyquist / carrier = 24×` ceiling on trackable rates at 48 kHz / 1 kHz.
+Real DJ scratching tops out at ~8×, well clear. Below that limit the
+estimator is bias-free and limited only by sample-rate quantization
+(~50 µs at 48 kHz, equivalent to ~0.005 of unity rate).
+
+**What's *not* here yet.** Absolute position (M6 — needs bitstream
+demod and the format's 20-bit code table), stickiness policy (M5.4 —
+"confidence dropped below threshold for N ms → freeze deck" lives in
+the integration layer, not in the DSP), and AGC + cartridge
+calibration (M6 — real-world amplitude variation). The decoder
+exposes `confidence` and `amplitude` so the integration layer can
+implement those policies without modifying the DSP.
+
+**License + provenance.** Clean-room implementation from the
+xwax/Mixxx algorithm description; no xwax code copied (xwax is BSD;
+dub is GPL-3.0 — the *direction* of compatibility allows BSD → GPL,
+but we want attribution to remain unambiguous, hence the rewrite from
+spec).
+
 ### Two decks + debug internal mixer — M4
 
 The engine has always declared `DECK_COUNT = 2`; M4 makes the second

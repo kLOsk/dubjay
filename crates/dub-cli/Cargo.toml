@@ -16,5 +16,6 @@ dub-engine = { workspace = true }
 dub-ffi = { workspace = true }
 dub-io = { workspace = true }
 dub-audio = { workspace = true }
+dub-timecode = { workspace = true }
 anyhow = { workspace = true }
 hound = { workspace = true }

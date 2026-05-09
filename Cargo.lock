@@ -125,6 +125,7 @@ dependencies = [
  "dub-engine",
  "dub-ffi",
  "dub-io",
+ "dub-timecode",
  "hound",
 ]
 
@@ -183,6 +184,9 @@ version = "0.0.1"
 [[package]]
 name = "dub-timecode"
 version = "0.0.1"
+dependencies = [
+ "assert_no_alloc",
+]
 
 [[package]]
 name = "encoding_rs"

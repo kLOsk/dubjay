@@ -25,6 +25,7 @@ use dub_engine::{Engine, EngineHandle, RealtimeContext};
 use dub_io::Track;
 
 mod analyze;
+mod decode_timecode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
         "version" => version(),
         "play" => play(&args[2..]),
         "analyze" => analyze_cmd(&args[2..]),
+        "decode-timecode" => decode_timecode_cmd(&args[2..]),
         "measure-latency" => measure_latency(),
         "help" | "-h" | "--help" => {
             print_help();
@@ -78,6 +80,9 @@ fn print_help() {
     eprintln!("                    [--deck-b-seek-at WALL=POS_SECS]");
     eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
+    eprintln!("  decode-timecode <wav>");
+    eprintln!("                    [--window MS] [--head N]");
+    eprintln!("                    [--synthetic]   offline timecode-vinyl decoder (M5.1)");
     eprintln!();
     eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
@@ -97,6 +102,12 @@ fn print_help() {
     eprintln!("    peak/RMS/DC, clipping count, max per-sample first-difference per");
     eprintln!("    channel, and locations where |Δ| exceeds --threshold (default 0.05).");
     eprintln!("    Use this instead of subjective listening to verify de-click correctness.");
+    eprintln!();
+    eprintln!("  decode-timecode (M5.1): read a stereo WAV containing recorded Serato CV02");
+    eprintln!("    timecode and report decoded rate / position / amplitude / confidence in");
+    eprintln!("    discrete time slices. Verdict heuristic LOCKED / PARTIAL / POOR. With");
+    eprintln!("    --synthetic and no input path, decodes a built-in test scenario instead");
+    eprintln!("    (sanity-check the decoder math without a turntable).");
 }
 
 fn smoke() -> Result<()> {
@@ -487,6 +498,11 @@ fn analyze_cmd(args: &[String]) -> Result<()> {
     }
     let input = input.ok_or_else(|| anyhow!("usage: dub analyze <wav> [--threshold DELTA]"))?;
     analyze::run(&input, threshold)
+}
+
+fn decode_timecode_cmd(args: &[String]) -> Result<()> {
+    let (input, synthetic, window_ms, max_lines) = decode_timecode::parse_args(args)?;
+    decode_timecode::run(input.as_deref(), synthetic, window_ms, max_lines)
 }
 
 /// One loaded deck ready to be configured into the engine.

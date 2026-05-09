@@ -8,3 +8,6 @@ repository.workspace = true
 description = "Serato CV02 + Traktor MK2 timecode decoder. xwax-derived."
 
 [dependencies]
+
+[dev-dependencies]
+assert_no_alloc = { workspace = true }
