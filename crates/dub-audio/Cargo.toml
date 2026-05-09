@@ -1,0 +1,18 @@
+[package]
+name = "dub-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform audio I/O for Dub. macOS CoreAudio in v1; Windows ASIO and iOS later."
+
+[dependencies]
+dub-engine = { workspace = true }
+thiserror = { workspace = true }
+
+# CoreAudio is target-gated: the rest of the workspace builds fine on Linux
+# even though Dub itself is macOS-first. Once we add Windows ASIO this gets a
+# corresponding `cfg(target_os = "windows")` block.
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = { workspace = true }

@@ -20,6 +20,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// Apple/vendor product names ("CoreAudio", "AudioUnit") are not Rust symbols;
+// clippy::doc_markdown is wrong to demand backticks in prose.
+#![allow(clippy::doc_markdown)]
 
 mod deck;
 pub mod realtime;
@@ -86,14 +89,18 @@ impl Engine {
     /// Called from the audio thread. The [`RealtimeContext`] argument is
     /// the only way to invoke RT-safe APIs.
     ///
-    /// `out` is interleaved stereo, length `2 * block_size`. The buffer is
-    /// **zeroed** at the start; each deck's contribution is mixed in
-    /// additively (`+=`).
+    /// `out` is interleaved stereo, length must be even (`2 * frames`).
+    /// The buffer is **zeroed** at the start; each deck's contribution is
+    /// mixed in additively (`+=`).
+    ///
+    /// `block_size` on the engine is a hint, not a hard constraint:
+    /// CoreAudio (and other host APIs) may hand us variable buffer sizes
+    /// on each callback, and we honour whatever we're given.
     pub fn render(&mut self, rt: &mut RealtimeContext<'_>, out: &mut [f32]) {
         debug_assert_eq!(
-            out.len(),
-            2 * self.block_size,
-            "buffer size mismatch with engine block_size"
+            out.len() % 2,
+            0,
+            "stereo output buffer must have even length"
         );
         rt.tick();
         for sample in out.iter_mut() {

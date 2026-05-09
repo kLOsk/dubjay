@@ -1,15 +1,19 @@
-//! Headless smoke test + offline render harness for the Dub engine.
+//! Headless smoke test, offline render harness, and real-time playback
+//! driver for the Dub engine.
 //!
 //! Subcommands:
 //!
 //! - `smoke` — verify the engine constructs and renders a block of silence.
 //! - `rt-audit` — render N blocks and print the wall-clock time + tick count.
 //! - `version` — print engine + ffi version.
-//! - `play <input> [-o <output>] [--rate R] [--gain G] [--sr ENGINE_SR]
-//!         [--block-size N]` — load `<input>`, render through the engine
-//!   into `<output>` (default: `<input>.dub.wav`). Proves the engine
-//!   pipeline works end-to-end without needing CoreAudio. Real-time
-//!   playback through CoreAudio lands in M1.4.
+//! - `play <input> [--realtime] [-o <output>] [--rate R] [--gain G]
+//!         [--sr ENGINE_SR] [--block-size N] [--duration SECS]` —
+//!   load `<input>` and either:
+//!
+//!   - **offline** (default): render through the engine into `<output>`
+//!     (default `<input>.dub.wav`). Deterministic, used by automated tests.
+//!   - **realtime** (`--realtime`): play through the default audio output
+//!     for up to the track's duration (or `--duration`).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -53,12 +57,14 @@ fn print_help() {
     eprintln!("usage: dub <subcommand> [args]");
     eprintln!();
     eprintln!("subcommands:");
-    eprintln!("  smoke        engine handshake + zero-render");
-    eprintln!("  rt-audit     stress the render path under assert_no_alloc");
-    eprintln!("  version      print versions");
-    eprintln!("  play <input> [-o <output>] [--rate R] [--gain G] [--sr SR]");
-    eprintln!("               [--block-size N]");
-    eprintln!("                offline-render <input> through the engine to <output>");
+    eprintln!("  smoke         engine handshake + zero-render");
+    eprintln!("  rt-audit      stress the render path under assert_no_alloc");
+    eprintln!("  version       print versions");
+    eprintln!("  play <input>  [--realtime] [-o <output>] [--rate R] [--gain G]");
+    eprintln!("                [--sr SR] [--block-size N] [--duration SECS]");
+    eprintln!();
+    eprintln!("  play (offline, default): render to a 32-bit float WAV through the engine.");
+    eprintln!("  play --realtime:         play through the default macOS output device.");
 }
 
 fn smoke() -> Result<()> {
@@ -122,25 +128,36 @@ fn version() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PlayOpts {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     rate: f64,
     gain: f32,
-    engine_sr: f32,
+    engine_sr: Option<f32>,
     block_size: usize,
+    realtime: bool,
+    duration: Option<f64>,
+}
+
+impl Default for PlayOpts {
+    fn default() -> Self {
+        Self {
+            input: None,
+            output: None,
+            rate: 1.0,
+            gain: 1.0,
+            engine_sr: None,
+            block_size: 64,
+            realtime: false,
+            duration: None,
+        }
+    }
 }
 
 impl PlayOpts {
     fn parse(args: &[String]) -> Result<Self> {
-        let mut opts = Self {
-            rate: 1.0,
-            gain: 1.0,
-            engine_sr: 48_000.0,
-            block_size: 64,
-            ..Self::default()
-        };
+        let mut opts = Self::default();
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -169,7 +186,7 @@ impl PlayOpts {
                     let v = args
                         .get(i + 1)
                         .ok_or_else(|| anyhow!("--sr expects a value"))?;
-                    opts.engine_sr = v.parse().context("--sr not a number")?;
+                    opts.engine_sr = Some(v.parse().context("--sr not a number")?);
                     i += 2;
                 }
                 "--block-size" => {
@@ -177,6 +194,17 @@ impl PlayOpts {
                         .get(i + 1)
                         .ok_or_else(|| anyhow!("--block-size expects a value"))?;
                     opts.block_size = v.parse().context("--block-size not a number")?;
+                    i += 2;
+                }
+                "--realtime" | "--live" => {
+                    opts.realtime = true;
+                    i += 1;
+                }
+                "--duration" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--duration expects seconds"))?;
+                    opts.duration = Some(v.parse().context("--duration not a number")?);
                     i += 2;
                 }
                 s if s.starts_with('-') => {
@@ -212,58 +240,77 @@ fn play(args: &[String]) -> Result<()> {
     let opts = PlayOpts::parse(args)?;
     let input = opts
         .input
-        .as_ref()
-        .ok_or_else(|| anyhow!("usage: dub play <input> [-o <output>] [--rate R] ..."))?;
-    let output = opts
-        .output
         .clone()
-        .unwrap_or_else(|| default_output_path(input));
+        .ok_or_else(|| anyhow!("usage: dub play <input> [--realtime] [-o <output>] ..."))?;
 
-    println!("Dub CLI offline play");
-    println!("  input:        {}", input.display());
-    println!("  output:       {}", output.display());
-    println!("  engine SR:    {} Hz", opts.engine_sr);
-    println!("  block size:   {} frames", opts.block_size);
-    println!("  rate:         {}", opts.rate);
-    println!("  gain:         {}", opts.gain);
-
-    let track = Track::load_from_path(input).context("loading input")?;
+    let track = Track::load_from_path(&input).context("loading input")?;
     println!(
-        "  track:        {} frames @ {} Hz, {} ch ({:.3} s)",
+        "track loaded: {} frames @ {} Hz, {} ch ({:.3} s)",
         track.frames(),
         track.sample_rate(),
         track.channels(),
         track.duration_seconds()
     );
 
-    // Offline render: generate enough output frames to cover the track at
-    // the user's requested rate. Negative rates render in reverse from the
-    // end of the track.
+    if opts.realtime {
+        play_realtime(track, &opts)
+    } else {
+        play_offline(&input, track, &opts)
+    }
+}
+
+/// Build an engine + deck-0 pre-loaded with `track`, with the requested rate,
+/// gain, and starting position (end-of-track if rate is negative).
+fn build_configured_engine(
+    track: Track,
+    engine_sr: f32,
+    block_size: usize,
+    opts: &PlayOpts,
+) -> (Engine, std::sync::Arc<Track>) {
     let track = std::sync::Arc::new(track);
-    let mut engine = Engine::new(opts.engine_sr, opts.block_size);
+    let mut engine = Engine::new(engine_sr, block_size);
     engine.deck_mut(0).set_source(track.clone());
     engine.deck_mut(0).set_gain(opts.gain);
     engine.deck_mut(0).set_rate(opts.rate);
     engine.deck_mut(0).set_playing(true);
-
     if opts.rate < 0.0 {
-        engine
-            .deck_mut(0)
-            .set_position_frames((track.frames() - 1) as f64);
+        #[allow(clippy::cast_precision_loss)]
+        let last = (track.frames().saturating_sub(1)) as f64;
+        engine.deck_mut(0).set_position_frames(last);
     }
+    (engine, track)
+}
+
+fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
+    let output = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_path(input));
+    let engine_sr = opts.engine_sr.unwrap_or(48_000.0);
+
+    println!("mode:         offline");
+    println!("  output:     {}", output.display());
+    println!("  engine SR:  {engine_sr} Hz");
+    println!("  block size: {} frames", opts.block_size);
+    println!("  rate:       {}", opts.rate);
+    println!("  gain:       {}", opts.gain);
+
+    let track_sr = f64::from(track.sample_rate());
+    let track_frames = track.frames();
+    let (mut engine, _track_arc) = build_configured_engine(track, engine_sr, opts.block_size, opts);
 
     let abs_rate = opts.rate.abs().max(1e-12);
-    // Output frames needed to cover the track exactly once at rate=R.
-    // n_track_frames * (engine_sr / track_sr) / |rate|.
-    let track_sr = f64::from(track.sample_rate());
-    let engine_sr = f64::from(opts.engine_sr);
-    let total_output_frames =
-        ((track.frames() as f64) * (engine_sr / track_sr) / abs_rate).ceil() as u64;
+    let engine_sr_f = f64::from(engine_sr);
+    #[allow(clippy::cast_precision_loss)]
+    let track_frames_f = track_frames as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let total_output_frames = (track_frames_f * (engine_sr_f / track_sr) / abs_rate).ceil() as u64;
     let total_blocks = total_output_frames.div_ceil(opts.block_size as u64);
 
     let spec = hound::WavSpec {
         channels: 2,
-        sample_rate: opts.engine_sr.round() as u32,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        sample_rate: engine_sr.round() as u32,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
@@ -291,22 +338,76 @@ fn play(args: &[String]) -> Result<()> {
     let elapsed = start.elapsed();
     writer.finalize().context("finalizing output WAV")?;
 
+    #[allow(clippy::cast_precision_loss)]
     let rms = (rms_acc / (n_samples as f64).max(1.0)).sqrt();
-    let total_output_secs = (n_samples as f64 / 2.0) / engine_sr;
+    #[allow(clippy::cast_precision_loss)]
+    let total_output_secs = (n_samples as f64 / 2.0) / engine_sr_f;
     let realtime_factor = total_output_secs / elapsed.as_secs_f64().max(1e-12);
 
-    println!(
-        "  rendered:     {} blocks, {} samples",
-        total_blocks, n_samples
-    );
-    println!("  output dur:   {total_output_secs:.3} s");
-    println!("  wall:         {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+    println!("  rendered:   {total_blocks} blocks, {n_samples} samples");
+    println!("  output dur: {total_output_secs:.3} s");
+    println!("  wall:       {:.3} ms", elapsed.as_secs_f64() * 1000.0);
     println!("  realtime ×{realtime_factor:.0}");
+    println!("  peak:       {peak:.4} ({:.2} dBFS)", 20.0 * peak.log10());
+    println!("  rms:        {rms:.4} ({:.2} dBFS)", 20.0 * rms.log10());
+    println!("OK");
+    Ok(())
+}
+
+fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
+    use std::thread;
+    use std::time::Duration;
+
+    println!("mode:         realtime (CoreAudio default output)");
+
+    // PRD §4.1.5: the engine matches the device, never the other way
+    // around (no boundary resampling in v1). Query the device first so
+    // the engine can be built at the right rate.
+    let device = dub_audio::query_default_output().context("querying default audio output")?;
+    let engine_sr = opts.engine_sr.unwrap_or(device.sample_rate);
+    if (engine_sr - device.sample_rate).abs() > 0.5 {
+        eprintln!(
+            "warning: --sr {engine_sr} differs from device SR {} Hz; CoreAudio will SRC internally",
+            device.sample_rate
+        );
+    }
+
+    println!("  device SR:  {} Hz", device.sample_rate);
+    println!("  engine SR:  {engine_sr} Hz");
+    println!("  block size: {} frames (hint)", opts.block_size);
+    println!("  rate:       {}", opts.rate);
+    println!("  gain:       {}", opts.gain);
+
+    let track_sr = f64::from(track.sample_rate());
+    let track_frames = track.frames();
+    let abs_rate = opts.rate.abs().max(1e-12);
+    #[allow(clippy::cast_precision_loss)]
+    let natural_secs = (track_frames as f64) / track_sr / abs_rate;
+    let play_secs = opts.duration.unwrap_or(natural_secs);
+
+    let (engine, _track_arc) = build_configured_engine(track, engine_sr, opts.block_size, opts);
+
+    println!("  playing:    {play_secs:.3} s");
+
+    let start = Instant::now();
+    let output = dub_audio::AudioOutput::start(engine).context("starting CoreAudio output")?;
+
+    // The render callback runs on CoreAudio's RT thread; we just wait
+    // here until it's time to stop.
+    let sleep_for = Duration::from_secs_f64(play_secs.max(0.0));
+    thread::sleep(sleep_for);
+
+    let elapsed = start.elapsed();
+    let cb_count = output.callback_count();
+    drop(output);
+
     println!(
-        "  peak:         {peak:.4} ({:.2} dBFS)",
-        20.0 * peak.log10()
+        "  callbacks:  {cb_count} render calls in {:.3} s",
+        elapsed.as_secs_f64()
     );
-    println!("  rms:          {rms:.4} ({:.2} dBFS)", 20.0 * rms.log10());
+    if cb_count == 0 {
+        anyhow::bail!("CoreAudio fired zero render callbacks; device probably failed to start");
+    }
     println!("OK");
     Ok(())
 }

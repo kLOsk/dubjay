@@ -5,6 +5,7 @@ members = [
     "crates/dub-dsp",
     "crates/dub-stretch",
     "crates/dub-io",
+    "crates/dub-audio",
     "crates/dub-timecode",
     "crates/dub-thru",
     "crates/dub-fingerprint",
@@ -35,6 +36,7 @@ dub-fingerprint = { path = "crates/dub-fingerprint" }
 dub-library = { path = "crates/dub-library" }
 dub-controller = { path = "crates/dub-controller" }
 dub-ffi = { path = "crates/dub-ffi" }
+dub-audio = { path = "crates/dub-audio" }
 
 # External (only what's needed for M0–M2; more added per milestone)
 assert_no_alloc = { version = "1.1", default-features = false }
@@ -48,6 +50,11 @@ symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm
 
 # WAV writer (for offline-render output in dub-cli; not used in the engine).
 hound = "3"
+
+# CoreAudio (macOS only; target-gated in dub-audio's Cargo.toml). PRD §4.2:
+# v1 uses HAL via coreaudio-rs, not cpal — we want lowest possible latency
+# and direct device control.
+coreaudio-rs = "0.14"
 
 # Test-only
 proptest = "1"
