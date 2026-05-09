@@ -13,20 +13,83 @@
 //! resampling for ordinary playback (with key-lock disabled) lands later
 //! when we evaluate whether linear is audibly insufficient.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dub_io::Track;
 
 use crate::realtime::RealtimeContext;
 
+/// State shared between an audio-thread [`Deck`] and the main-thread
+/// [`crate::handle::DeckCommand`] proxy. Lock-free reads from the UI
+/// thread, lock-free writes from the audio thread.
+///
+/// Three values are made visible across the boundary:
+///
+/// - **position (in track frames)** as `f64::to_bits` packed in an
+///   `AtomicU64`. The audio thread updates this once per render block
+///   (post-block position); the UI reads it for waveform/playhead.
+///   Relaxed ordering is sufficient: it's a one-way snapshot, no
+///   synchronization required.
+/// - **playing flag**: the deck's transport state. Audio thread writes
+///   when commands change it; UI reads to render the play/pause button.
+/// - **end-of-track flag**: set by the audio thread when the playhead
+///   walks off the end of the source. Lets the UI auto-reset etc.
+#[derive(Debug)]
+pub(crate) struct DeckSharedState {
+    pub(crate) position_bits: AtomicU64,
+    pub(crate) is_playing: AtomicBool,
+    pub(crate) at_end: AtomicBool,
+}
+
+impl DeckSharedState {
+    pub(crate) fn new() -> Self {
+        Self {
+            position_bits: AtomicU64::new(0.0f64.to_bits()),
+            is_playing: AtomicBool::new(false),
+            at_end: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn store_position(&self, frames: f64) {
+        self.position_bits
+            .store(frames.to_bits(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_position(&self) -> f64 {
+        f64::from_bits(self.position_bits.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn store_playing(&self, playing: bool) {
+        self.is_playing.store(playing, Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_playing(&self) -> bool {
+        self.is_playing.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store_at_end(&self, at_end: bool) {
+        self.at_end.store(at_end, Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_at_end(&self) -> bool {
+        self.at_end.load(Ordering::Relaxed)
+    }
+}
+
 /// A single deck's transport + audio source state.
 ///
-/// Cheap to clone (the `Arc<Track>` is reference-counted; no audio is copied).
-/// Loading a track happens off the audio thread; the engine swaps the source
-/// in via lock-free message passing on a render-block boundary (this lands
-/// when the engine grows multiple decks; for M1 we just `set_source` directly
-/// on the audio thread because the offline harness is single-threaded).
-#[derive(Debug, Clone)]
+/// Two views of the deck exist:
+///
+/// - the **audio-thread Deck** (this struct) holds the playhead, source,
+///   and renders audio. Owned by the [`crate::Engine`].
+/// - the **main-thread proxy** ([`crate::handle::DeckCommand`]) sends
+///   commands to mutate this deck and reads the latest position via the
+///   shared atomic snapshot.
+///
+/// They communicate through `Arc<DeckSharedState>`, written by the audio
+/// thread once per render block and read with `Relaxed` ordering by the UI.
+#[derive(Debug)]
 pub struct Deck {
     source: Option<Arc<Track>>,
 
@@ -45,10 +108,15 @@ pub struct Deck {
     /// True when this deck contributes audio to the engine output. False
     /// means the deck is muted and renders silence (without advancing).
     playing: bool,
+
+    /// Atomic snapshot shared with the main-thread handle. Audio-thread-only
+    /// writes; `Arc::clone` happens off-RT in the constructor.
+    shared: Arc<DeckSharedState>,
 }
 
 impl Deck {
-    /// Construct an empty deck with no track loaded.
+    /// Construct an empty deck with no track loaded. Allocates the shared
+    /// atomic state — call this off the audio thread.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -57,19 +125,30 @@ impl Deck {
             rate: 1.0,
             gain: 1.0,
             playing: false,
+            shared: Arc::new(DeckSharedState::new()),
         }
+    }
+
+    /// Return a clone of the shared state Arc. Used by the engine handle
+    /// constructor to plumb the same atomic snapshot to both sides.
+    pub(crate) fn shared(&self) -> Arc<DeckSharedState> {
+        self.shared.clone()
     }
 
     /// Load a track. Resets the playhead to position 0.
     pub fn set_source(&mut self, track: Arc<Track>) {
         self.source = Some(track);
         self.position = 0.0;
+        self.shared.store_position(0.0);
+        self.shared.store_at_end(false);
     }
 
     /// Clear the loaded track. The deck renders silence afterward.
     pub fn clear_source(&mut self) {
         self.source = None;
         self.position = 0.0;
+        self.shared.store_position(0.0);
+        self.shared.store_at_end(false);
     }
 
     /// Borrow the loaded track, if any.
@@ -107,6 +186,8 @@ impl Deck {
     /// length when a source is loaded; otherwise stored as-is.
     pub fn set_position_frames(&mut self, position: f64) {
         self.position = position;
+        self.shared.store_position(position);
+        self.shared.store_at_end(false);
     }
 
     /// Linear gain. Default `1.0`.
@@ -130,6 +211,7 @@ impl Deck {
     /// Set play/pause.
     pub fn set_playing(&mut self, playing: bool) {
         self.playing = playing;
+        self.shared.store_playing(playing);
     }
 
     /// Render this deck's contribution into `out`, mixing additively.
@@ -205,6 +287,15 @@ impl Deck {
         }
 
         self.position = pos;
+
+        // Publish snapshot for UI. Two atomic writes, both Relaxed —
+        // the UI does not need to synchronize on these, only observe
+        // the most recent value.
+        self.shared.store_position(pos);
+        let off_end = pos < 0.0 || pos >= track_len;
+        if off_end != self.shared.load_at_end() {
+            self.shared.store_at_end(off_end);
+        }
     }
 }
 

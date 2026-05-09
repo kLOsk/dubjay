@@ -31,18 +31,34 @@ fn run() -> Result<()> {
     const BLOCKS: u64 = 100_000;
     const SAMPLE_RATE: f32 = 48_000.0;
     const BLOCK_SIZE: usize = 64;
+    const COMMANDS_PER_INTERVAL: u64 = 100;
 
     println!(
-        "rt-audit: rendering {BLOCKS} blocks of {BLOCK_SIZE} stereo frames @ {SAMPLE_RATE} Hz"
+        "rt-audit: rendering {BLOCKS} blocks of {BLOCK_SIZE} stereo frames @ {SAMPLE_RATE} Hz \
+         (with command-channel drain)"
     );
 
-    let mut engine = Engine::new(SAMPLE_RATE, BLOCK_SIZE);
+    // Build the production engine variant — with a command channel — so
+    // the drain path is part of the audit. Pre-stage commands periodically
+    // to make sure draining itself is alloc-free.
+    let (mut engine, mut handle) = Engine::new_with_handle(SAMPLE_RATE, BLOCK_SIZE);
     let mut buffer = vec![0.0f32; 2 * BLOCK_SIZE];
     let mut rt = RealtimeContext::new();
 
     let start = Instant::now();
+    let mut total_commands_sent: u64 = 0;
     assert_no_alloc::assert_no_alloc(|| {
-        for _ in 0..BLOCKS {
+        for i in 0..BLOCKS {
+            // Every ~1000 blocks, push a small burst of commands. Sending
+            // through `EngineHandle` MUST be alloc-free — it's a try_push
+            // on a pre-allocated ringbuf, no boxing.
+            if i.is_multiple_of(1_000) {
+                for _ in 0..COMMANDS_PER_INTERVAL {
+                    if handle.deck(0).set_gain(0.5).is_ok() {
+                        total_commands_sent += 1;
+                    }
+                }
+            }
             engine.render(&mut rt, &mut buffer);
             // Defeat dead-code elimination so the render call isn't
             // optimized away in release. This is essential for honest
@@ -51,6 +67,7 @@ fn run() -> Result<()> {
         }
     });
     let elapsed = start.elapsed();
+    println!("rt-audit: drained {total_commands_sent} commands during render");
 
     let total_seconds = (BLOCKS as f32 * BLOCK_SIZE as f32) / SAMPLE_RATE;
     let realtime_factor = total_seconds / elapsed.as_secs_f32();

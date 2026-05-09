@@ -96,15 +96,47 @@ Per PRD §4.4:
 
 ## UI ↔ Engine messaging
 
-Bidirectional, lock-free:
+Bidirectional, lock-free.
 
-- **UI → Engine** (commands): `ringbuf::HeapRb<Command>` SPSC. UI pushes,
-  audio thread pops at the start of each render block.
-- **Engine → UI** (events / state): two channels.
-  1. **Events:** `ringbuf::HeapRb<EngineEvent>` for discrete events
-     (xrun detected, FX engaged, source mode changed).
-  2. **State snapshot:** atomic-store of a small struct (transport position,
-     deck states, peak meters) every block. UI polls at 60 fps.
+### UI → Engine (commands) — implemented in M2
+
+`ringbuf::HeapRb<Command>` (SPSC, capacity 256). UI pushes, audio thread
+pops at the start of each render block. Producer side lives in
+`dub_engine::EngineHandle`; consumer side is owned by `Engine`.
+
+- `Command` is a `#[repr]`-friendly enum (`Copy`, ≤ 32 bytes), no `Box`,
+  no `dyn Trait`. Variants today: `DeckPlay`, `DeckPause`, `DeckSeek`,
+  `DeckSetRate`, `DeckSetGain`. Adding a command is one variant + one
+  match arm in `apply_command`.
+- The drain is RT-safe: `try_pop` is a load + index, and every variant
+  applies in-place to the deck array. Verified by `rt-audit` with 100k
+  blocks and 10k pre-staged commands under `assert_no_alloc`.
+- Track loading is **not** a command yet. Tracks are pre-loaded before
+  `AudioOutput::start`. The reason: swapping `Arc<Track>` on the audio
+  thread risks dropping the old `Arc` to zero, which calls `dealloc`
+  (a syscall). M3 (disk streaming) introduces a "trash channel" sending
+  the old `Arc` back to the main thread for drop, then enables a
+  `LoadTrack` command.
+
+### Engine → UI (state snapshot) — implemented in M2
+
+Per-deck `Arc<DeckSharedState>` carrying:
+
+- `position_bits: AtomicU64` (`f64::to_bits` of current track frame),
+- `is_playing: AtomicBool`,
+- `at_end: AtomicBool`.
+
+Audio thread writes (Relaxed) once per render block. UI reads (Relaxed)
+at whatever rate it likes — typically 60 fps for waveforms. There is no
+synchronization guarantee across fields; tearing during a transport
+change is invisible at 60 fps and we deliberately avoid the cost of
+`SeqCst` here.
+
+### Engine → UI (events) — pending M4+
+
+`ringbuf::HeapRb<EngineEvent>` for discrete events (xrun detected, source
+mode changed, end-of-track reached, etc.). Not yet wired; the snapshot
+covers everything we need through M3.
 
 ## Build / link / ship
 

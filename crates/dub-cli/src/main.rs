@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use dub_engine::{Engine, RealtimeContext};
+use dub_engine::{Engine, EngineHandle, RealtimeContext};
 use dub_io::Track;
 
 fn main() -> ExitCode {
@@ -65,9 +65,13 @@ fn print_help() {
     eprintln!("  play <input>      [--realtime] [-o <output>] [--rate R] [--gain G]");
     eprintln!("                    [--sr SR] [--block-size N] [--duration SECS]");
     eprintln!("                    [--buffer-size FRAMES]");
+    eprintln!("                    [--pause-at SECS] [--resume-at SECS]");
+    eprintln!("                    [--seek-at WALL=POS_SECS]");
     eprintln!();
     eprintln!("  play (offline, default): render to a 32-bit float WAV through the engine.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
+    eprintln!("    --pause-at, --resume-at, --seek-at drive the engine's lock-free");
+    eprintln!("    command channel (M2 transport) from the main thread while audio runs.");
 }
 
 fn smoke() -> Result<()> {
@@ -177,6 +181,14 @@ struct PlayOpts {
     realtime: bool,
     duration: Option<f64>,
     buffer_size: Option<u32>,
+    /// Wall-clock seconds (since playback start) at which to send a
+    /// pause command. M2 demo for the lock-free command channel.
+    pause_at: Option<f64>,
+    /// Wall-clock seconds at which to send a play (resume) command.
+    resume_at: Option<f64>,
+    /// `WALL=POS` — at `WALL` wall-clock seconds, seek deck 0 to `POS`
+    /// track-seconds. M2 demo of the seek command.
+    seek_at: Option<(f64, f64)>,
 }
 
 impl Default for PlayOpts {
@@ -191,6 +203,9 @@ impl Default for PlayOpts {
             realtime: false,
             duration: None,
             buffer_size: None,
+            pause_at: None,
+            resume_at: None,
+            seek_at: None,
         }
     }
 }
@@ -254,6 +269,32 @@ impl PlayOpts {
                     opts.buffer_size = Some(v.parse().context("--buffer-size not an integer")?);
                     i += 2;
                 }
+                "--pause-at" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--pause-at expects seconds"))?;
+                    opts.pause_at = Some(v.parse().context("--pause-at not a number")?);
+                    i += 2;
+                }
+                "--resume-at" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--resume-at expects seconds"))?;
+                    opts.resume_at = Some(v.parse().context("--resume-at not a number")?);
+                    i += 2;
+                }
+                "--seek-at" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--seek-at expects WALL=POS in seconds"))?;
+                    let (wall, pos) = v
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("--seek-at expects WALL=POS, got {v}"))?;
+                    let wall: f64 = wall.parse().context("--seek-at WALL not a number")?;
+                    let pos: f64 = pos.parse().context("--seek-at POS not a number")?;
+                    opts.seek_at = Some((wall, pos));
+                    i += 2;
+                }
                 s if s.starts_with('-') => {
                     return Err(anyhow!("unknown flag: {s}"));
                 }
@@ -306,16 +347,11 @@ fn play(args: &[String]) -> Result<()> {
     }
 }
 
-/// Build an engine + deck-0 pre-loaded with `track`, with the requested rate,
-/// gain, and starting position (end-of-track if rate is negative).
-fn build_configured_engine(
-    track: Track,
-    engine_sr: f32,
-    block_size: usize,
-    opts: &PlayOpts,
-) -> (Engine, std::sync::Arc<Track>) {
-    let track = std::sync::Arc::new(track);
-    let mut engine = Engine::new(engine_sr, block_size);
+/// Pre-load deck 0 with `track`, set rate/gain/start-position, and
+/// mark it playing. Used after both `Engine::new` and
+/// `Engine::new_with_handle` so behavior is identical between offline
+/// and realtime paths.
+fn configure_deck0(engine: &mut Engine, track: &std::sync::Arc<Track>, opts: &PlayOpts) {
     engine.deck_mut(0).set_source(track.clone());
     engine.deck_mut(0).set_gain(opts.gain);
     engine.deck_mut(0).set_rate(opts.rate);
@@ -325,7 +361,35 @@ fn build_configured_engine(
         let last = (track.frames().saturating_sub(1)) as f64;
         engine.deck_mut(0).set_position_frames(last);
     }
+}
+
+/// Build an engine + deck-0 pre-loaded with `track`, with the requested
+/// rate, gain, and starting position (end-of-track if rate is negative).
+/// Offline variant — no command channel, single-threaded.
+fn build_configured_engine(
+    track: Track,
+    engine_sr: f32,
+    block_size: usize,
+    opts: &PlayOpts,
+) -> (Engine, std::sync::Arc<Track>) {
+    let track = std::sync::Arc::new(track);
+    let mut engine = Engine::new(engine_sr, block_size);
+    configure_deck0(&mut engine, &track, opts);
     (engine, track)
+}
+
+/// Realtime variant — paired with an [`EngineHandle`] for cross-thread
+/// transport commands.
+fn build_configured_engine_with_handle(
+    track: Track,
+    engine_sr: f32,
+    block_size: usize,
+    opts: &PlayOpts,
+) -> (Engine, EngineHandle, std::sync::Arc<Track>) {
+    let track = std::sync::Arc::new(track);
+    let (mut engine, handle) = Engine::new_with_handle(engine_sr, block_size);
+    configure_deck0(&mut engine, &track, opts);
+    (engine, handle, track)
 }
 
 fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
@@ -435,9 +499,23 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     let natural_secs = (track_frames as f64) / track_sr / abs_rate;
     let play_secs = opts.duration.unwrap_or(natural_secs);
 
-    let (engine, _track_arc) = build_configured_engine(track, engine_sr, opts.block_size, opts);
+    let (engine, mut handle, _track_arc) =
+        build_configured_engine_with_handle(track, engine_sr, opts.block_size, opts);
 
     println!("  playing:      {play_secs:.3} s");
+
+    // Build the transport schedule. Events are sorted by wall-clock time
+    // and then fired in order from this (main) thread. Each fire is a
+    // single ringbuf push; the audio thread observes the change at the
+    // start of its next render block (≤ buffer-size latency later).
+    #[allow(clippy::cast_possible_truncation)]
+    let schedule = build_transport_schedule(opts, play_secs, track_sr as f32);
+    if !schedule.is_empty() {
+        println!("  schedule:");
+        for ev in &schedule {
+            println!("    t={:.3}s {}", ev.wall_secs(), ev.describe());
+        }
+    }
 
     let start = Instant::now();
     let output = dub_audio::AudioOutput::start_with_buffer_size(engine, opts.buffer_size)
@@ -446,22 +524,129 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     let latency_ms = output.latency_seconds() * 1000.0;
     println!("  buffer (act): {achieved} frames -> {latency_ms:.2} ms one-way");
 
-    // The render callback runs on CoreAudio's RT thread; we just wait
-    // here until it's time to stop.
-    let sleep_for = Duration::from_secs_f64(play_secs.max(0.0));
-    thread::sleep(sleep_for);
+    // Sleep up to the first scheduled event, fire it, sleep to the next,
+    // and so on. Every command is sent from this thread, never from the
+    // audio thread.
+    let mut last_wall = 0.0f64;
+    for ev in &schedule {
+        let dt = (ev.wall_secs() - last_wall).max(0.0);
+        thread::sleep(Duration::from_secs_f64(dt));
+        ev.fire(&mut handle)?;
+        let snap = handle.deck_state(0).unwrap();
+        println!(
+            "    @{:.3}s applied {:<14} | pos={:.1}fr playing={}",
+            ev.wall_secs(),
+            ev.describe(),
+            snap.position_frames,
+            snap.is_playing
+        );
+        last_wall = ev.wall_secs();
+    }
+    let remaining = (play_secs - last_wall).max(0.0);
+    thread::sleep(Duration::from_secs_f64(remaining));
 
     let elapsed = start.elapsed();
     let cb_count = output.callback_count();
+    let final_snap = handle.deck_state(0).unwrap();
     drop(output);
 
     println!(
         "  callbacks:    {cb_count} render calls in {:.3} s",
         elapsed.as_secs_f64()
     );
+    println!(
+        "  final state:  pos={:.1}fr playing={} at_end={}",
+        final_snap.position_frames, final_snap.is_playing, final_snap.at_end
+    );
     if cb_count == 0 {
         anyhow::bail!("CoreAudio fired zero render callbacks; device probably failed to start");
     }
     println!("OK");
     Ok(())
+}
+
+/// One transport event scheduled to fire from the main thread at a given
+/// wall-clock offset since playback start.
+#[derive(Debug, Clone, Copy)]
+enum ScheduledEvent {
+    Pause { wall_secs: f64 },
+    Resume { wall_secs: f64 },
+    Seek { wall_secs: f64, pos_frames: f64 },
+}
+
+impl ScheduledEvent {
+    fn wall_secs(self) -> f64 {
+        match self {
+            Self::Pause { wall_secs }
+            | Self::Resume { wall_secs }
+            | Self::Seek { wall_secs, .. } => wall_secs,
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Pause { .. } => "pause".to_string(),
+            Self::Resume { .. } => "resume".to_string(),
+            Self::Seek { pos_frames, .. } => format!("seek({pos_frames:.0}fr)"),
+        }
+    }
+
+    fn fire(self, handle: &mut EngineHandle) -> Result<()> {
+        match self {
+            Self::Pause { .. } => handle.deck(0).pause()?,
+            Self::Resume { .. } => handle.deck(0).play()?,
+            Self::Seek { pos_frames, .. } => handle.deck(0).seek(pos_frames)?,
+        }
+        Ok(())
+    }
+}
+
+// `wall_secs` is a method, not a struct field, on a Copy enum — wrap it
+// for sorting since `partial_cmp` on `Self` returns Option (NaN guard).
+struct ScheduledEventList(Vec<ScheduledEvent>);
+
+impl ScheduledEventList {
+    fn iter(&self) -> std::slice::Iter<'_, ScheduledEvent> {
+        self.0.iter()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a ScheduledEventList {
+    type Item = &'a ScheduledEvent;
+    type IntoIter = std::slice::Iter<'a, ScheduledEvent>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+fn build_transport_schedule(opts: &PlayOpts, play_secs: f64, track_sr: f32) -> ScheduledEventList {
+    let mut events: Vec<ScheduledEvent> = Vec::new();
+    if let Some(t) = opts.pause_at {
+        if t >= 0.0 && t <= play_secs {
+            events.push(ScheduledEvent::Pause { wall_secs: t });
+        }
+    }
+    if let Some(t) = opts.resume_at {
+        if t >= 0.0 && t <= play_secs {
+            events.push(ScheduledEvent::Resume { wall_secs: t });
+        }
+    }
+    if let Some((wall, pos_secs)) = opts.seek_at {
+        if wall >= 0.0 && wall <= play_secs {
+            let pos_frames = pos_secs * f64::from(track_sr);
+            events.push(ScheduledEvent::Seek {
+                wall_secs: wall,
+                pos_frames,
+            });
+        }
+    }
+    events.sort_by(|a, b| {
+        a.wall_secs()
+            .partial_cmp(&b.wall_secs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ScheduledEventList(events)
 }

@@ -69,7 +69,7 @@ impl Track {
             return None;
         }
         let n = samples.len();
-        if n == 0 || n % usize::from(channels) != 0 {
+        if n == 0 || !n.is_multiple_of(usize::from(channels)) {
             return None;
         }
         let frames = n / usize::from(channels);
