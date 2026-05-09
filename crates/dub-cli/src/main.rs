@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         "rt-audit" => rt_audit(),
         "version" => version(),
         "play" => play(&args[2..]),
+        "measure-latency" => measure_latency(),
         "help" | "-h" | "--help" => {
             print_help();
             return ExitCode::SUCCESS;
@@ -57,11 +58,13 @@ fn print_help() {
     eprintln!("usage: dub <subcommand> [args]");
     eprintln!();
     eprintln!("subcommands:");
-    eprintln!("  smoke         engine handshake + zero-render");
-    eprintln!("  rt-audit      stress the render path under assert_no_alloc");
-    eprintln!("  version       print versions");
-    eprintln!("  play <input>  [--realtime] [-o <output>] [--rate R] [--gain G]");
-    eprintln!("                [--sr SR] [--block-size N] [--duration SECS]");
+    eprintln!("  smoke             engine handshake + zero-render");
+    eprintln!("  rt-audit          stress the render path under assert_no_alloc");
+    eprintln!("  version           print versions");
+    eprintln!("  measure-latency   query the default output device for SR + buffer + latency");
+    eprintln!("  play <input>      [--realtime] [-o <output>] [--rate R] [--gain G]");
+    eprintln!("                    [--sr SR] [--block-size N] [--duration SECS]");
+    eprintln!("                    [--buffer-size FRAMES]");
     eprintln!();
     eprintln!("  play (offline, default): render to a 32-bit float WAV through the engine.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
@@ -128,6 +131,41 @@ fn version() -> Result<()> {
     Ok(())
 }
 
+fn measure_latency() -> Result<()> {
+    let info = dub_audio::query_default_output().context("querying default output")?;
+    let latency_ms = f64::from(info.buffer_frames) / f64::from(info.sample_rate) * 1000.0;
+
+    println!("default output device:");
+    println!("  sample rate:      {} Hz", info.sample_rate);
+    println!("  channels:         {}", info.channels);
+    println!("  buffer (current): {} frames", info.buffer_frames);
+    #[cfg(target_os = "macos")]
+    println!(
+        "  buffer (range):   {}-{} frames",
+        info.buffer_frame_range.min, info.buffer_frame_range.max
+    );
+    println!("  latency:          {latency_ms:.2} ms (output buffer only)");
+
+    // Echo what each common buffer size would mean at the device's SR.
+    println!();
+    println!("latency at common buffer sizes (this device's SR):");
+    for &n in &[64u32, 128, 256, 512, 1024] {
+        let ms = f64::from(n) / f64::from(info.sample_rate) * 1000.0;
+        println!("  {n:>4} frames -> {ms:6.2} ms");
+    }
+
+    if latency_ms < 8.0 {
+        println!("\nOK ({latency_ms:.2} ms < 8 ms PRD target)");
+    } else {
+        println!(
+            "\nNOTE: current device buffer ({:.2} ms) exceeds the <8 ms PRD target.",
+            latency_ms
+        );
+        println!("Try `dub play --realtime --buffer-size 256` to request a smaller buffer.");
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PlayOpts {
     input: Option<PathBuf>,
@@ -138,6 +176,7 @@ struct PlayOpts {
     block_size: usize,
     realtime: bool,
     duration: Option<f64>,
+    buffer_size: Option<u32>,
 }
 
 impl Default for PlayOpts {
@@ -151,6 +190,7 @@ impl Default for PlayOpts {
             block_size: 64,
             realtime: false,
             duration: None,
+            buffer_size: None,
         }
     }
 }
@@ -205,6 +245,13 @@ impl PlayOpts {
                         .get(i + 1)
                         .ok_or_else(|| anyhow!("--duration expects seconds"))?;
                     opts.duration = Some(v.parse().context("--duration not a number")?);
+                    i += 2;
+                }
+                "--buffer-size" => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--buffer-size expects frames"))?;
+                    opts.buffer_size = Some(v.parse().context("--buffer-size not an integer")?);
                     i += 2;
                 }
                 s if s.starts_with('-') => {
@@ -372,11 +419,14 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
         );
     }
 
-    println!("  device SR:  {} Hz", device.sample_rate);
-    println!("  engine SR:  {engine_sr} Hz");
-    println!("  block size: {} frames (hint)", opts.block_size);
-    println!("  rate:       {}", opts.rate);
-    println!("  gain:       {}", opts.gain);
+    println!("  device SR:    {} Hz", device.sample_rate);
+    println!("  engine SR:    {engine_sr} Hz");
+    println!("  device buffer (current): {} frames", device.buffer_frames);
+    if let Some(req) = opts.buffer_size {
+        println!("  buffer (req): {req} frames");
+    }
+    println!("  rate:         {}", opts.rate);
+    println!("  gain:         {}", opts.gain);
 
     let track_sr = f64::from(track.sample_rate());
     let track_frames = track.frames();
@@ -387,10 +437,14 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
 
     let (engine, _track_arc) = build_configured_engine(track, engine_sr, opts.block_size, opts);
 
-    println!("  playing:    {play_secs:.3} s");
+    println!("  playing:      {play_secs:.3} s");
 
     let start = Instant::now();
-    let output = dub_audio::AudioOutput::start(engine).context("starting CoreAudio output")?;
+    let output = dub_audio::AudioOutput::start_with_buffer_size(engine, opts.buffer_size)
+        .context("starting CoreAudio output")?;
+    let achieved = output.buffer_frames();
+    let latency_ms = output.latency_seconds() * 1000.0;
+    println!("  buffer (act): {achieved} frames -> {latency_ms:.2} ms one-way");
 
     // The render callback runs on CoreAudio's RT thread; we just wait
     // here until it's time to stop.
@@ -402,7 +456,7 @@ fn play_realtime(track: Track, opts: &PlayOpts) -> Result<()> {
     drop(output);
 
     println!(
-        "  callbacks:  {cb_count} render calls in {:.3} s",
+        "  callbacks:    {cb_count} render calls in {:.3} s",
         elapsed.as_secs_f64()
     );
     if cb_count == 0 {

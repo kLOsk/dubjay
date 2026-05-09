@@ -16,3 +16,6 @@ thiserror = { workspace = true }
 # corresponding `cfg(target_os = "windows")` block.
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { workspace = true }
+objc2-core-audio = { workspace = true }
+objc2-core-audio-types = { workspace = true }
+objc2-audio-toolbox = { workspace = true }

@@ -56,6 +56,13 @@ hound = "3"
 # and direct device control.
 coreaudio-rs = "0.14"
 
+# Direct FFI to CoreAudio for the bits coreaudio-rs doesn't wrap (e.g.
+# kAudioDevicePropertyBufferFrameSize). Versions track what coreaudio-rs
+# 0.14 already pulls in transitively, to avoid duplicate symbol versions.
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-audio-toolbox = "0.3"
+
 # Test-only
 proptest = "1"
 insta = "1"

@@ -35,7 +35,7 @@ mod macos;
 pub use error::AudioError;
 
 #[cfg(target_os = "macos")]
-pub use macos::{query_default_output, AudioOutput};
+pub use macos::{query_default_output, AudioOutput, BufferFrameRange};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,6 +47,11 @@ pub struct DeviceInfo {
     pub sample_rate: f32,
     /// Channel count (output channels). Currently always 2.
     pub channels: u32,
+    /// Current device buffer size, in frames per render callback.
+    pub buffer_frames: u32,
+    /// Allowed buffer-size range for this device (frames).
+    #[cfg(target_os = "macos")]
+    pub buffer_frame_range: BufferFrameRange,
 }
 
 #[cfg(test)]
