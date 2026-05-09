@@ -132,6 +132,78 @@ increments an atomic `trash_overflow_count`. Leaking is the lesser evil
 versus a forbidden `dealloc` on the RT thread, and the counter surfaces
 the contract violation to the UI for logging.
 
+### De-click envelope on transport changes — M3.5
+
+Any instantaneous transport mutation (track load, seek, play/pause)
+would change the value the deck reads from one sample to the next.
+A jump function in the time domain is, in the frequency domain, a
+brief impulse with infinite-frequency content — the ear hears that
+as a click.
+
+`crates/dub-engine/src/declick.rs` precomputes a 2 ms equal-power
+crossfade table at engine construction (one per engine, shared as
+`Arc<DeclickEnvelope>` across decks). At 48 kHz that's 96 samples ×
+4 bytes = 384 bytes — sits in L1 cache.
+
+Each `Deck` carries:
+
+- `declick_envelope: Arc<DeclickEnvelope>` (read-only),
+- `declick: DeclickState` (`Idle` or `Active{ prev_source, prev_position,
+  prev_rate, prev_playing, samples_remaining }`),
+- `pending_disposal: Option<Arc<Track>>` for back-to-back swaps.
+
+Mutators that change what the deck reads (`set_source`, `swap_source`,
+`set_position_frames`, `set_playing` on transition, `clear_source`)
+all call `start_declick`, which snapshots the *current* state into
+`Active{prev_*}` before the caller mutates `self`. The render loop
+then runs two phases per block:
+
+1. **Fade phase** (while `samples_remaining > 0`): per sample, read
+   `(old_l, old_r)` from `prev_source` at `prev_position` and
+   `(new_l, new_r)` from `self.source` at `self.position`. Mix
+   `out = old · (1 − fade_in[i]) + new · fade_in[i]` where
+   `fade_in[i] = sin²(i · π/(2N))` is read from the envelope table.
+2. **Steady phase**: normal additive interpolation, identical to the
+   M2 render path.
+
+The audio thread never drops `Arc<Track>`. After every render block
+the engine sweeps each deck for finished ramps and `pending_disposal`
+slots and ferries any orphaned `Arc<Track>` through the trash channel
+(§Trash channel above). Back-to-back transport changes within a single
+2 ms window stash one displaced Arc in `pending_disposal`; in the
+≥4-deep edge case (physically impossible from human input) we
+`mem::forget` and increment the same overflow counter the trash
+channel uses.
+
+**Tail-fade**: complementary primitive sharing the same envelope. The
+transport declick fires on user-initiated state changes; it does not
+fire when the playhead simply walks past the last sample of a track
+(that's the data running out, not a transport mutation). Without a
+tail-fade, the deck reads "last in-range value, then zero" in one
+sample — a step function the ear hears as a click. The `track_tail_fade_scale`
+helper applies `cos²` over the last `N` frames of every track read,
+on both the steady-state path and inside the M3.5 crossfade's old/new
+sides. Gated by a `track_len ≥ 2 × envelope_length` threshold so
+sub-millisecond test tracks aren't obliterated.
+
+Verification: 7 declick + tail-fade unit tests cover fade-in monotonicity,
+fade-out to silence on pause, A→B crossfade smoothness, no-jump bound
+on per-sample deltas, back-to-back-swap Arc accounting, end-of-track
+smoothness, and the short-track skip threshold. `rt-audit` exercises
+100k blocks with 20 hot-loads each producing a 2 ms fade, all under
+`assert_no_alloc`, with zero overflows.
+
+**End-to-end audit**: subjective listening is a poor debug loop for
+clicks, so M3.5 also ships a `dub analyze <wav>` subcommand that
+reads any 32-bit-float (or 16-bit PCM) WAV and reports peak, RMS,
+DC offset, clipping count, and the maximum per-sample first-difference
+per channel, flagging samples where `|s[i] − s[i-1]|` exceeds a
+configurable threshold (default 0.05). The offline `dub play -o`
+path supports the same scheduled transport events as realtime, so a
+hot-swap scenario can be rendered deterministically and audited
+mathematically — current measured worst-case delta on the M3.5 demo
+suite is 0.0187, against a click step of order 0.5+.
+
 ### Engine → UI (state snapshot) — implemented in M2
 
 Per-deck `Arc<DeckSharedState>` carrying:

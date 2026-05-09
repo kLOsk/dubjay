@@ -24,6 +24,8 @@ use anyhow::{anyhow, Context, Result};
 use dub_engine::{Engine, EngineHandle, RealtimeContext};
 use dub_io::Track;
 
+mod analyze;
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("smoke");
@@ -33,6 +35,7 @@ fn main() -> ExitCode {
         "rt-audit" => rt_audit(),
         "version" => version(),
         "play" => play(&args[2..]),
+        "analyze" => analyze_cmd(&args[2..]),
         "measure-latency" => measure_latency(),
         "help" | "-h" | "--help" => {
             print_help();
@@ -68,13 +71,20 @@ fn print_help() {
     eprintln!("                    [--pause-at SECS] [--resume-at SECS]");
     eprintln!("                    [--seek-at WALL=POS_SECS]");
     eprintln!("                    [--hot-swap-at WALL=PATH_TO_TRACK]");
+    eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
     eprintln!();
     eprintln!("  play (offline, default): render to a 32-bit float WAV through the engine.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
-    eprintln!("    --pause-at, --resume-at, --seek-at drive the engine's lock-free");
-    eprintln!("    command channel (M2 transport) from the main thread while audio runs.");
-    eprintln!("    --hot-swap-at sends a DeckLoad command (M3); the new track is decoded");
-    eprintln!("    pre-emptively, the old Arc<Track> is bounced through the trash channel.");
+    eprintln!("    --pause-at, --resume-at, --seek-at, --hot-swap-at drive the engine's");
+    eprintln!("    lock-free command channel from the main thread (M2/M3 transport).");
+    eprintln!("    All four flags work in BOTH offline and realtime modes — offline uses");
+    eprintln!("    virtual wall-clock derived from rendered frames so results are fully");
+    eprintln!("    deterministic and analyzable via `dub analyze`.");
+    eprintln!();
+    eprintln!("  analyze: read a 32-bit float WAV (e.g. `dub play -o ...`) and report");
+    eprintln!("    peak/RMS/DC, clipping count, max per-sample first-difference per");
+    eprintln!("    channel, and locations where |Δ| exceeds --threshold (default 0.05).");
+    eprintln!("    Use this instead of subjective listening to verify de-click correctness.");
 }
 
 fn smoke() -> Result<()> {
@@ -342,6 +352,37 @@ fn default_output_path(input: &Path) -> PathBuf {
     out
 }
 
+fn analyze_cmd(args: &[String]) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut threshold = analyze::DEFAULT_DELTA_THRESHOLD;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--threshold" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("--threshold expects a value"))?;
+                threshold = v
+                    .parse::<f32>()
+                    .with_context(|| format!("--threshold {v}"))?;
+            }
+            other if other.starts_with("--") => {
+                return Err(anyhow!("unknown analyze flag: {other}"));
+            }
+            other => {
+                if input.is_some() {
+                    return Err(anyhow!("analyze takes a single input WAV"));
+                }
+                input = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+    let input = input.ok_or_else(|| anyhow!("usage: dub analyze <wav> [--threshold DELTA]"))?;
+    analyze::run(&input, threshold)
+}
+
 fn play(args: &[String]) -> Result<()> {
     let opts = PlayOpts::parse(args)?;
     let input = opts
@@ -381,23 +422,11 @@ fn configure_deck0(engine: &mut Engine, track: &std::sync::Arc<Track>, opts: &Pl
     }
 }
 
-/// Build an engine + deck-0 pre-loaded with `track`, with the requested
-/// rate, gain, and starting position (end-of-track if rate is negative).
-/// Offline variant — no command channel, single-threaded.
-fn build_configured_engine(
-    track: Track,
-    engine_sr: f32,
-    block_size: usize,
-    opts: &PlayOpts,
-) -> (Engine, std::sync::Arc<Track>) {
-    let track = std::sync::Arc::new(track);
-    let mut engine = Engine::new(engine_sr, block_size);
-    configure_deck0(&mut engine, &track, opts);
-    (engine, track)
-}
-
-/// Realtime variant — paired with an [`EngineHandle`] for cross-thread
-/// transport commands.
+/// Build an engine + deck-0 pre-loaded with `track`, paired with an
+/// [`EngineHandle`] for transport commands. Used by both the offline
+/// renderer and the realtime CoreAudio player so the same scheduled
+/// events can be applied through either path with bit-identical engine
+/// behavior — only the wall-clock timing differs.
 fn build_configured_engine_with_handle(
     track: Track,
     engine_sr: f32,
@@ -416,6 +445,7 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_output_path(input));
     let engine_sr = opts.engine_sr.unwrap_or(48_000.0);
+    let engine_sr_f = f64::from(engine_sr);
 
     println!("mode:         offline");
     println!("  output:     {}", output.display());
@@ -426,14 +456,31 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
 
     let track_sr = f64::from(track.sample_rate());
     let track_frames = track.frames();
-    let (mut engine, _track_arc) = build_configured_engine(track, engine_sr, opts.block_size, opts);
-
     let abs_rate = opts.rate.abs().max(1e-12);
-    let engine_sr_f = f64::from(engine_sr);
     #[allow(clippy::cast_precision_loss)]
-    let track_frames_f = track_frames as f64;
+    let natural_secs = (track_frames as f64) / track_sr / abs_rate;
+    let play_secs = opts.duration.unwrap_or(natural_secs);
+
+    // Use the same Engine/EngineHandle pattern as `play_realtime` so the
+    // offline path is bit-deterministic against the same scheduled
+    // events. This is essential for analyze-on-output workflows: running
+    // a hot-swap scenario through `play_offline` then through
+    // `dub analyze` should reveal any sample-discontinuity that the
+    // realtime path produced, since the engine code path is identical.
+    let (mut engine, mut handle, _track_arc) =
+        build_configured_engine_with_handle(track, engine_sr, opts.block_size, opts);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let schedule = build_transport_schedule(opts, play_secs, track_sr as f32)?;
+    if !schedule.is_empty() {
+        println!("  schedule:");
+        for ev in &schedule {
+            println!("    t={:.3}s {}", ev.wall_secs(), ev.describe());
+        }
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let total_output_frames = (track_frames_f * (engine_sr_f / track_sr) / abs_rate).ceil() as u64;
+    let total_output_frames = (play_secs * engine_sr_f).ceil() as u64;
     let total_blocks = total_output_frames.div_ceil(opts.block_size as u64);
 
     let spec = hound::WavSpec {
@@ -450,9 +497,32 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
     let mut peak: f32 = 0.0;
     let mut rms_acc: f64 = 0.0;
     let mut n_samples: u64 = 0;
+    let mut frames_rendered: u64 = 0;
+
+    // Schedule iterator: peek ahead to fire events whose virtual
+    // wall-clock has been crossed at the START of each block.
+    let mut sched_iter = schedule.into_iter().peekable();
 
     let start = Instant::now();
     for _ in 0..total_blocks {
+        #[allow(clippy::cast_precision_loss)]
+        let virt_secs = (frames_rendered as f64) / engine_sr_f;
+        while let Some(ev) = sched_iter.peek() {
+            if ev.wall_secs() <= virt_secs {
+                let ev = sched_iter.next().expect("peeked Some");
+                let wall = ev.wall_secs();
+                let label = ev.describe();
+                ev.fire(&mut handle)?;
+                let snap = handle.deck_state(0).unwrap();
+                println!(
+                    "    @{wall:.3}s applied {label:<22} | pos={:.1}fr playing={}",
+                    snap.position_frames, snap.is_playing
+                );
+            } else {
+                break;
+            }
+        }
+
         engine.render(&mut rt, &mut buffer);
         for sample in &buffer {
             writer.write_sample(*sample).context("writing sample")?;
@@ -463,9 +533,13 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
             rms_acc += f64::from(*sample) * f64::from(*sample);
             n_samples += 1;
         }
+        frames_rendered += opts.block_size as u64;
     }
     let elapsed = start.elapsed();
     writer.finalize().context("finalizing output WAV")?;
+
+    let reclaimed = handle.reclaim();
+    let overflow = handle.trash_overflow_count();
 
     #[allow(clippy::cast_precision_loss)]
     let rms = (rms_acc / (n_samples as f64).max(1.0)).sqrt();
@@ -479,6 +553,9 @@ fn play_offline(input: &Path, track: Track, opts: &PlayOpts) -> Result<()> {
     println!("  realtime ×{realtime_factor:.0}");
     println!("  peak:       {peak:.4} ({:.2} dBFS)", 20.0 * peak.log10());
     println!("  rms:        {rms:.4} ({:.2} dBFS)", 20.0 * rms.log10());
+    if reclaimed > 0 || overflow > 0 {
+        println!("  trash:        reclaimed={reclaimed} overflow={overflow}");
+    }
     println!("OK");
     Ok(())
 }

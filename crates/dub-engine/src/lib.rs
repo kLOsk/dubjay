@@ -26,6 +26,7 @@
 
 mod command;
 mod deck;
+pub mod declick;
 mod handle;
 pub mod realtime;
 
@@ -77,10 +78,11 @@ impl Engine {
     /// **Not the audio thread.** Allocations occur.
     #[must_use]
     pub fn new(sample_rate: f32, block_size: usize) -> Self {
+        let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
         Self {
             sample_rate,
             block_size,
-            decks: std::array::from_fn(|_| Deck::new()),
+            decks: std::array::from_fn(|_| Deck::new(envelope.clone())),
             cmd_rx: None,
             trash_tx: None,
             trash_overflow: None,
@@ -96,7 +98,8 @@ impl Engine {
     /// shared state Arcs.
     #[must_use]
     pub fn new_with_handle(sample_rate: f32, block_size: usize) -> (Self, EngineHandle) {
-        let decks: [Deck; DECK_COUNT] = std::array::from_fn(|_| Deck::new());
+        let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
+        let decks: [Deck; DECK_COUNT] = std::array::from_fn(|_| Deck::new(envelope.clone()));
         let shared: [std::sync::Arc<deck::DeckSharedState>; DECK_COUNT] =
             std::array::from_fn(|i| decks[i].shared());
         let (handle, side) = EngineHandle::new(shared);
@@ -168,6 +171,15 @@ impl Engine {
         for deck in &mut self.decks {
             deck.render(rt, out, sr);
         }
+
+        // After render, harvest any Arc<Track> orphaned by completed
+        // de-click ramps in this block (and any pending disposals from
+        // back-to-back transport changes that the per-command sweep
+        // didn't catch). This is the contract that lets the audio
+        // thread mutate transport state without ever calling Arc::drop.
+        for idx in 0..DECK_COUNT {
+            self.sweep_deck_disposal(idx);
+        }
     }
 
     /// Drain every pending command, applying each to the engine.
@@ -231,11 +243,42 @@ impl Engine {
                     self.send_to_trash(source);
                     return;
                 };
-                let old = d.swap_source(source);
-                if let Some(old) = old {
-                    self.send_to_trash(old);
-                }
+                d.swap_source(source);
+                // The OLD Arc<Track> (if any) now lives inside the
+                // deck's de-click state for the duration of the ramp;
+                // we'll harvest it after the next render block via
+                // `take_finished_declick_source`. If there was already
+                // a ramp in flight when we called swap, an even-older
+                // Arc may have been displaced into the deck's
+                // pending_disposal slot — sweep that immediately.
+                self.sweep_deck_disposal(idx as usize);
             }
+        }
+    }
+
+    /// Harvest any `Arc<Track>` orphaned by this deck — finished
+    /// crossfades and pending disposals from back-to-back transport
+    /// changes — and route them through the trash channel. Cheap
+    /// (mostly two `Option::take()` checks) and called from the
+    /// engine's command-application and post-render sweeps.
+    fn sweep_deck_disposal(&mut self, idx: usize) {
+        // Two-step take: borrow `decks` only as long as we're popping
+        // each Option, then release before calling `send_to_trash`
+        // which borrows `self.trash_tx`. Avoids `cannot borrow *self
+        // as mutable more than once`.
+        let pending = self
+            .decks
+            .get_mut(idx)
+            .and_then(Deck::take_pending_disposal);
+        if let Some(arc) = pending {
+            self.send_to_trash(arc);
+        }
+        let finished = self
+            .decks
+            .get_mut(idx)
+            .and_then(Deck::take_finished_declick_source);
+        if let Some(arc) = finished {
+            self.send_to_trash(arc);
         }
     }
 
@@ -311,6 +354,8 @@ mod tests {
         let mut engine = Engine::new(48_000.0, 4);
         engine.deck_mut(0).set_source(track);
         engine.deck_mut(0).set_playing(true);
+        // Skip past the M3.5 fade-in ramp so we observe raw playback.
+        engine.deck_mut(0).quiesce_declick_for_test();
 
         let mut buffer = vec![0.0f32; 8];
         let mut rt = RealtimeContext::new();
@@ -330,9 +375,14 @@ mod tests {
 
     #[test]
     fn handle_play_and_pause_apply_on_render() {
-        let track = Arc::new(Track::from_interleaved(vec![0.5; 16], 48_000, 2).unwrap());
+        // Track value is constant 0.5 across all samples. The deck
+        // applies a 2 ms fade on play and pause (M3.5 de-click). We
+        // render enough frames to span the fade and assert on the
+        // post-fade region.
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
         let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 4);
         engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).quiesce_declick_for_test();
 
         // Default state: not playing → first render is silent.
         let mut buffer = vec![0.0f32; 8];
@@ -343,27 +393,37 @@ mod tests {
             assert_eq!(*s, 0.0);
         }
 
-        // Send Play → next render produces audio (the track is 0.5s).
+        // Send Play → fade-in starts. Render 256 frames (well past the
+        // 96-sample / 2 ms fade at 48k) and check post-fade samples.
         handle.deck(0).play().unwrap();
-        let mut buffer = vec![0.0f32; 8];
+        let mut buffer = vec![0.0f32; 256 * 2];
         engine.render(&mut rt, &mut buffer);
-        for s in &buffer {
-            assert!((s - 0.5).abs() < 1e-6, "expected 0.5, got {s}");
+        // Before fade: small values (fade-in starts at 0). After fade
+        // (samples ≥ 96): exactly track value 0.5.
+        for (i, s) in buffer.chunks_exact(2).enumerate().skip(100) {
+            assert!(
+                (s[0] - 0.5).abs() < 1e-6,
+                "post-fade frame {i} L={}, expected 0.5",
+                s[0]
+            );
         }
 
         // Snapshot reflects audio thread state.
         let snap = handle.deck_state(0).unwrap();
         assert!(snap.is_playing);
-        assert!((snap.position_frames - 4.0).abs() < 1e-9);
+        assert!((snap.position_frames - 256.0).abs() < 1e-9);
 
-        // Send Pause → next render advances no further (output starts
-        // from where we paused, but with playing=false we render silence).
+        // Send Pause → fade-out starts. Render 256 frames again; the
+        // post-fade region should be silence (deck paused).
         handle.deck(0).pause().unwrap();
-        let mut buffer = vec![0.0f32; 8];
+        let mut buffer = vec![0.0f32; 256 * 2];
         engine.render(&mut rt, &mut buffer);
-        #[allow(clippy::float_cmp)]
-        for s in &buffer {
-            assert_eq!(*s, 0.0);
+        for (i, s) in buffer.chunks_exact(2).enumerate().skip(100) {
+            assert!(
+                s[0].abs() < 1e-6,
+                "post-fade frame {i} after pause: L={} (want silence)",
+                s[0]
+            );
         }
         let snap = handle.deck_state(0).unwrap();
         assert!(!snap.is_playing);
@@ -371,10 +431,12 @@ mod tests {
 
     #[test]
     fn handle_seek_repositions_playhead() {
-        let mut samples = Vec::with_capacity(40);
-        for i in 0..20 {
+        // 1024-frame track of distinct ramp samples. Long enough to
+        // span the fade window so we can read past it.
+        let mut samples = Vec::with_capacity(2048);
+        for i in 0..1024 {
             #[allow(clippy::cast_precision_loss)]
-            let v = i as f32 * 0.01;
+            let v = i as f32 * 0.001;
             samples.push(v);
             samples.push(v);
         }
@@ -382,20 +444,29 @@ mod tests {
 
         let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 4);
         engine.deck_mut(0).set_source(track);
-        handle.deck(0).play().unwrap();
+        engine.deck_mut(0).quiesce_declick_for_test();
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
 
-        // Seek to frame 10 then render 4 frames.
-        handle.deck(0).seek(10.0).unwrap();
-        let mut buffer = vec![0.0f32; 8];
+        // Seek to frame 100 via the handle. The seek triggers a 96-frame
+        // declick fade. Render 256 frames and check the post-fade region.
+        handle.deck(0).seek(100.0).unwrap();
+        let mut buffer = vec![0.0f32; 256 * 2];
         let mut rt = RealtimeContext::new();
         engine.render(&mut rt, &mut buffer);
 
-        // Expected: frames 10..14 → 0.10, 0.11, 0.12, 0.13.
-        let expected = [0.10, 0.10, 0.11, 0.11, 0.12, 0.12, 0.13, 0.13];
-        for (g, w) in buffer.iter().zip(expected.iter()) {
-            assert!((g - w).abs() < 1e-6, "got {g} want {w}");
+        // After the fade (frame ≥ 100 in the BUFFER, frame ≥ 200 in the
+        // TRACK), output should be the linear ramp 100+i offset.
+        for (i, s) in buffer.chunks_exact(2).enumerate().skip(100) {
+            #[allow(clippy::cast_precision_loss)]
+            let expected = (100 + i) as f32 * 0.001;
+            assert!(
+                (s[0] - expected).abs() < 1e-6,
+                "frame {i}: got {} want {expected}",
+                s[0]
+            );
         }
-        assert!((handle.deck_state(0).unwrap().position_frames - 14.0).abs() < 1e-9);
+        assert!((handle.deck_state(0).unwrap().position_frames - (100.0 + 256.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -418,19 +489,20 @@ mod tests {
 
     #[test]
     fn hot_load_swaps_source_and_returns_old_via_trash() {
-        let track_a = Arc::new(Track::from_interleaved(vec![0.5; 8], 48_000, 2).unwrap());
-        let track_b = Arc::new(Track::from_interleaved(vec![0.25; 8], 48_000, 2).unwrap());
+        // Long tracks so the post-declick samples are still in range.
+        let track_a = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        let track_b = Arc::new(Track::from_interleaved(vec![0.25; 1024], 48_000, 2).unwrap());
 
-        // Track-A starts with refcount 1 (us) + 0 = 1 + the Arc::clone
-        // we'll send into the engine = 2. Watch this go up to 2 then
-        // back down to 1 across load and reclaim.
+        // Track-A: us + the Arc::clone we'll hand to the engine = 2.
         let track_a_for_engine = track_a.clone();
         assert_eq!(Arc::strong_count(&track_a), 2);
 
         let (mut engine, mut handle) = Engine::new_with_handle(48_000.0, 4);
         engine.deck_mut(0).set_source(track_a_for_engine);
         engine.deck_mut(0).set_playing(true);
-        // First render uses track A → output = 0.5.
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        // Steady-state render: 4 frames of track A → 0.5.
         let mut buffer = vec![0.0f32; 8];
         let mut rt = RealtimeContext::new();
         engine.render(&mut rt, &mut buffer);
@@ -438,16 +510,30 @@ mod tests {
             assert!((s - 0.5).abs() < 1e-6);
         }
 
-        // Hot-load track B. Before reclaim the engine is holding the
-        // old A on its way through the trash channel — so strong_count
-        // is still 2 (ours + the trash buffer slot).
+        // Hot-load track B. The DeckLoad applies during the next render
+        // and triggers a declick fade A → B. Render 256 frames so we
+        // span the fade and observe steady-state B in the tail.
         handle.deck(0).load(track_b.clone()).unwrap();
-        let mut buffer = vec![0.0f32; 8];
+        let mut buffer = vec![0.0f32; 256 * 2];
         engine.render(&mut rt, &mut buffer);
-        for s in &buffer {
-            assert!((s - 0.25).abs() < 1e-6, "after swap expected 0.25, got {s}");
+        for (i, s) in buffer.chunks_exact(2).enumerate().skip(100) {
+            assert!(
+                (s[0] - 0.25).abs() < 1e-6,
+                "post-fade frame {i}: got {} want 0.25",
+                s[0]
+            );
         }
-        assert_eq!(Arc::strong_count(&track_a), 2, "old Arc still in trash");
+        // The trash channel is fed by the post-render sweep when the
+        // declick ramp finishes. With a 96-sample fade and a 256-frame
+        // block, the ramp completed in this block, so the old Arc is
+        // already in the trash channel.
+        //
+        // Strong count: us + trash channel slot = 2.
+        assert_eq!(
+            Arc::strong_count(&track_a),
+            2,
+            "old Arc should be in the trash channel after fade completes"
+        );
 
         // Reclaim drops the old Arc on the main thread → strong_count
         // drops back to 1.
@@ -502,8 +588,10 @@ mod tests {
         let mut engine = Engine::new(48_000.0, 4);
         engine.deck_mut(0).set_source(track_a);
         engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
         engine.deck_mut(1).set_source(track_b);
         engine.deck_mut(1).set_playing(true);
+        engine.deck_mut(1).quiesce_declick_for_test();
 
         let mut buffer = vec![0.0f32; 8];
         let mut rt = RealtimeContext::new();
