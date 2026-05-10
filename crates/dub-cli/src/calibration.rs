@@ -321,16 +321,13 @@ pub fn snr_margin(carrier: &MeasurementStats, lift: &MeasurementStats) -> f32 {
 /// rename.
 #[must_use]
 pub fn format_string(format: Format) -> &'static str {
-    match format {
-        Format::SeratoCv02 => "serato-cv02",
-        // Traktor MK2 is M6 territory; the format string is pinned
-        // here so calibration JSONs from M6 builds are recognizable
-        // by older readers ("we know what this format is, we just
-        // can't decode it"). The CLI rejects calibration of
-        // unsupported formats earlier, before reaching this code
-        // path.
-        Format::TraktorMk2 => "traktor-mk2",
-    }
+    // M6: thin wrapper over `Format::cli_name()`. Kept as a separate
+    // public symbol because the calibration JSON schema treats this
+    // as the on-disk format key — renaming `Format::cli_name` later
+    // shouldn't silently rewrite every calibration file's `format`
+    // field. If the canonical CLI vocabulary ever needs to diverge
+    // from the on-disk vocabulary, this is where to fork.
+    format.cli_name()
 }
 
 /// Sanitize a CoreAudio device name for use in a filename.

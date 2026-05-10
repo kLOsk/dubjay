@@ -29,16 +29,26 @@ pub const DEFAULT_WINDOW_MS: f32 = 25.0;
 /// # Errors
 /// Returns any error from WAV decoding, sample-format mismatches,
 /// or filesystem I/O.
-pub fn run(input: Option<&Path>, synthetic: bool, window_ms: f32, max_lines: usize) -> Result<()> {
+pub fn run(
+    input: Option<&Path>,
+    synthetic: bool,
+    window_ms: f32,
+    max_lines: usize,
+    format: Format,
+) -> Result<()> {
     if synthetic {
-        return run_synthetic(window_ms, max_lines);
+        return run_synthetic(window_ms, max_lines, format);
     }
-    let path = input
-        .ok_or_else(|| anyhow!("usage: dub decode-timecode <wav> [--window MS] [--head N]"))?;
-    run_file(path, window_ms, max_lines)
+    let path = input.ok_or_else(|| {
+        anyhow!(
+            "usage: dub decode-timecode <wav> [--format serato-cv02|traktor-mk1|traktor-mk2] \
+             [--window MS] [--head N]"
+        )
+    })?;
+    run_file(path, window_ms, max_lines, format)
 }
 
-fn run_file(path: &Path, window_ms: f32, max_lines: usize) -> Result<()> {
+fn run_file(path: &Path, window_ms: f32, max_lines: usize, format: Format) -> Result<()> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
     let spec = reader.spec();
@@ -71,19 +81,12 @@ fn run_file(path: &Path, window_ms: f32, max_lines: usize) -> Result<()> {
     let interleaved = read_stereo_f32(&mut reader)
         .with_context(|| format!("reading samples from {}", path.display()))?;
 
-    decode_and_report(
-        Format::SeratoCv02,
-        sample_rate,
-        &interleaved,
-        window_ms,
-        max_lines,
-    )
+    decode_and_report(format, sample_rate, &interleaved, window_ms, max_lines)
 }
 
-fn run_synthetic(window_ms: f32, max_lines: usize) -> Result<()> {
+fn run_synthetic(window_ms: f32, max_lines: usize, format: Format) -> Result<()> {
     use dub_timecode::signal::Generator;
     let sample_rate = 48_000.0_f32;
-    let format = Format::SeratoCv02;
     println!(
         "decode-timecode: SYNTHETIC ({:?}, sr={} Hz, no input file)",
         format, sample_rate
@@ -261,11 +264,12 @@ fn read_stereo_f32(
 }
 
 /// Argument parser used by `main`.
-pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, bool, f32, usize)> {
+pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, bool, f32, usize, Format)> {
     let mut input: Option<PathBuf> = None;
     let mut synthetic = false;
     let mut window_ms = DEFAULT_WINDOW_MS;
     let mut max_lines = 40_usize;
+    let mut format = Format::SeratoCv02;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -289,6 +293,17 @@ pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, bool, f32, usize)
                     .context("--head not an integer")?;
                 i += 2;
             }
+            "--format" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    anyhow!("--format expects 'serato-cv02', 'traktor-mk1', or 'traktor-mk2'")
+                })?;
+                format = Format::from_cli_arg(v).ok_or_else(|| {
+                    anyhow!(
+                        "unknown --format '{v}' (supported: serato-cv02, traktor-mk1, traktor-mk2)"
+                    )
+                })?;
+                i += 2;
+            }
             s if s.starts_with('-') => {
                 return Err(anyhow!("unknown flag: {s}"));
             }
@@ -301,5 +316,5 @@ pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, bool, f32, usize)
             }
         }
     }
-    Ok((input, synthetic, window_ms, max_lines))
+    Ok((input, synthetic, window_ms, max_lines, format))
 }

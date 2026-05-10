@@ -361,17 +361,14 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                     .with_context(|| format!("--amplitude {v}"))?;
             }
             "--format" => {
-                let v = iter
-                    .next()
-                    .ok_or_else(|| anyhow!("--format expects 'serato-cv02'"))?;
-                opts.format = match v.as_str() {
-                    "serato-cv02" | "serato" | "cv02" => Format::SeratoCv02,
-                    other => {
-                        return Err(anyhow!(
-                            "unknown --format '{other}' (only 'serato-cv02' supported in v1)"
-                        ))
-                    }
-                };
+                let v = iter.next().ok_or_else(|| {
+                    anyhow!("--format expects 'serato-cv02', 'traktor-mk1', or 'traktor-mk2'")
+                })?;
+                opts.format = Format::from_cli_arg(v.as_str()).ok_or_else(|| {
+                    anyhow!(
+                        "unknown --format '{v}' (supported: serato-cv02, traktor-mk1, traktor-mk2)"
+                    )
+                })?;
             }
             other if other.starts_with("--") => {
                 return Err(anyhow!("unknown scope flag: {other}"));
@@ -1293,12 +1290,34 @@ mod tests {
             let o = parse_opts(&s(&["--format", v])).unwrap();
             assert!(matches!(o.format, Format::SeratoCv02));
         }
+        for v in ["traktor-mk1", "mk1"] {
+            let o = parse_opts(&s(&["--format", v])).unwrap();
+            assert!(
+                matches!(o.format, Format::TraktorMk1),
+                "alias '{v}' must parse as TraktorMk1"
+            );
+        }
+        for v in ["traktor-mk2", "mk2"] {
+            let o = parse_opts(&s(&["--format", v])).unwrap();
+            assert!(
+                matches!(o.format, Format::TraktorMk2),
+                "alias '{v}' must parse as TraktorMk2"
+            );
+        }
     }
 
     #[test]
     fn parse_opts_rejects_unknown_format() {
+        // Garbage formats should still error out.
+        let r = parse_opts(&s(&["--format", "rekordbox"]));
+        assert!(r.is_err(), "unsupported format must error");
+        // Bare 'traktor' is also rejected as ambiguous (MK1 vs MK2).
+        // See Format::from_cli_arg docstring.
         let r = parse_opts(&s(&["--format", "traktor"]));
-        assert!(r.is_err());
+        assert!(
+            r.is_err(),
+            "bare 'traktor' must error to avoid silent mis-routing"
+        );
     }
 
     #[test]

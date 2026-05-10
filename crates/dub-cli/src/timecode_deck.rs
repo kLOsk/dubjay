@@ -93,6 +93,15 @@ struct Opts {
     /// e.g. `--deck-b-input-channels 5,6` for SL3 deck B. `None`
     /// keeps single-deck mode.
     deck_b_input_channels: Option<Vec<u32>>,
+    /// Timecode format for both decks. M6 added Traktor MK1 (2 kHz)
+    /// and Traktor MK2 (2.5 kHz) alongside Serato CV02. The default
+    /// stays Serato CV02 to keep M5.3+ invocations working without
+    /// a flag. Per-deck mixed format (e.g. Serato A + Traktor B,
+    /// or MK1 A + MK2 B) isn't supported in the CLI yet — the
+    /// engine already handles it (every `attach_timecode_input`
+    /// is per-deck), so adding `--deck-b-format` later is a
+    /// one-line change.
+    format: Format,
     /// Output buffer size hint for CoreAudio output (frames). Smaller
     /// = lower output latency. None means "device default".
     output_buffer_size: Option<u32>,
@@ -167,6 +176,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     let mut deck_a_out_ch: Option<u32> = None;
     let mut deck_b_out_ch: Option<u32> = None;
     let mut deck_b_input_channels: Option<Vec<u32>> = None;
+    let mut format = Format::SeratoCv02;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -273,6 +283,20 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                 );
                 i += 2;
             }
+            "--format" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    anyhow!("--format expects 'serato-cv02', 'traktor-mk1', or 'traktor-mk2'")
+                })?;
+                format = Format::from_cli_arg(v).ok_or_else(|| {
+                    anyhow!(
+                        "unknown --format '{v}' (supported: serato-cv02, traktor-mk1, \
+                         traktor-mk2; bare 'traktor' is rejected as ambiguous — MK1 \
+                         is 2 kHz carrier, MK2 is 2.5 kHz, picking the wrong one \
+                         silently plays back at the wrong speed)"
+                    )
+                })?;
+                i += 2;
+            }
             "--deck-b-input-channels" => {
                 let v = args.get(i + 1).ok_or_else(|| {
                     anyhow!(
@@ -302,7 +326,8 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     if positional.is_empty() {
         return Err(anyhow!(
             "usage: dub timecode-deck <track-a.wav> [<track-b.wav>] --input-channels N,M \
-             [--deck-b-input-channels N,M] [--device NAME] \
+             [--deck-b-input-channels N,M] [--format serato-cv02|traktor-mk1|traktor-mk2] \
+             [--device NAME] \
              [--duration SECS] [--confidence T] [--disengage-threshold T] \
              [--sticky-blocks N] [--amplitude-threshold T] \
              [--output-buffer-size FRAMES] [--recalibrate] [--no-probe] [--no-calibrate] \
@@ -365,6 +390,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
         duration_secs: input.duration.unwrap_or(DEFAULT_RUN_SECS),
         input,
         deck_b_input_channels,
+        format,
         output_buffer_size,
         confidence,
         disengage,
@@ -513,19 +539,21 @@ pub fn run(args: &[String]) -> Result<()> {
         amplitude_threshold: resolved.amplitude,
     };
     engine
-        .attach_timecode_input(0, rx_a, cfg(Format::SeratoCv02))
+        .attach_timecode_input(0, rx_a, cfg(opts.format))
         .context("attaching timecode input to deck 0")?;
     if two_deck {
         let rx_b = input
             .take_consumer_pair(1)
             .ok_or_else(|| anyhow!("AudioInput pair 1 consumer already taken"))?;
         engine
-            .attach_timecode_input(1, rx_b, cfg(Format::SeratoCv02))
+            .attach_timecode_input(1, rx_b, cfg(opts.format))
             .context("attaching timecode input to deck 1")?;
     }
     println!(
-        "timecode:     format=SeratoCv02 engage={:.3} disengage={:.3} \
+        "timecode:     format={} ({:.0} Hz carrier) engage={:.3} disengage={:.3} \
          sticky={} blocks amp_floor={:.4}{}",
+        opts.format.cli_name(),
+        opts.format.carrier_hz(),
         resolved.engage,
         resolved.disengage,
         resolved.sticky_blocks_to_disengage,
@@ -852,10 +880,24 @@ fn resolve_output_routing(
 /// rigs" requirement: even if the same SL3 is used across cartridge
 /// swaps, the fingerprint catches the change at startup and the
 /// thresholds are re-derived in place.
+///
+/// **Format-aware (M6 fix).** The calibration JSON path keys off
+/// `(device_name, opts.format)` so a user with both Serato and
+/// Traktor records on the same SL3 keeps independent calibrations
+/// per format. An earlier draft of M6 hardcoded `Format::SeratoCv02`
+/// here — which silently loaded the Serato JSON when the user passed
+/// `--format traktor-mk1`, then ran the carrier probe at the wrong
+/// nominal frequency (1 kHz Serato vs the 2 kHz the MK1 record was
+/// actually emitting), so the probe got `rate ≈ 2.0×` and timed out
+/// trying to find unity-rate stability. Fallback then used Serato
+/// thresholds against MK1 audio, which worked passably (similar
+/// signal levels) but was not the right calibration. Pinned by
+/// the regression test
+/// `resolve_thresholds_uses_opts_format_for_calibration_path` below.
 fn resolve_thresholds(input: &mut AudioInput, opts: &Opts) -> Result<CalibrationThresholds> {
-    let format = Format::SeratoCv02;
+    let format = opts.format;
     let dir = default_calibration_dir().context("resolving default calibration dir")?;
-    let path = Calibration::path_for(input.device_name(), format, &dir);
+    let path = calibration_path_for(input.device_name(), opts, &dir);
 
     // Bypass-everything modes first.
     if opts.no_calibrate {
@@ -1021,6 +1063,27 @@ fn save_calibration(cal: &Calibration, path: &std::path::Path) {
     }
 }
 
+/// Compute the on-disk path the calibration JSON should live at for
+/// the given input device + run options. Pure — no I/O, no audio
+/// device access — so the format-passthrough is unit-testable
+/// without a hardware fixture.
+///
+/// **Why this is its own helper.** An earlier draft of M6 inlined
+/// this logic inside `resolve_thresholds` and silently used
+/// `Format::SeratoCv02` instead of `opts.format`, which loaded the
+/// wrong calibration JSON and ran the carrier probe at the wrong
+/// nominal frequency when the user passed `--format traktor-mk1`.
+/// Extracting this lets us pin the contract ("the path always
+/// derives from `opts.format`") with a fast unit test that doesn't
+/// need a real audio device.
+fn calibration_path_for(
+    device_name: &str,
+    opts: &Opts,
+    dir: &std::path::Path,
+) -> std::path::PathBuf {
+    Calibration::path_for(device_name, opts.format, dir)
+}
+
 /// Difference in days between `calibrated_at` (RFC-3339) and now.
 /// Returns 0.0 if `calibrated_at` is unparseable so the freshness
 /// warning never spuriously fires for older / future-schema files.
@@ -1045,6 +1108,7 @@ mod tests {
             track_b: None,
             input: InputArgs::default(),
             deck_b_input_channels: None,
+            format: Format::SeratoCv02,
             output_buffer_size: None,
             confidence: None,
             disengage: None,
@@ -1148,6 +1212,89 @@ mod tests {
         // Tolerance for sub-second clock drift across the test's
         // own runtime.
         assert!((age - 30.0).abs() < 0.01, "expected ~30, got {age}");
+    }
+
+    /// Regression: an earlier draft of M6 hardcoded
+    /// `Format::SeratoCv02` in `resolve_thresholds` instead of
+    /// reading `opts.format`, so `dub timecode-deck --format
+    /// traktor-mk1` silently loaded the Serato calibration JSON
+    /// (`SL_3_serato-cv02.json`) and ran the carrier probe at the
+    /// 1 kHz Serato carrier — which produced `rate ≈ 2.0×` against
+    /// the actual 2 kHz MK1 carrier and timed the probe out. This
+    /// test pins that the path always derives from `opts.format`.
+    #[test]
+    fn calibration_path_uses_opts_format_serato() {
+        let dir = std::path::Path::new("/tmp/dub-test");
+        let opts = Opts {
+            format: Format::SeratoCv02,
+            ..opts_default()
+        };
+        let p = calibration_path_for("SL 3", &opts, dir);
+        assert!(
+            p.to_string_lossy().contains("serato-cv02"),
+            "expected serato-cv02 in path, got {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn calibration_path_uses_opts_format_traktor_mk1() {
+        let dir = std::path::Path::new("/tmp/dub-test");
+        let opts = Opts {
+            format: Format::TraktorMk1,
+            ..opts_default()
+        };
+        let p = calibration_path_for("SL 3", &opts, dir);
+        assert!(
+            p.to_string_lossy().contains("traktor-mk1"),
+            "expected traktor-mk1 in path, got {}",
+            p.display()
+        );
+        assert!(
+            !p.to_string_lossy().contains("serato"),
+            "MK1 must not load the Serato JSON, got {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn calibration_path_uses_opts_format_traktor_mk2() {
+        let dir = std::path::Path::new("/tmp/dub-test");
+        let opts = Opts {
+            format: Format::TraktorMk2,
+            ..opts_default()
+        };
+        let p = calibration_path_for("SL 3", &opts, dir);
+        assert!(
+            p.to_string_lossy().contains("traktor-mk2"),
+            "expected traktor-mk2 in path, got {}",
+            p.display()
+        );
+        assert!(
+            !p.to_string_lossy().contains("traktor-mk1"),
+            "MK2 must not collide with MK1, got {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn calibration_path_distinct_per_format_for_same_device() {
+        // Three formats × one device = three independent JSON files.
+        // Pin the disjointness so a future refactor can't accidentally
+        // share calibration across formats.
+        let dir = std::path::Path::new("/tmp/dub-test");
+        let mut paths = vec![];
+        for format in [Format::SeratoCv02, Format::TraktorMk1, Format::TraktorMk2] {
+            let opts = Opts {
+                format,
+                ..opts_default()
+            };
+            paths.push(calibration_path_for("SL 3", &opts, dir));
+        }
+        // All three must be distinct.
+        assert_ne!(paths[0], paths[1]);
+        assert_ne!(paths[1], paths[2]);
+        assert_ne!(paths[0], paths[2]);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Timecode-vinyl decoder for Dub.
 //!
-//! Currently supports **Serato CV02** in relative-mode-only (PRD §5.4).
-//! [`Format::TraktorMk2`] is enumerated for API stability but full
-//! decode lands in M6.
+//! Supports **Serato CV02**, **Traktor MK1** and **Traktor MK2** in
+//! relative-mode-only (PRD §5.4 / §6). All three share the same
+//! decode algorithm — only the nominal carrier frequency differs
+//! per format (1 / 2 / 2.5 kHz respectively). Absolute-mode decoding
+//! is deferred to a future v1.x milestone.
 //!
 //! Pipeline:
 //!

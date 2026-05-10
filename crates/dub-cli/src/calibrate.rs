@@ -164,17 +164,14 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                     .with_context(|| format!("--detect-timeout {v}"))?;
             }
             "--format" => {
-                let v = iter
-                    .next()
-                    .ok_or_else(|| anyhow!("--format expects 'serato-cv02'"))?;
-                opts.format = match v.as_str() {
-                    "serato-cv02" | "serato" | "cv02" => Format::SeratoCv02,
-                    other => {
-                        return Err(anyhow!(
-                            "unknown --format '{other}' (only 'serato-cv02' supported in v1)"
-                        ))
-                    }
-                };
+                let v = iter.next().ok_or_else(|| {
+                    anyhow!("--format expects 'serato-cv02', 'traktor-mk1', or 'traktor-mk2'")
+                })?;
+                opts.format = Format::from_cli_arg(v.as_str()).ok_or_else(|| {
+                    anyhow!(
+                        "unknown --format '{v}' (supported: serato-cv02, traktor-mk1, traktor-mk2)"
+                    )
+                })?;
             }
             "-o" | "--output" => {
                 let v = iter

@@ -101,10 +101,12 @@ fn print_help() {
     eprintln!("                    [--deck-b-hot-swap-at WALL=PATH]");
     eprintln!("  analyze <wav>     [--threshold DELTA]   sample-discontinuity auditor");
     eprintln!("  decode-timecode <wav>");
+    eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [--window MS] [--head N]");
-    eprintln!("                    [--synthetic]   offline timecode-vinyl decoder (M5.1)");
+    eprintln!("                    [--synthetic]   offline timecode-vinyl decoder (M5.1+M6)");
     eprintln!("  timecode-deck <track-a> [<track-b>]");
     eprintln!("                    --input-channels N,M [--deck-b-input-channels N,M]");
+    eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [--device NAME] [--sr SR]");
     eprintln!("                    [--duration SECS] [--confidence T]");
     eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
@@ -114,16 +116,19 @@ fn print_help() {
     eprintln!("                                         [--output-channels N])]");
     eprintln!("                    [--device-profile NAME]");
     eprintln!(
-        "                                    live timecode (1- or 2-deck) (M5.3+M5.4.2+M5.5.2+M5.6)"
+        "                                    live timecode (1- or 2-deck, Serato + Traktor) \
+         (M5.3+M5.4.2+M5.5.2+M5.6+M6)"
     );
     eprintln!("  scope             [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--duration SECS]");
     eprintln!("                    [--engage T] [--disengage T] [--sticky N]");
-    eprintln!("                    [--amplitude T] [--format serato-cv02]");
-    eprintln!("                                    live timecode scope (TUI) (M5.4.1)");
+    eprintln!("                    [--amplitude T]");
+    eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
+    eprintln!("                                    live timecode scope (TUI) (M5.4.1+M6)");
     eprintln!("  calibrate         [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--carrier-secs S] [--lift-secs S]");
-    eprintln!("                    [--detect-timeout S] [--format serato-cv02]");
+    eprintln!("                    [--detect-timeout S]");
+    eprintln!("                    [--format serato-cv02|traktor-mk1|traktor-mk2]");
     eprintln!("                    [-o PATH] [--no-save]");
     eprintln!("                                    auto-calibrate per rig + persist (M5.4.2)");
     eprintln!();
@@ -600,8 +605,8 @@ fn analyze_cmd(args: &[String]) -> Result<()> {
 }
 
 fn decode_timecode_cmd(args: &[String]) -> Result<()> {
-    let (input, synthetic, window_ms, max_lines) = decode_timecode::parse_args(args)?;
-    decode_timecode::run(input.as_deref(), synthetic, window_ms, max_lines)
+    let (input, synthetic, window_ms, max_lines, format) = decode_timecode::parse_args(args)?;
+    decode_timecode::run(input.as_deref(), synthetic, window_ms, max_lines, format)
 }
 
 /// One loaded deck ready to be configured into the engine.

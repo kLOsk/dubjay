@@ -114,17 +114,29 @@ pub struct Decoder {
 impl Decoder {
     /// Create a decoder for the given timecode format and sample rate.
     ///
+    /// As of M6 all three relative-mode formats are supported:
+    /// [`Format::SeratoCv02`] (1 kHz carrier),
+    /// [`Format::TraktorMk1`] (2 kHz, AM modulation), and
+    /// [`Format::TraktorMk2`] (2.5 kHz, offset modulation). The
+    /// algorithm is format-agnostic — the only per-format parameter
+    /// the decoder uses today is the nominal carrier frequency,
+    /// pulled from [`Format::carrier_hz`]. All three encode their
+    /// stereo carrier in the same quadrature convention (`ch0 = sin`,
+    /// `ch1 = cos`), validated empirically against real cartridges
+    /// on the SL3 in M5.3 (Serato) and M6 (both Traktor generations).
+    /// MK2's offset modulation rides as a vertical DC shift; the
+    /// cartridge/preamp AC-couples it out before it reaches us, so
+    /// the relative-mode math sees a clean 2.5 kHz carrier.
+    ///
+    /// Absolute-position decoding (the bitstream riding on top of
+    /// the carrier) still isn't done — relative mode covers v1's
+    /// scratch-DJ workflow.
+    ///
     /// # Panics
-    /// `sample_rate` must be positive and `format` must be
-    /// [`Format::SeratoCv02`] in v1. Traktor MK2 is enumerated for
-    /// API stability but rejected here until M6.
+    /// `sample_rate` must be positive.
     #[must_use]
     pub fn new(format: Format, sample_rate: f32) -> Self {
         assert!(sample_rate > 0.0, "sample rate must be > 0");
-        assert!(
-            matches!(format, Format::SeratoCv02),
-            "only Serato CV02 is decoded in v1 (M5.1); Traktor MK2 lands in M6"
-        );
         Self {
             sample_rate,
             carrier_hz: format.carrier_hz(),
@@ -429,6 +441,142 @@ mod tests {
                 let _ = dec.process(&buf);
             }
         });
+    }
+
+    /// M6: Traktor round-trip parity. The decoder math is format-
+    /// agnostic — the only per-format parameter today is `carrier_hz`
+    /// — so the same property tests should pass at 2 kHz (MK1) and
+    /// 2.5 kHz (MK2) as at 1 kHz (Serato). Both are covered because
+    /// their carriers differ by 25%; decoding MK2 vinyl with an MK1
+    /// nominal would silently play back at +25% speed — exactly the
+    /// bug class these property tests catch.
+    fn roundtrip_format(format: Format, rate: f64, n_frames: usize) -> DecodeOutput {
+        let sr = 48_000.0_f32;
+        let mut gen = Generator::new(format, sr);
+        let mut dec = Decoder::new(format, sr);
+        let mut buf = vec![0.0f32; n_frames * 2];
+        gen.render(&mut buf, rate, 0.5);
+        dec.process(&buf)
+    }
+
+    #[test]
+    fn traktor_mk1_unity_decodes_to_unity() {
+        let out = roundtrip_format(Format::TraktorMk1, 1.0, 4_800);
+        assert!(
+            (out.rate - 1.0).abs() < RATE_TOL,
+            "MK1 rate = {} (want ≈1.0)",
+            out.rate
+        );
+        assert!(out.confidence > 0.99);
+        assert!((out.amplitude - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn traktor_mk2_unity_decodes_to_unity() {
+        let out = roundtrip_format(Format::TraktorMk2, 1.0, 4_800);
+        assert!(
+            (out.rate - 1.0).abs() < RATE_TOL,
+            "MK2 rate = {} (want ≈1.0)",
+            out.rate
+        );
+        assert!(out.confidence > 0.99);
+    }
+
+    #[test]
+    fn traktor_mk1_reverse_decodes_negative() {
+        let out = roundtrip_format(Format::TraktorMk1, -1.0, 4_800);
+        assert!(
+            (out.rate - (-1.0)).abs() < RATE_TOL,
+            "MK1 reverse = {}",
+            out.rate
+        );
+    }
+
+    #[test]
+    fn traktor_mk2_reverse_decodes_negative() {
+        let out = roundtrip_format(Format::TraktorMk2, -1.0, 4_800);
+        assert!(
+            (out.rate - (-1.0)).abs() < RATE_TOL,
+            "MK2 reverse = {}",
+            out.rate
+        );
+    }
+
+    #[test]
+    fn traktor_mk2_4x_rate_clears_alias_band() {
+        // At 2.5 kHz carrier, alias band starts at 0.5·SR/carrier
+        // = 9.6× rate. Real DJ scratching tops out ~8× so we have
+        // headroom — but it's the tightest of our three formats.
+        // Pin a 4× rate test so any future regression that drops
+        // alias-safety below 5× shows up as a test failure.
+        let out = roundtrip_format(Format::TraktorMk2, 4.0, 4_800);
+        assert!(
+            (out.rate - 4.0).abs() < RATE_TOL * 4.0,
+            "MK2 4× rate = {} (want ≈4.0, well clear of alias band)",
+            out.rate
+        );
+    }
+
+    #[test]
+    fn traktor_position_integrates_at_unity_for_both_generations() {
+        // 1 second at unity rate should advance position by 1 second
+        // for both MK1 (2 kHz) and MK2 (2.5 kHz). If the
+        // generator-decoder loop ever desynchronises on carrier, this
+        // test moves first.
+        for format in [Format::TraktorMk1, Format::TraktorMk2] {
+            let sr = 48_000.0_f32;
+            let mut gen = Generator::new(format, sr);
+            let mut dec = Decoder::new(format, sr);
+            let mut buf = vec![0.0f32; 48_000 * 2];
+            gen.render(&mut buf, 1.0, 0.5);
+            let out = dec.process(&buf);
+            assert!(
+                (out.position_secs - 1.0).abs() < 0.01,
+                "{format:?} position = {} (want ≈1.0s)",
+                out.position_secs
+            );
+        }
+    }
+
+    #[test]
+    fn mk2_vinyl_decoded_as_mk1_plays_back_too_fast_by_25_percent() {
+        // Critical regression test. M6 was originally shipped with
+        // MK2 set to 2 kHz instead of 2.5 kHz — silent mis-routing,
+        // playback would have been at 80% speed on MK2 vinyl. To
+        // catch any future refactor that accidentally collapses MK1
+        // and MK2 to the same carrier, we *deliberately* feed an
+        // MK2-generated signal to an MK1-configured decoder and
+        // assert the rate comes back at +25% (= 2500/2000), not
+        // +0%. If MK1 and MK2 ever share a carrier, this test will
+        // break — which is the right time to revisit format
+        // proliferation.
+        let sr = 48_000.0_f32;
+        let mut gen_mk2 = Generator::new(Format::TraktorMk2, sr);
+        let mut dec_mk1 = Decoder::new(Format::TraktorMk1, sr);
+        let mut buf = vec![0.0f32; 4_800 * 2];
+        gen_mk2.render(&mut buf, 1.0, 0.5);
+        let out = dec_mk1.process(&buf);
+        let expected = 2500.0 / 2000.0;
+        assert!(
+            (out.rate - expected).abs() < 0.01,
+            "MK2-vinyl-as-MK1-decoder rate = {} (want ≈{} = wrong-by-25%)",
+            out.rate,
+            expected
+        );
+    }
+
+    #[test]
+    fn traktor_silence_yields_low_confidence() {
+        for format in [Format::TraktorMk1, Format::TraktorMk2] {
+            let mut dec = Decoder::new(format, 48_000.0);
+            let buf = vec![0.0f32; 4_800 * 2];
+            let out = dec.process(&buf);
+            assert!(
+                out.confidence < 0.01,
+                "{format:?} confidence on silence = {}",
+                out.confidence
+            );
+        }
     }
 
     #[test]

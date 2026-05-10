@@ -248,15 +248,16 @@ hot-swap scenario can be rendered deterministically and audited
 mathematically — current measured worst-case delta on the M3.5 demo
 suite is 0.0187, against a click step of order 0.5+.
 
-### Timecode decoder, relative-mode-only — M5.1
+### Timecode decoder, relative-mode-only — M5.1 / M6
 
 Lives in `dub-timecode`. Pure DSP, no I/O, no allocations on the hot
 path — designed to drop straight onto the audio thread when M5.3 wires
 it up to live audio input.
 
 **Signal model.** Both stereo channels carry the same nominal sinusoid
-at the format's carrier (1 kHz for Serato CV02), offset by 90° between
-ch0 and ch1. The convention — verified empirically against a real
+at the format's carrier — **1 kHz** for Serato CV02, **2 kHz** for
+Traktor MK1, **2.5 kHz** for Traktor MK2 (since M6) — offset by 90°
+between ch0 and ch1. The convention — verified empirically against a real
 Serato Control CV02 cartridge through an SL3 — is `ch0 ≈ A·sin(φ)`,
 `ch1 ≈ A·cos(φ)`, with ch0 *leading* ch1 by 90° at forward play.
 Treating each frame as a complex sample `s = ch1 + j·ch0` makes the
@@ -301,18 +302,69 @@ parity tracking. The L/R quadrature relationship of the printed signal
 is the only direction encoding we need.
 
 **Limits.** Per-sample phase advance saturates at ±π, which puts a
-`Nyquist / carrier = 24×` ceiling on trackable rates at 48 kHz / 1 kHz.
-Real DJ scratching tops out at ~8×, well clear. Below that limit the
+`Nyquist / carrier` ceiling on trackable rates: 24× at 48 kHz / 1 kHz
+(Serato), 12× at 48 kHz / 2 kHz (MK1), 9.6× at 48 kHz / 2.5 kHz (MK2).
+Real DJ scratching tops out at ~8×, well clear of all three ceilings —
+MK2 is the tightest but still has 20% headroom. Below the limit the
 estimator is bias-free and limited only by sample-rate quantization
 (~50 µs at 48 kHz, equivalent to ~0.005 of unity rate).
 
-**What's *not* here yet.** Absolute position (M6 — needs bitstream
-demod and the format's 20-bit code table), stickiness policy (M5.4 —
-"confidence dropped below threshold for N ms → freeze deck" lives in
-the integration layer, not in the DSP), and AGC + cartridge
-calibration (M6 — real-world amplitude variation). The decoder
-exposes `confidence` and `amplitude` so the integration layer can
-implement those policies without modifying the DSP.
+**Multi-format (M6).** All three relative-mode formats — Serato CV02
+(1 kHz), **Traktor MK1** (2 kHz, AM modulation), and **Traktor MK2**
+(2.5 kHz, offset modulation where the modulation rides as a vertical
+DC shift instead of as amplitude changes) — decode through the same
+code path. The only per-format parameter the algorithm uses today
+is `Format::carrier_hz()`; position-bit count and side-A length are
+exposed for future absolute-mode work but not consumed yet. MK2's
+offset modulation is AC-coupled out by the cartridge/preamp before
+it reaches us, so the relative-mode math sees a clean 2.5 kHz
+carrier and works without per-format branches. The L/R quadrature
+convention (`ch0 = sin(φ)`, `ch1 = cos(φ)`, ch0 leads ch1 by 90° at
+forward play) is empirically the same for all three vendors — all
+three copied from the xwax-documented spec — so a single decoder
+handles any record without per-format branches. If a future format
+needs a different convention, `Format` is the right place to add a
+`ch0_is_sin: bool` (or similar) and the decoder gets a one-line
+conditional swap of `re`/`im` mapping.
+
+**Why MK1 and MK2 are separate variants** even though only `carrier_hz`
+differs: getting the carrier wrong is silent — playback at the wrong
+speed, no error, no warning, no log. M6 was first drafted with MK2 at
+2 kHz (matching MK1) which would have played MK2 vinyl back at 80%
+speed; the bug was caught because the user asked the right question
+("can we support both old and new?") before live-testing. The fix:
+distinct enum variants, distinct `carrier_hz` (2000 vs 2500), and a
+deliberate cross-format regression test (`mk2_vinyl_decoded_as_mk1_
+plays_back_too_fast_by_25_percent`) that fails the moment a refactor
+collapses the carriers. The CLI also rejects the bare alias `traktor`
+for the same reason — forcing the user to know which generation they
+own beats silent mis-routing.
+
+**CLI vocabulary.** `Format::from_cli_arg` accepts:
+
+- `serato-cv02` / `serato` / `cv02` → `SeratoCv02`
+- `traktor-mk1` / `mk1` → `TraktorMk1`
+- `traktor-mk2` / `mk2` → `TraktorMk2`
+- bare `traktor` → **rejected** (ambiguous)
+
+Every CLI subcommand (`scope`, `calibrate`, `timecode-deck`,
+`decode-timecode`) uses them so the vocabulary is consistent.
+`Format::cli_name()` is the inverse — the on-disk format key in
+the calibration JSON. Round-tripped by unit test so renaming an
+alias can't desync the JSON. Calibration is per-format keyed
+already (`device_key("SL 3", Format::TraktorMk1)` is a different
+file than `Format::TraktorMk2`), so a user with both records on
+the same SL3 keeps two independent calibrations.
+
+**What's *not* here yet.** Absolute position (needs bitstream
+demod and the format's 20- or 23-bit code table), stickiness
+policy (M5.4 — "confidence dropped below threshold for N ms →
+freeze deck" lives in the integration layer, not in the DSP),
+and AGC + cartridge calibration (real-world amplitude variation
+is handled by M5.4.2's per-rig threshold derivation rather than
+by the DSP). The decoder exposes `confidence` and `amplitude` so
+the integration layer can implement those policies without
+modifying the DSP.
 
 **License + provenance.** Clean-room implementation from the
 xwax/Mixxx algorithm description; no xwax code copied (xwax is BSD;
