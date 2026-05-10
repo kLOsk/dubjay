@@ -21,7 +21,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.87"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/klos/dubjay"
+repository = "https://github.com/kLOsk/dubjay"
 authors = ["klos"]
 
 [workspace.dependencies]

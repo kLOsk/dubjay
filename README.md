@@ -6,7 +6,7 @@
 
 *Mac-first. Rust-cored. GPLv3.*
 
-[![CI](https://github.com/klos/dubjay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/klos/dubjay/actions/workflows/ci.yml)
+[![CI](https://github.com/kLOsk/dubjay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kLOsk/dubjay/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#status)
