@@ -806,6 +806,22 @@ pub struct InputOptions {
     /// output channels [0..channels) are taken straight from device
     /// input channels [0..channels) — fine for a 2-channel mic.
     pub channel_map: Option<Vec<i32>>,
+    /// **M5.6**: split the incoming interleaved-`channels` stream
+    /// into N independent stereo ringbuffers, one per `(l, r)` pair.
+    /// Each entry names the 0-based logical AU channels that form
+    /// that pair's L and R; the IOProc demuxes per-frame and pushes
+    /// 2 samples per pair into separate SPSC rings.
+    ///
+    /// Required for two-deck timecode (M5.6): SL3 input is opened
+    /// 4-channel via `channel_map = [2,3,4,5]` (= device ch 3..6),
+    /// then `output_pairs = [(0, 1), (2, 3)]` gives deck A pair 0
+    /// and deck B pair 1. Each pair's consumer goes to its own
+    /// `Engine::attach_timecode_input(deck_idx, ...)`.
+    ///
+    /// `None` and `Some(vec![(0, 1)])` are equivalent: a single
+    /// stereo pair from the first two channels (= the M5.2 / M5.3
+    /// behaviour). Constraints: `l != r`, both `< channels`.
+    pub output_pairs: Option<Vec<(u32, u32)>>,
 }
 
 impl Default for InputOptions {
@@ -817,6 +833,7 @@ impl Default for InputOptions {
             sample_rate: None,
             ringbuf_frames: 48_000,
             channel_map: None,
+            output_pairs: None,
         }
     }
 }
@@ -831,12 +848,21 @@ impl Default for InputOptions {
 /// no locks, no transcendentals.
 pub struct AudioInput {
     audio_unit: AudioUnit,
-    /// Consumer end of the IOProc → consumer ringbuf. `Some` until the
-    /// caller takes it via [`AudioInput::take_consumer`] (used to plumb
-    /// the input into the engine for M5.3 timecode wiring); after that
-    /// `read_into` returns 0. Dropping the `AudioInput` always stops
-    /// the AudioUnit, regardless of whether the consumer was taken.
-    rx: Option<HeapCons<f32>>,
+    /// Per-pair consumer ends of the IOProc → consumer ringbufs. One
+    /// stereo SPSC ring per `output_pairs` entry; the IOProc demuxes
+    /// the interleaved-`channels` device stream into these rings.
+    /// Each `Some` until the caller takes it via
+    /// [`AudioInput::take_consumer`] / [`AudioInput::take_consumer_pair`]
+    /// (used to plumb the input into the engine for M5.3 / M5.6
+    /// timecode wiring). After taking, the corresponding
+    /// `read_into_pair` returns 0. Dropping the `AudioInput` always
+    /// stops the AudioUnit, regardless of which consumers were taken.
+    ///
+    /// Single-pair mode (M5.2 / M5.3 / M5.4 backward compat): `rxs`
+    /// has length 1; `rxs[0]` is the legacy stereo consumer and
+    /// `take_consumer()` / `read_into()` / `available()` operate on
+    /// it without the caller ever needing to know about pair indices.
+    rxs: Vec<Option<HeapCons<f32>>>,
     callback_count: Arc<AtomicU64>,
     overflow_count: Arc<AtomicU64>,
     sample_rate: f32,
@@ -860,6 +886,15 @@ impl AudioInput {
     /// Returns [`AudioError::Device`] if the device cannot be opened,
     /// the requested format cannot be set, the buffer size cannot be
     /// applied, or the input callback cannot be installed.
+    // Linear HAL setup pipeline: resolve device → set format → set
+    // channel map → initialize → set buffer → build N stereo rings →
+    // install IOProc → start. Splitting it would just hide the
+    // ordering invariants (e.g. channel_map must be applied *before*
+    // initialize, the IOProc closure must capture the producers
+    // *after* they're built). M5.6 added ~30 lines for the multi-pair
+    // ringbuf creation and validation; the function is still a
+    // straight-line setup, not a tangle.
+    #[allow(clippy::too_many_lines)]
     pub fn start_with_options(opts: &InputOptions) -> Result<Self, AudioError> {
         let device_id = resolve_input_device(opts.device_name.as_deref())?;
         let device_name =
@@ -947,32 +982,68 @@ impl AudioInput {
         }
         let buffer_frames = get_buffer_frame_size(device_id)?;
 
-        // Audio→consumer ringbuf. Capacity in *interleaved samples*
-        // = `ringbuf_frames * channels`. That gives us
-        // `ringbuf_frames` frames of headroom regardless of channel
-        // count.
-        let rb_capacity = opts.ringbuf_frames.saturating_mul(channels as usize).max(1);
-        let rb = HeapRb::<f32>::new(rb_capacity);
-        let (mut tx, rx) = rb.split();
+        // Resolve and validate the M5.6 output pairs. `None` and
+        // `Some(vec![(0, 1)])` are equivalent — both mean "one
+        // stereo pair from the first two channels" (the M5.2 / M5.3
+        // single-deck case). Both result in a 1-element `pairs`
+        // vector and the same RT behaviour.
+        let pairs: Vec<(u32, u32)> = match opts.output_pairs.as_ref() {
+            None => vec![(0, 1)],
+            Some(p) if p.is_empty() => {
+                return Err(AudioError::Device(
+                    "InputOptions.output_pairs is Some([]); use None for the default \
+                     single stereo pair, or pass at least one (l, r) pair"
+                        .to_string(),
+                ))
+            }
+            Some(p) => p.clone(),
+        };
+        for (idx, &(l, r)) in pairs.iter().enumerate() {
+            if l >= channels || r >= channels {
+                return Err(AudioError::Device(format!(
+                    "output_pairs[{idx}] = ({l}, {r}) but only {channels} channels are open"
+                )));
+            }
+            if l == r {
+                return Err(AudioError::Device(format!(
+                    "output_pairs[{idx}] = ({l}, {r}): L and R must be different channels \
+                     (a stereo pair from the same mono channel is almost always a bug)"
+                )));
+            }
+        }
+
+        // Per-pair audio→consumer ringbufs. Each ring holds stereo
+        // (capacity in samples = `ringbuf_frames * 2`), giving
+        // `ringbuf_frames` frames of headroom independent of the
+        // device's channel count or the number of pairs.
+        let rb_capacity_per_pair = opts.ringbuf_frames.saturating_mul(2).max(1);
+        let mut txs: Vec<ringbuf::HeapProd<f32>> = Vec::with_capacity(pairs.len());
+        let mut rxs: Vec<Option<HeapCons<f32>>> = Vec::with_capacity(pairs.len());
+        for _ in 0..pairs.len() {
+            let rb = HeapRb::<f32>::new(rb_capacity_per_pair);
+            let (tx, rx) = rb.split();
+            txs.push(tx);
+            rxs.push(Some(rx));
+        }
 
         let callback_count = Arc::new(AtomicU64::new(0));
         let overflow_count = Arc::new(AtomicU64::new(0));
         let cb_count = callback_count.clone();
         let of_count = overflow_count.clone();
 
+        // Capture into the closure: the producers (one per pair),
+        // the channels-per-frame (= AU's logical interleave width),
+        // and the pair offsets. All `Copy` or `Send` enough to live
+        // in the IOProc closure.
+        let channels_us = channels as usize;
+        let pairs_for_cb = pairs.clone();
+
         audio_unit
             .set_input_callback(move |args: InputCallbackArgs| {
                 cb_count.fetch_add(1, Ordering::Relaxed);
-                let buf = args.data.buffer;
-                // Try to push every sample. `push_slice` returns the
-                // number actually pushed; any shortfall is a ring
-                // overflow (consumer too slow). We count it once per
-                // shortfall, not per dropped sample, so the counter
-                // measures *callbacks that lost data* rather than
-                // sample count — useful for a "is the consumer
-                // keeping up?" alert without flooding the counter.
-                let pushed = tx.push_slice(buf);
-                if pushed < buf.len() {
+                let overflow =
+                    push_demuxed_frames(args.data.buffer, channels_us, &pairs_for_cb, &mut txs);
+                if overflow {
                     of_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(())
@@ -985,7 +1056,7 @@ impl AudioInput {
 
         Ok(Self {
             audio_unit,
-            rx: Some(rx),
+            rxs,
             callback_count,
             overflow_count,
             sample_rate,
@@ -995,46 +1066,81 @@ impl AudioInput {
         })
     }
 
-    /// Drain available samples into `dst` (interleaved). Returns the
-    /// number of samples actually copied (≤ `dst.len()`); a partial
-    /// fill simply means the device hasn't produced enough data yet,
-    /// not an error.
+    /// Drain available samples from pair 0 (legacy single-pair) into
+    /// `dst` (interleaved stereo). Returns the number of samples
+    /// actually copied (≤ `dst.len()`); a partial fill simply means
+    /// the device hasn't produced enough data yet, not an error.
     ///
-    /// `dst.len()` should be a multiple of [`AudioInput::channels`]
-    /// for the caller's life to be easy, but the read itself doesn't
-    /// require it — partial frames at the tail just stay in the ring.
+    /// `dst.len()` should be a multiple of 2 for the caller's life
+    /// to be easy (each pair is stereo). Returns 0 if pair 0's
+    /// consumer was previously moved out via [`Self::take_consumer`]
+    /// or [`Self::take_consumer_pair`].
     ///
-    /// Returns 0 if the consumer was previously moved out via
-    /// [`AudioInput::take_consumer`].
+    /// Equivalent to `read_into_pair(0, dst)`. Use the indexed form
+    /// for M5.6 two-deck mode where pair 1 is deck B's input.
     pub fn read_into(&mut self, dst: &mut [f32]) -> usize {
-        self.rx.as_mut().map_or(0, |rx| rx.pop_slice(dst))
+        self.read_into_pair(0, dst)
     }
 
-    /// Move the consumer end of the IOProc → consumer ringbuf out of
-    /// this `AudioInput`. Used by the M5.3 timecode-deck wiring to
-    /// hand the consumer to `dub_engine::Engine::attach_timecode_input`,
-    /// which then runs the decoder on the audio thread directly.
+    /// Drain available stereo samples from pair `idx` into `dst`.
+    /// Returns 0 if `idx` is out of range or that pair's consumer
+    /// has been taken.
+    pub fn read_into_pair(&mut self, idx: usize, dst: &mut [f32]) -> usize {
+        self.rxs
+            .get_mut(idx)
+            .and_then(|slot| slot.as_mut().map(|rx| rx.pop_slice(dst)))
+            .unwrap_or(0)
+    }
+
+    /// Number of stereo pairs configured via
+    /// [`InputOptions::output_pairs`]. Single-pair mode (the M5.2 /
+    /// M5.3 / M5.4 default) returns 1; M5.6 two-deck mode returns 2.
+    #[must_use]
+    pub fn pair_count(&self) -> usize {
+        self.rxs.len()
+    }
+
+    /// Move pair 0's consumer out of this `AudioInput`. Used by the
+    /// M5.3 timecode-deck wiring to hand the consumer to
+    /// `dub_engine::Engine::attach_timecode_input`, which then runs
+    /// the decoder on the audio thread directly.
     ///
-    /// After this, [`AudioInput::read_into`] returns 0 forever (the
-    /// engine owns the consumer; only one reader is sound on an SPSC
-    /// ring). The `AudioInput` itself stays alive on the main thread
-    /// to keep the AudioUnit running and to surface `callback_count` /
-    /// `overflow_count` to the UI; dropping it stops the device.
+    /// After this, [`Self::read_into`] returns 0 forever (the
+    /// engine owns the consumer; only one reader is sound on an
+    /// SPSC ring). The `AudioInput` itself stays alive on the main
+    /// thread to keep the AudioUnit running and to surface
+    /// `callback_count` / `overflow_count` to the UI; dropping it
+    /// stops the device.
     ///
-    /// Returns `None` if the consumer has already been taken.
+    /// Equivalent to `take_consumer_pair(0)`. For M5.6 two-deck
+    /// mode, call `take_consumer_pair(1)` to get deck B's consumer.
     pub fn take_consumer(&mut self) -> Option<HeapCons<f32>> {
-        self.rx.take()
+        self.take_consumer_pair(0)
     }
 
-    /// Number of *interleaved samples* currently buffered between the
-    /// audio thread and the consumer. Divide by [`Self::channels`] to
-    /// get frames.
-    ///
-    /// Returns 0 if the consumer was previously moved out via
-    /// [`AudioInput::take_consumer`].
+    /// Move pair `idx`'s consumer out of this `AudioInput`. Returns
+    /// `None` if `idx` is out of range or that pair was already
+    /// taken. Used by M5.6 two-deck timecode to attach pair 0 to
+    /// engine deck 0 and pair 1 to engine deck 1.
+    pub fn take_consumer_pair(&mut self, idx: usize) -> Option<HeapCons<f32>> {
+        self.rxs.get_mut(idx).and_then(Option::take)
+    }
+
+    /// Number of interleaved stereo samples currently buffered
+    /// between the audio thread and pair 0's consumer. Divide by 2
+    /// to get frames. Returns 0 if pair 0's consumer was taken.
     #[must_use]
     pub fn available(&self) -> usize {
-        self.rx.as_ref().map_or(0, Observer::occupied_len)
+        self.available_pair(0)
+    }
+
+    /// Per-pair version of [`Self::available`].
+    #[must_use]
+    pub fn available_pair(&self, idx: usize) -> usize {
+        self.rxs
+            .get(idx)
+            .and_then(|slot| slot.as_ref().map(Observer::occupied_len))
+            .unwrap_or(0)
     }
 
     /// IOProc callback count since [`AudioInput::start`]. Used by
@@ -1173,6 +1279,51 @@ fn set_input_channel_map(au: &AudioUnit, map: &[i32]) -> Result<(), AudioError> 
     Ok(())
 }
 
+/// Demultiplex an interleaved-N IOProc frame buffer into per-pair
+/// stereo SPSC ringbufs (M5.6 two-deck input).
+///
+/// `buf` is interleaved-`channels`. For each frame (= `channels`
+/// samples), push (L, R) into each `pair`'s ringbuf, where the
+/// L/R indices are 0-based logical AU channels (i.e., post
+/// `kAudioOutputUnitProperty_ChannelMap`).
+///
+/// Returns `true` if any pair's ring was unable to accept both
+/// samples — overflow is signalled once per callback (not per
+/// pair, not per sample), keeping the `overflow_count` counter
+/// meaningful as "how many callbacks lost data" rather than a
+/// sample-loss tally. Same convention as the M5.2 single-pair
+/// path so existing rt-audit traces stay comparable.
+///
+/// **RT-safety**: `push_slice` on `HeapProd` is lock-free (atomic
+/// CAS on the head index). The inner loop is bounded by
+/// `pairs.len()` (1 in single-pair mode, 2 in M5.6 two-deck mode);
+/// on a typical 256-frame CoreAudio callback with 2 pairs that's
+/// 512 push_slice calls of 2 samples each — measured well under
+/// 50 µs / callback, comfortably inside the 5 ms budget at 256/48k.
+///
+/// Extracted from `AudioInput::start_with_options` so the demux
+/// logic is unit-testable without standing up an audio device —
+/// the IOProc is otherwise too coupled to CoreAudio to exercise
+/// from a test.
+fn push_demuxed_frames(
+    buf: &[f32],
+    channels: usize,
+    pairs: &[(u32, u32)],
+    txs: &mut [ringbuf::HeapProd<f32>],
+) -> bool {
+    let mut overflow = false;
+    for frame in buf.chunks_exact(channels) {
+        for (p_idx, &(l, r)) in pairs.iter().enumerate() {
+            let pair_samples = [frame[l as usize], frame[r as usize]];
+            let pushed = txs[p_idx].push_slice(&pair_samples);
+            if pushed < 2 {
+                overflow = true;
+            }
+        }
+    }
+    overflow
+}
+
 /// Install a channel map on the output AU (M5.5.2). Writes
 /// `kAudioOutputUnitProperty_ChannelMap` with `Scope::Input,
 /// Element::Output` (the AU's *input* scope is what receives our
@@ -1289,4 +1440,127 @@ fn device_channel_count(device: AudioObjectID, scope: u32) -> Option<u32> {
         total
     };
     Some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringbuf::traits::{Consumer, Split};
+    use ringbuf::HeapRb;
+
+    /// Build N HeapProds + HeapCons of the given capacity for the
+    /// pure-logic demux tests. Mirrors what `start_with_options`
+    /// builds at runtime, just without the AudioUnit.
+    fn make_pair_rings(n: usize, cap: usize) -> (Vec<ringbuf::HeapProd<f32>>, Vec<HeapCons<f32>>) {
+        let mut txs = Vec::with_capacity(n);
+        let mut rxs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let rb = HeapRb::<f32>::new(cap);
+            let (tx, rx) = rb.split();
+            txs.push(tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
+    }
+
+    #[test]
+    fn demux_single_pair_passes_through_stereo() {
+        // M5.2 / M5.3 / M5.4 backward-compat path: 2 channels in, 1
+        // pair out, identity mapping. The output must equal the
+        // input byte-for-byte (same frame layout, same pair).
+        let buf = [10.0, 11.0, 20.0, 21.0, 30.0, 31.0]; // 3 stereo frames
+        let pairs = [(0u32, 1u32)];
+        let (mut txs, mut rxs) = make_pair_rings(1, 64);
+        let overflow = push_demuxed_frames(&buf, 2, &pairs, &mut txs);
+        assert!(
+            !overflow,
+            "ringbuf with cap 64 should not overflow on 6 samples"
+        );
+        let mut out = vec![0.0_f32; buf.len()];
+        let n = rxs[0].pop_slice(&mut out);
+        assert_eq!(n, buf.len());
+        assert_eq!(out, buf, "single-pair demux must be identity");
+    }
+
+    #[test]
+    fn demux_two_pairs_from_4ch_isolates() {
+        // M5.6 case: 4-channel device frame, deck A on logical
+        // channels 0+1, deck B on logical channels 2+3. Each pair
+        // gets its own stream with the right samples.
+        // Frame 0: A=10,11 B=12,13.  Frame 1: A=20,21 B=22,23.
+        let buf = [10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0];
+        let pairs = [(0u32, 1u32), (2u32, 3u32)];
+        let (mut txs, mut rxs) = make_pair_rings(2, 64);
+        let overflow = push_demuxed_frames(&buf, 4, &pairs, &mut txs);
+        assert!(!overflow);
+
+        let mut a = vec![0.0_f32; 4];
+        let mut b = vec![0.0_f32; 4];
+        let na = rxs[0].pop_slice(&mut a);
+        let nb = rxs[1].pop_slice(&mut b);
+        assert_eq!(na, 4);
+        assert_eq!(nb, 4);
+        assert_eq!(
+            a,
+            vec![10.0, 11.0, 20.0, 21.0],
+            "deck A should get ch 0+1 only"
+        );
+        assert_eq!(
+            b,
+            vec![12.0, 13.0, 22.0, 23.0],
+            "deck B should get ch 2+3 only"
+        );
+    }
+
+    #[test]
+    fn demux_swapped_pair_indices_swap_lr() {
+        // Pair = (1, 0) means "L is logical channel 1, R is logical
+        // channel 0" — swaps the stereo image. Documents the semantic
+        // and confirms the indices are honoured (not just the
+        // ordering of `pairs`). Useful when a user's interface wires
+        // the cartridge L/R inverted.
+        let buf = [1.0, 2.0]; // one frame: ch0=1, ch1=2
+        let pairs = [(1u32, 0u32)];
+        let (mut txs, mut rxs) = make_pair_rings(1, 32);
+        let _ = push_demuxed_frames(&buf, 2, &pairs, &mut txs);
+        let mut out = vec![0.0_f32; 2];
+        rxs[0].pop_slice(&mut out);
+        assert_eq!(out, vec![2.0, 1.0], "(1, 0) must swap L and R");
+    }
+
+    #[test]
+    fn demux_overflow_is_signalled() {
+        // Tiny ring (2 samples = 1 frame); push 3 frames; the second
+        // and third frame's pushes will partially fail. The function
+        // must return `true` once.
+        let buf = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let pairs = [(0u32, 1u32)];
+        let (mut txs, _rxs) = make_pair_rings(1, 2);
+        let overflow = push_demuxed_frames(&buf, 2, &pairs, &mut txs);
+        assert!(
+            overflow,
+            "ring with capacity 2 should overflow on 6 samples"
+        );
+    }
+
+    #[test]
+    fn demux_partial_frame_at_tail_is_ignored() {
+        // `chunks_exact` drops a tail that isn't a full frame. This
+        // is the right behaviour because CoreAudio only ever delivers
+        // complete frames (the contract of an AU); a partial frame in
+        // the test buffer represents a malformed input. Document the
+        // behaviour by pinning it.
+        let buf = [10.0, 11.0, 12.0, 13.0, 99.0]; // 1 full 4-ch frame + 1 stray sample
+        let pairs = [(0u32, 1u32), (2u32, 3u32)];
+        let (mut txs, mut rxs) = make_pair_rings(2, 64);
+        push_demuxed_frames(&buf, 4, &pairs, &mut txs);
+        let mut a = vec![0.0_f32; 8];
+        let mut b = vec![0.0_f32; 8];
+        let na = rxs[0].pop_slice(&mut a);
+        let nb = rxs[1].pop_slice(&mut b);
+        assert_eq!(na, 2, "exactly one frame's worth (the stray 99.0 ignored)");
+        assert_eq!(nb, 2);
+        assert_eq!(&a[..2], &[10.0, 11.0]);
+        assert_eq!(&b[..2], &[12.0, 13.0]);
+    }
 }

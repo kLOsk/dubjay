@@ -103,8 +103,9 @@ fn print_help() {
     eprintln!("  decode-timecode <wav>");
     eprintln!("                    [--window MS] [--head N]");
     eprintln!("                    [--synthetic]   offline timecode-vinyl decoder (M5.1)");
-    eprintln!("  timecode-deck <track>");
-    eprintln!("                    --input-channels N,M [--device NAME] [--sr SR]");
+    eprintln!("  timecode-deck <track-a> [<track-b>]");
+    eprintln!("                    --input-channels N,M [--deck-b-input-channels N,M]");
+    eprintln!("                    [--device NAME] [--sr SR]");
     eprintln!("                    [--duration SECS] [--confidence T]");
     eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
     eprintln!("                    [--amplitude-threshold T] [--output-buffer-size FRAMES]");
@@ -113,7 +114,7 @@ fn print_help() {
     eprintln!("                                         [--output-channels N])]");
     eprintln!("                    [--device-profile NAME]");
     eprintln!(
-        "                                    live timecode \u{2192} deck-0 demo (M5.3+M5.4.2+M5.5.2)"
+        "                                    live timecode (1- or 2-deck) (M5.3+M5.4.2+M5.5.2+M5.6)"
     );
     eprintln!("  scope             [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--duration SECS]");

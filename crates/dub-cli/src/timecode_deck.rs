@@ -79,8 +79,20 @@ const STALE_CALIBRATION_DAYS: f64 = 30.0;
 /// [`InputArgs`] so the `--input-channels`/`--device`/`--sr` flags
 /// are identical to `dub levels` and `dub capture`.
 struct Opts {
-    track: PathBuf,
+    /// Deck A's track. Always required.
+    track_a: PathBuf,
+    /// Deck B's track. `Some` triggers two-deck mode (M5.6); `None`
+    /// keeps the M5.3 single-deck behaviour. When `Some`,
+    /// `deck_b_input_channels` must also be set.
+    track_b: Option<PathBuf>,
+    /// Deck A's input config (device, channels, SR, buffer). Built
+    /// from `--input-channels`, `--device`, etc. (the shared
+    /// `InputArgs` parser).
     input: InputArgs,
+    /// Deck B's input channels (1-based device-channel indices),
+    /// e.g. `--deck-b-input-channels 5,6` for SL3 deck B. `None`
+    /// keeps single-deck mode.
+    deck_b_input_channels: Option<Vec<u32>>,
     /// Output buffer size hint for CoreAudio output (frames). Smaller
     /// = lower output latency. None means "device default".
     output_buffer_size: Option<u32>,
@@ -154,6 +166,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     let mut output_channels: Option<u32> = None;
     let mut deck_a_out_ch: Option<u32> = None;
     let mut deck_b_out_ch: Option<u32> = None;
+    let mut deck_b_input_channels: Option<Vec<u32>> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -260,6 +273,24 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                 );
                 i += 2;
             }
+            "--deck-b-input-channels" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    anyhow!(
+                        "--deck-b-input-channels expects N,M (1-based, e.g. 5,6 for SL3 deck B)"
+                    )
+                })?;
+                let parsed: Result<Vec<u32>, _> =
+                    v.split(',').map(str::trim).map(str::parse::<u32>).collect();
+                let chans = parsed.with_context(|| format!("--deck-b-input-channels {v}"))?;
+                if chans.len() != 2 || chans.contains(&0) {
+                    return Err(anyhow!(
+                        "--deck-b-input-channels must be exactly two non-zero 1-based \
+                         indices, e.g. 5,6; got {v:?}"
+                    ));
+                }
+                deck_b_input_channels = Some(chans);
+                i += 2;
+            }
             _ => {
                 filtered.push(args[i].clone());
                 i += 1;
@@ -270,7 +301,8 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     let positional: Vec<&String> = leftover.iter().filter(|s| !s.starts_with("--")).collect();
     if positional.is_empty() {
         return Err(anyhow!(
-            "usage: dub timecode-deck <track.wav> --input-channels N,M [--device NAME] \
+            "usage: dub timecode-deck <track-a.wav> [<track-b.wav>] --input-channels N,M \
+             [--deck-b-input-channels N,M] [--device NAME] \
              [--duration SECS] [--confidence T] [--disengage-threshold T] \
              [--sticky-blocks N] [--amplitude-threshold T] \
              [--output-buffer-size FRAMES] [--recalibrate] [--no-probe] [--no-calibrate] \
@@ -278,9 +310,9 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
              [--device-profile NAME]"
         ));
     }
-    if positional.len() > 1 {
+    if positional.len() > 2 {
         return Err(anyhow!(
-            "timecode-deck takes a single track path; got {}",
+            "timecode-deck takes 1 (single-deck) or 2 (two-deck) track paths; got {}",
             positional.len()
         ));
     }
@@ -311,10 +343,28 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
             "--deck-a-out-ch and --deck-b-out-ch must be specified together"
         ));
     }
+
+    // Two-deck mode requires *both* a second track AND
+    // --deck-b-input-channels — one without the other is a config
+    // error. M5.6 doesn't support timecode for deck B with no track
+    // (would be silent) or a track for deck B with no timecode (no
+    // way to drive transport).
+    let track_b: Option<PathBuf> = positional.get(1).map(|p| PathBuf::from(*p));
+    if track_b.is_some() != deck_b_input_channels.is_some() {
+        return Err(anyhow!(
+            "two-deck mode requires both <track-b.wav> AND --deck-b-input-channels N,M; \
+             got track_b={} deck-b-input-channels={}",
+            track_b.is_some(),
+            deck_b_input_channels.is_some(),
+        ));
+    }
+
     Ok(Opts {
-        track: PathBuf::from(positional[0]),
+        track_a: PathBuf::from(positional[0]),
+        track_b,
         duration_secs: input.duration.unwrap_or(DEFAULT_RUN_SECS),
         input,
+        deck_b_input_channels,
         output_buffer_size,
         confidence,
         disengage,
@@ -337,31 +387,56 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
 /// Track decode, audio device open, attach errors, or HAL failures.
 pub fn run(args: &[String]) -> Result<()> {
     let opts = parse_opts(args)?;
+    let two_deck = opts.track_b.is_some();
 
-    // 1. Load the track off the audio thread.
-    let track = Track::load_from_path(&opts.track)
-        .with_context(|| format!("loading track {}", opts.track.display()))?;
+    // 1. Load the track(s) off the audio thread.
+    let track_a = Track::load_from_path(&opts.track_a)
+        .with_context(|| format!("loading track A {}", opts.track_a.display()))?;
     println!(
-        "track:        {} ({} frames @ {} Hz, {} ch, {:.3} s)",
-        opts.track.display(),
-        track.frames(),
-        track.sample_rate(),
-        track.channels(),
-        track.duration_seconds()
+        "track A:      {} ({} frames @ {} Hz, {} ch, {:.3} s)",
+        opts.track_a.display(),
+        track_a.frames(),
+        track_a.sample_rate(),
+        track_a.channels(),
+        track_a.duration_seconds()
     );
+    let track_b = match opts.track_b.as_ref() {
+        Some(p) => {
+            let t = Track::load_from_path(p)
+                .with_context(|| format!("loading track B {}", p.display()))?;
+            println!(
+                "track B:      {} ({} frames @ {} Hz, {} ch, {:.3} s)",
+                p.display(),
+                t.frames(),
+                t.sample_rate(),
+                t.channels(),
+                t.duration_seconds()
+            );
+            Some(t)
+        }
+        None => None,
+    };
 
-    // 2. Open the input device. SR will be the device's hardware
-    //    nominal — we lean on dub-audio's M5.2 invariant that the
-    //    AudioUnit and device agree.
-    let input_opts = opts.input.to_options();
+    // 2. Open the input device. In two-deck mode (M5.6) we open
+    //    one 4-channel AU with `output_pairs = [(0, 1), (2, 3)]`,
+    //    giving deck A pair 0 and deck B pair 1; the IOProc demuxes
+    //    per frame into two stereo SPSC ringbuffers. Single-deck
+    //    keeps the M5.3 path (channels=2, output_pairs=None).
+    //
+    //    CoreAudio doesn't allow two AUs on the same physical input
+    //    device — this demux is the only way to feed two timecode
+    //    decoders without serialising on a single ringbuffer
+    //    (which is SPSC by design).
+    let input_opts = build_input_options(&opts.input, opts.deck_b_input_channels.as_deref())?;
     let mut input =
         AudioInput::start_with_options(&input_opts).context("opening input device for timecode")?;
     let input_sr = input.sample_rate();
     println!(
-        "input:        device='{}' sr={input_sr} Hz channels={} buffer={} frames",
+        "input:        device='{}' sr={input_sr} Hz channels={} buffer={} frames pairs={}",
         input.device_name(),
         input.channels(),
         input.buffer_frames(),
+        input.pair_count(),
     );
 
     // 3. The engine MUST run at the input SR for v1 (no SR conversion
@@ -387,12 +462,18 @@ pub fn run(args: &[String]) -> Result<()> {
         device.sample_rate, device.buffer_frames,
     );
 
-    // 4. Configure deck 0 with the track. Crucially we do NOT
-    //    set_playing(true) — the decoder will do that on the first
-    //    locked block (see `Engine::drive_timecode_inputs`).
+    // 4. Configure deck 0 with track A; in two-deck mode also load
+    //    track B onto deck 1. Crucially we do NOT set_playing(true)
+    //    on either deck — the decoder will do that per-deck on the
+    //    first locked block (see `Engine::drive_timecode_inputs`).
     {
         let deck = engine.deck_mut(0);
-        deck.set_source(Arc::new(track));
+        deck.set_source(Arc::new(track_a));
+        deck.set_gain(1.0);
+    }
+    if let Some(t) = track_b {
+        let deck = engine.deck_mut(1);
+        deck.set_source(Arc::new(t));
         deck.set_gain(1.0);
     }
 
@@ -405,14 +486,24 @@ pub fn run(args: &[String]) -> Result<()> {
     //     to the engine, because the calibration helpers consume
     //     samples from the same input device. After
     //     `take_consumer()` is called, the input is engine-owned.
+    //
+    //     **Two-deck note (M5.6)**: calibration probes pair 0
+    //     (deck A) only, and the same thresholds are reused for
+    //     deck B. This is correct when both decks have matched
+    //     cartridges (the common case). For mismatched cartridges,
+    //     M5.4.4 will add per-deck named profiles; today the user
+    //     can pass `--no-probe` and pin individual thresholds via
+    //     `--confidence` etc. See ARCHITECTURE.md / M5.6.
     let resolved = resolve_thresholds(&mut input, &opts)?;
 
-    // 5. Hand the input ringbuf consumer to the engine.
-    let rx = input
-        .take_consumer()
-        .ok_or_else(|| anyhow!("AudioInput consumer already taken"))?;
-    let cfg = TimecodeInputConfig {
-        format: Format::SeratoCv02,
+    // 5. Hand each input pair's consumer to its deck. Pair 0 always
+    //    goes to engine deck 0 (deck A); pair 1, when present (M5.6
+    //    two-deck mode), goes to deck 1.
+    let rx_a = input
+        .take_consumer_pair(0)
+        .ok_or_else(|| anyhow!("AudioInput pair 0 consumer already taken"))?;
+    let cfg = |format: Format| TimecodeInputConfig {
+        format,
         input_sample_rate: input_sr,
         // CoreAudio output blocks vary; 4096 is a safe upper bound.
         max_block_frames: 4096,
@@ -422,15 +513,28 @@ pub fn run(args: &[String]) -> Result<()> {
         amplitude_threshold: resolved.amplitude,
     };
     engine
-        .attach_timecode_input(0, rx, cfg)
+        .attach_timecode_input(0, rx_a, cfg(Format::SeratoCv02))
         .context("attaching timecode input to deck 0")?;
+    if two_deck {
+        let rx_b = input
+            .take_consumer_pair(1)
+            .ok_or_else(|| anyhow!("AudioInput pair 1 consumer already taken"))?;
+        engine
+            .attach_timecode_input(1, rx_b, cfg(Format::SeratoCv02))
+            .context("attaching timecode input to deck 1")?;
+    }
     println!(
         "timecode:     format=SeratoCv02 engage={:.3} disengage={:.3} \
-         sticky={} blocks amp_floor={:.4}",
+         sticky={} blocks amp_floor={:.4}{}",
         resolved.engage,
         resolved.disengage,
         resolved.sticky_blocks_to_disengage,
         resolved.amplitude,
+        if two_deck {
+            " (deck A + B share calibration; M5.4.4 will add per-deck profiles)"
+        } else {
+            ""
+        },
     );
 
     // 6. Resolve output routing: known-device auto-detect, manual
@@ -511,11 +615,75 @@ fn print_stats(
 ) {
     // Single-line refresh on stderr — keeps stdout clean for `tee`.
     let buf_ms = (f64::from(output.buffer_frames()) / f64::from(output.sample_rate())) * 1000.0;
-    let avail_frames = (input.available() as f64) / f64::from(input.channels().max(1));
+    // `available()` reports interleaved-stereo *samples* on pair 0;
+    // each frame is 2 samples regardless of how many channels the
+    // device delivers (the demux gives us one stereo pair per
+    // ringbuf in M5.6).
+    #[allow(clippy::cast_precision_loss)]
+    let avail_frames = (input.available() as f64) / 2.0;
     eprintln!(
         "  out_cb={out_cb} buf={buf_ms:.2}ms in_cb={in_cb} in_overflow={in_of} \
          in_buffered={avail_frames:.0} frames"
     );
+}
+
+/// Build [`dub_audio::InputOptions`] for the input AU, supporting
+/// both single-deck (M5.3) and two-deck (M5.6) modes.
+///
+/// In single-deck mode this is a thin wrapper around
+/// `InputArgs::to_options()` — the legacy path, untouched.
+///
+/// In two-deck mode (`deck_b_channels = Some([5, 6])`):
+///
+/// 1. The AU is opened with `channels = 4` (or however many we need
+///    to span both decks' channels).
+/// 2. `channel_map` is `[a_l-1, a_r-1, b_l-1, b_r-1]` — 0-based
+///    device channel indices for the SL3-style "deck A on 3+4,
+///    deck B on 5+6" layout.
+/// 3. `output_pairs = [(0, 1), (2, 3)]` — both pairs are stereo
+///    contiguous in the AU's logical (post-channel-map) frame, so
+///    pair indices map cleanly to logical positions.
+///
+/// Validation: deck A and deck B input pairs must not overlap (a
+/// shared channel between decks is almost always a bug).
+fn build_input_options(
+    input: &InputArgs,
+    deck_b_channels: Option<&[u32]>,
+) -> Result<dub_audio::InputOptions> {
+    let mut opts = input.to_options();
+    let Some(b) = deck_b_channels else {
+        return Ok(opts);
+    };
+    let a = input.input_channels.as_deref().ok_or_else(|| {
+        anyhow!("two-deck mode requires --input-channels for deck A (e.g. 3,4 for SL3 deck A)")
+    })?;
+    if a.len() != 2 {
+        return Err(anyhow!(
+            "two-deck mode requires --input-channels to be a pair (got {} channels)",
+            a.len()
+        ));
+    }
+    if b.len() != 2 {
+        return Err(anyhow!(
+            "--deck-b-input-channels must be a pair (got {} channels)",
+            b.len()
+        ));
+    }
+    let overlap = a.iter().any(|c| b.contains(c));
+    if overlap {
+        return Err(anyhow!(
+            "--input-channels {a:?} and --deck-b-input-channels {b:?} share a channel; \
+             each deck needs its own stereo pair (SL3: 3,4 + 5,6)"
+        ));
+    }
+    // Combine into a 4-channel logical AU layout: [a_l, a_r, b_l, b_r],
+    // converted from 1-based to 0-based.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let channel_map: Vec<i32> = a.iter().chain(b.iter()).map(|&c| (c as i32) - 1).collect();
+    opts.channels = 4;
+    opts.channel_map = Some(channel_map);
+    opts.output_pairs = Some(vec![(0, 1), (2, 3)]);
+    Ok(opts)
 }
 
 /// Resolved output routing. Captured ahead of `AudioOutput::start_with_options`
@@ -873,8 +1041,10 @@ mod tests {
 
     fn opts_default() -> Opts {
         Opts {
-            track: PathBuf::new(),
+            track_a: PathBuf::new(),
+            track_b: None,
             input: InputArgs::default(),
+            deck_b_input_channels: None,
             output_buffer_size: None,
             confidence: None,
             disengage: None,
@@ -1190,5 +1360,207 @@ mod tests {
     #[allow(dead_code)]
     fn _keep_schema_version_alive() {
         let _ = SCHEMA_VERSION;
+    }
+
+    // -------------------------------------------------------------
+    // M5.6: two-deck timecode CLI + InputOptions builder
+    // -------------------------------------------------------------
+
+    #[test]
+    fn parse_opts_two_deck_round_trip() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let opts = parse_opts(&s(&[
+            "--input-channels",
+            "3,4",
+            "--deck-b-input-channels",
+            "5,6",
+            "trackA.wav",
+            "trackB.wav",
+        ]))
+        .expect("two-deck parse");
+        assert_eq!(opts.track_a, PathBuf::from("trackA.wav"));
+        assert_eq!(opts.track_b, Some(PathBuf::from("trackB.wav")));
+        assert_eq!(
+            opts.input.input_channels.as_deref(),
+            Some(&[3_u32, 4_u32][..])
+        );
+        assert_eq!(
+            opts.deck_b_input_channels.as_deref(),
+            Some(&[5_u32, 6_u32][..])
+        );
+    }
+
+    #[test]
+    fn parse_opts_single_deck_still_works() {
+        // Backward compat: M5.3 invocation must keep parsing with
+        // track_b=None and deck_b_input_channels=None.
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let opts = parse_opts(&s(&["--input-channels", "3,4", "track.wav"])).expect("M5.3 parse");
+        assert_eq!(opts.track_a, PathBuf::from("track.wav"));
+        assert!(opts.track_b.is_none(), "no track B in single-deck mode");
+        assert!(
+            opts.deck_b_input_channels.is_none(),
+            "no deck B input channels"
+        );
+    }
+
+    #[test]
+    fn parse_opts_track_b_without_deck_b_channels_errors() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&["--input-channels", "3,4", "trackA.wav", "trackB.wav"]));
+        assert!(
+            r.is_err(),
+            "track B without --deck-b-input-channels must error (no way to drive transport)"
+        );
+    }
+
+    #[test]
+    fn parse_opts_deck_b_channels_without_track_b_errors() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--input-channels",
+            "3,4",
+            "--deck-b-input-channels",
+            "5,6",
+            "trackA.wav",
+        ]));
+        assert!(
+            r.is_err(),
+            "--deck-b-input-channels without track B must error (would be silent)"
+        );
+    }
+
+    #[test]
+    fn parse_opts_too_many_positionals_errors() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--input-channels",
+            "3,4",
+            "--deck-b-input-channels",
+            "5,6",
+            "a.wav",
+            "b.wav",
+            "c.wav",
+        ]));
+        assert!(r.is_err(), "3 tracks must error (only 1 or 2 supported)");
+    }
+
+    #[test]
+    fn parse_opts_deck_b_channels_must_be_pair() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--input-channels",
+            "3,4",
+            "--deck-b-input-channels",
+            "5,6,7",
+            "a.wav",
+            "b.wav",
+        ]));
+        assert!(
+            r.is_err(),
+            "stereo timecode needs exactly 2 channels per deck"
+        );
+    }
+
+    #[test]
+    fn parse_opts_deck_b_channels_zero_rejected() {
+        let s = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = parse_opts(&s(&[
+            "--input-channels",
+            "3,4",
+            "--deck-b-input-channels",
+            "0,1",
+            "a.wav",
+            "b.wav",
+        ]));
+        assert!(
+            r.is_err(),
+            "channel 0 is invalid (CLI flags are 1-based device indices)"
+        );
+    }
+
+    #[test]
+    fn build_input_options_single_deck_passthrough() {
+        // Single-deck (no deck B) must produce the same options as
+        // the existing M5.3 path — no `output_pairs`, channels=2,
+        // channel_map = [2, 3] (1-based 3,4 → 0-based 2,3).
+        let input = InputArgs {
+            input_channels: Some(vec![3, 4]),
+            ..InputArgs::default()
+        };
+        let opts = build_input_options(&input, None).expect("single-deck build");
+        assert_eq!(opts.channels, 2);
+        assert_eq!(opts.channel_map.as_deref(), Some(&[2_i32, 3_i32][..]));
+        assert!(
+            opts.output_pairs.is_none(),
+            "single-deck must not set output_pairs (preserves M5.2 RT path)"
+        );
+    }
+
+    #[test]
+    fn build_input_options_two_deck_sl3_layout() {
+        // SL3 reference layout: deck A on device 3+4, deck B on
+        // device 5+6 → AU opens 4 channels, channel_map=[2,3,4,5],
+        // output_pairs=[(0,1),(2,3)].
+        let input = InputArgs {
+            input_channels: Some(vec![3, 4]),
+            ..InputArgs::default()
+        };
+        let opts = build_input_options(&input, Some(&[5, 6])).expect("two-deck build");
+        assert_eq!(opts.channels, 4);
+        assert_eq!(
+            opts.channel_map.as_deref(),
+            Some(&[2_i32, 3_i32, 4_i32, 5_i32][..]),
+            "channel_map must be [a_l-1, a_r-1, b_l-1, b_r-1]"
+        );
+        assert_eq!(
+            opts.output_pairs,
+            Some(vec![(0_u32, 1_u32), (2_u32, 3_u32)]),
+            "pairs must be (0,1) deck A and (2,3) deck B in logical AU coords"
+        );
+    }
+
+    #[test]
+    fn build_input_options_two_deck_overlap_errors() {
+        // Deck A on 3+4 and Deck B on 4+5 share channel 4 — the
+        // mixer can't physically route both decks to the same
+        // input pair, so error early instead of producing a
+        // silently-wrong calibration.
+        let input = InputArgs {
+            input_channels: Some(vec![3, 4]),
+            ..InputArgs::default()
+        };
+        let r = build_input_options(&input, Some(&[4, 5]));
+        assert!(r.is_err(), "overlapping deck pairs must error");
+    }
+
+    #[test]
+    fn build_input_options_two_deck_requires_deck_a_channels() {
+        // Asking for deck B's channels but not deck A's is
+        // ambiguous — we don't know what to put on logical 0+1.
+        // Force the user to be explicit.
+        let input = InputArgs::default();
+        let r = build_input_options(&input, Some(&[5, 6]));
+        assert!(
+            r.is_err(),
+            "two-deck mode without --input-channels for deck A must error"
+        );
+    }
+
+    #[test]
+    fn build_input_options_two_deck_swapped_layout() {
+        // Confirm the builder doesn't assume "deck A < deck B" —
+        // a user with deck A on 5+6 and deck B on 3+4 (atypical
+        // wiring) gets [4,5,2,3] which still gives the correct
+        // logical layout: pair 0 = deck A.
+        let input = InputArgs {
+            input_channels: Some(vec![5, 6]),
+            ..InputArgs::default()
+        };
+        let opts = build_input_options(&input, Some(&[3, 4])).expect("swapped build");
+        assert_eq!(
+            opts.channel_map.as_deref(),
+            Some(&[4_i32, 5_i32, 2_i32, 3_i32][..])
+        );
     }
 }

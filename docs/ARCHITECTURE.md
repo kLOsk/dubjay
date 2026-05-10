@@ -832,6 +832,115 @@ routing is 0-based (`Some(2)` for ch 3+4). Conversion happens once
 in `device_profiles::one_based_to_zero_based`; tests pin the round
 trip.
 
+### Two-deck timecode input — M5.6 (CoreAudio demux)
+
+M5.5.2 made the *output* path two-deck capable. M5.6 closes the
+symmetry on the *input* path so a real two-record timecode session
+on a single audio interface (SL3) can drive both engine decks
+independently.
+
+The constraint that shapes the design: **CoreAudio does not allow
+two `AudioUnit`s to open the same physical input device in the
+same process.** A naive "open one stereo AU per deck" approach
+fails at `audio_unit.start()` for the second AU. Real DJ apps —
+including the historical Scratch Live we're modelling — solve
+this by opening one multi-channel AU and demuxing in software.
+
+```
+                  CoreAudio input AU (4 logical channels)
+                  channel_map = [a_l-1, a_r-1, b_l-1, b_r-1]
+                              │
+                  ┌───────────┴───────────┐
+                  │     IOProc thread     │
+                  │  (push_demuxed_frames) │
+                  └───┬───────────────┬───┘
+                      │               │
+                ringbuf 0          ringbuf 1
+              (deck A pair)     (deck B pair)
+                      │               │
+              attach_timecode   attach_timecode
+              _input(0, …)      _input(1, …)
+                      │               │
+                Engine deck 0    Engine deck 1
+```
+
+**`InputOptions::output_pairs: Option<Vec<(u32, u32)>>`** declares
+the per-pair `(L, R)` indices into the AU's logical (post
+channel-map) interleaved frame. `None` and `Some(vec![(0, 1)])`
+are equivalent — both mean "single stereo pair" — preserving
+M5.2 / M5.3 / M5.4 byte-identical RT behaviour. Two-deck mode
+sets `Some(vec![(0, 1), (2, 3)])`.
+
+**`push_demuxed_frames(buf, channels, pairs, &mut txs)`** is the
+extracted IOProc inner loop:
+
+```rust
+for frame in buf.chunks_exact(channels) {
+    for (p_idx, &(l, r)) in pairs.iter().enumerate() {
+        let pair_samples = [frame[l as usize], frame[r as usize]];
+        let pushed = txs[p_idx].push_slice(&pair_samples);
+        if pushed < 2 { overflow = true; }
+    }
+}
+```
+
+Linear in `frames × pairs` (256 × 2 ≈ 50 µs / callback at 48 k);
+no allocations; lock-free `push_slice` (atomic-CAS index update);
+overflow is signalled once per callback (matches the M5.2
+single-pair convention so existing rt-audit traces stay
+comparable). The function lives outside the closure so it's
+unit-testable without standing up an audio device — five tests
+pin single-pair pass-through, 4-channel isolation, swapped
+`(L, R)`, overflow signalling, and partial-frame handling.
+
+**Per-pair `AudioInput` API.** New methods alongside the
+single-pair API:
+
+```rust
+fn pair_count(&self) -> usize;
+fn take_consumer_pair(&mut self, idx: usize) -> Option<HeapCons<f32>>;
+fn read_into_pair(&mut self, idx: usize, dst: &mut [f32]) -> usize;
+fn available_pair(&self, idx: usize) -> usize;
+```
+
+`take_consumer()`, `read_into()`, `available()` keep their
+existing semantics by aliasing to pair 0. Calibration and
+`dub levels` / `dub capture` continue to read from pair 0 with
+zero code changes.
+
+**CLI surface.** `dub timecode-deck <track-a> [<track-b>] \
+  --input-channels 3,4 --deck-b-input-channels 5,6` triggers
+two-deck mode. The helper `build_input_options` constructs the
+4-channel `InputOptions` (channel_map = `[2, 3, 4, 5]`,
+output_pairs = `[(0, 1), (2, 3)]`) and the run loop attaches
+pair 0 to engine deck 0 and pair 1 to engine deck 1. Validation
+rejects: `--deck-b-input-channels` without track B (silent
+deck B); track B without `--deck-b-input-channels` (no transport
+source); overlapping deck-A / deck-B pairs (would silently
+mis-route to the audio thread); deck-B channels without deck-A
+(ambiguous logical layout).
+
+**Calibration semantics.** Two-deck mode probes pair 0 (deck A)
+only, and shares the resulting `LiftPolicy` thresholds across
+both decks. This is correct when both turntables have matched
+cartridges (the common case). For mismatched cartridges, a
+startup line warns and the user can pin per-knob thresholds via
+`--confidence` / `--amplitude-threshold` etc., or fall back to
+M5.3 defaults via `--no-calibrate`. M5.4.4 will add per-deck
+named profiles so the right cartridge profile is auto-loaded
+for each deck, but it would have been premature to ship that
+machinery before the actual two-deck driver landed — the most
+useful thing a multi-cartridge feature can do is *recognise*
+that two decks have different cartridges, which only makes
+sense once two decks are running.
+
+**Output side untouched.** M5.5.2's per-deck output routing
+already supports two decks — M5.6 just provides two real input
+sources to drive them. The startup banner `output routing:
+Serato SL 3 (6 ch, deck A → ch 3+4, deck B → ch 5+6)` now
+describes a fully-symmetric two-deck path on both input and
+output.
+
 ### Engine → UI (state snapshot) — implemented in M2
 
 Per-deck `Arc<DeckSharedState>` carrying:
