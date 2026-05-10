@@ -416,14 +416,30 @@ a wide margin. All four are tunable per attach via
 disables the gate (confidence-only fallback) — diagnostic only,
 pinned by a regression test so we can't lose it.
 
-The factoring deliberately separates `step_policy(DecodeOutput)`
-from `drive(...)` (which sources data from the ringbuf) so the
-state machine is unit-testable without ringbufs or decoders. The
-test suite covers each pathology this policy was tightened to
-fix — including the lukewarm-but-quiet lift bug from the second
-SL3 validation. M5.4 layers calibration UX (per-cartridge stored
-thresholds) and a TUI scope on top; the lift gate itself is
-complete.
+The factoring deliberately separates the lift policy from data
+sourcing. The state machine lives in a public `LiftPolicy` struct
+(`dub_engine::LiftPolicy`) with a single `step(DecodeOutput) ->
+LiftIntent` method; `TimecodeInput` *embeds* a `LiftPolicy` and
+delegates to it from inside `drive(...)`. This lets three callers
+share *exactly* the same lift behavior:
+
+1. The audio-thread render path (`Engine::drive_timecode_inputs` →
+   `TimecodeInput::drive` → `LiftPolicy::step`) — production
+   playback.
+2. `dub scope` (M5.4.1) — owns its own `LiftPolicy` + `Decoder` +
+   input buffer on the main thread; renders the policy's live
+   state in a TUI without touching the audio thread or the engine.
+3. `dub calibrate` (M5.4.2) — replays recorded carrier samples
+   through a `LiftPolicy` to evaluate candidate thresholds against
+   historical data before persisting them.
+
+Single source of truth: if the policy changes, every diagnostic
+follows. If `dub scope` says "this would lock", `dub timecode-deck`
+will lock at the same thresholds, period. The unit-test suite
+covers each pathology the policy was tightened to fix — including
+the lukewarm-but-quiet lift bug from the second SL3 validation —
+plus the public accessors (`is_engaged`, `consecutive_below`,
+`last_locked_rate`) that diagnostic UIs read each frame.
 
 **RT-safety.** `drive_timecode_inputs` is allocation-free and
 finite-time:
@@ -464,13 +480,82 @@ exercises the new alignment.
   evolve via integration of rate, which is what the platter
   encodes. M5.4+ may add explicit re-sync if accumulated drift
   becomes audible over long sessions.
-- Stickiness on stylus lift (M5.4).
 - External-mixer multi-channel output routing (M5.5). Output today
   is a single summed stereo bus; per-deck routing waits until
   hardware actually demands it.
 - Multi-deck timecode. Engine has slots for `[Option<TimecodeInput>;
   DECK_COUNT]` so M5.5 just attaches a second one — but until then
   CLI's `dub timecode-deck` wires only deck 0.
+
+### Live timecode scope — M5.4.1
+
+`dub scope` is a standalone diagnostic TUI that opens the input
+device, runs the same `LiftPolicy` as `dub timecode-deck`, and
+renders what the decoder + policy see in real time. It exists
+because lift-policy debugging by ear (the M5.3 "ghost noise"
+session) was much harder than it needed to be: every iteration
+required a full `dub timecode-deck` run with track audio mixed
+into the diagnostic. The scope decouples diagnosis from
+playback — same code path, no audible side-effects.
+
+```text
+  CoreAudio input IOProc                  ratatui frame (30 fps)
+  (e.g. SL3 ch3+4)                              ▲
+           │                                    │
+           ▼                                    │
+  HeapRb<f32> (1 s capacity)                    │
+           │                                    │
+           ▼                                    │
+  AudioInput::read_into ──► acc[block_samples]  │
+                                  │             │
+                  ┌───────────────┴───────────┐ │
+                  ▼                           ▼ │
+            LissajousTrail            Decoder::process
+            (1024-frame ring          → DecodeOutput
+             of (L,R) pairs)                 │
+                  │                          ▼
+                  │                    LiftPolicy::step
+                  │                          │
+                  │                          ▼
+                  │                    LiftIntent::{Locked,
+                  │                                 DropoutHoldRate}
+                  │                          │
+                  └────────────► UiState ◄───┘
+                                    │
+                                    ▼
+                              draw_ui (Canvas + Gauges)
+```
+
+**Architecture.** Single-threaded — the main thread drains the
+input ringbuf, runs the decoder + policy, and renders the TUI.
+No RT constraints apply: the IOProc is RT-safe (M5.2 invariant),
+unaffected by what the main thread does with the consumer end.
+ratatui + crossterm are pulled in only by the CLI; they never
+touch the engine or audio crates.
+
+**Block size.** Fixed at 256 frames (matching `timecode-deck`
+default). The lift policy's sticky window is measured in
+*blocks*, not seconds — if the scope ran the policy at a
+different cadence than playback, the user couldn't trust scope
+thresholds to transfer to `dub timecode-deck`. The contract is:
+*same block size → same policy behavior*. Both tools call
+`policy.step(...)` exactly once per 256-frame block.
+
+**Live thresholds.** Arrow keys mutate the policy thresholds in
+place (`↑/↓ engage`, `PgUp/PgDn disengage`, `←/→ amplitude`).
+On every change the policy is rebuilt via `LiftPolicy::new` —
+which resets `engaged` to `false` so the user sees what would
+happen *with these new thresholds, starting from a cold lock*
+rather than carrying engagement over from the old thresholds.
+This is the calibration sandbox; M5.4.2 (`dub calibrate`) will
+persist the resulting values per-cartridge.
+
+**Why not a Lissajous on the audio thread?** The trail buffer
+(1024 frame pairs) is tiny enough that pulling it from the
+ringbuf consumer on the main thread costs ~µs per frame. Pushing
+display data through the audio thread would have meant a second
+ringbuf solely for visualization; not worth the surface area for
+a diagnostic.
 
 ### Two decks + debug internal mixer — M4
 

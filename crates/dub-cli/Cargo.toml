@@ -19,3 +19,5 @@ dub-audio = { workspace = true }
 dub-timecode = { workspace = true }
 anyhow = { workspace = true }
 hound = { workspace = true }
+ratatui = "0.30.0"
+crossterm = "0.29.0"

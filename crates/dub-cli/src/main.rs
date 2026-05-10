@@ -27,6 +27,7 @@ use dub_io::Track;
 mod analyze;
 mod decode_timecode;
 mod input_cmds;
+mod scope;
 mod timecode_deck;
 
 fn main() -> ExitCode {
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         "levels" => input_cmds::levels(&args[2..]),
         "capture" => input_cmds::capture(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
+        "scope" => scope::run(&args[2..]),
         "measure-latency" => measure_latency(),
         "help" | "-h" | "--help" => {
             print_help();
@@ -103,6 +105,11 @@ fn print_help() {
     eprintln!("                    [--disengage-threshold T] [--sticky-blocks N]");
     eprintln!("                    [--amplitude-threshold T] [--output-buffer-size FRAMES]");
     eprintln!("                                    live timecode \u{2192} deck-0 demo (M5.3)");
+    eprintln!("  scope             [--device NAME] [--input-channels N,M] [--sr SR]");
+    eprintln!("                    [--buffer-size F] [--duration SECS]");
+    eprintln!("                    [--engage T] [--disengage T] [--sticky N]");
+    eprintln!("                    [--amplitude T] [--format serato-cv02]");
+    eprintln!("                                    live timecode scope (TUI) (M5.4.1)");
     eprintln!();
     eprintln!("  play (offline, default): render the engine output to a 32-bit float WAV.");
     eprintln!("  play --realtime:         play through the default macOS output device.");
@@ -141,6 +148,16 @@ fn print_help() {
     eprintln!("    Output device SR is forced to engine SR so playback runs on a single clock");
     eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. Default duration 60 s; Ctrl-C");
     eprintln!("    to stop.");
+    eprintln!();
+    eprintln!("  scope (M5.4.1): live timecode-vinyl inspector. Opens the input device,");
+    eprintln!("    decodes timecode in real time, and runs the same lift policy as");
+    eprintln!("    timecode-deck (so what you see here is what you'd hear). The TUI shows:");
+    eprintln!("      - Lissajous (X=L, Y=R): clean carrier traces a circle; lift collapses it.");
+    eprintln!("      - rate, confidence (gauge), amplitude (gauge), position, sticky countdown.");
+    eprintln!("      - Live thresholds, mutable in-place via arrow keys for tuning your rig.");
+    eprintln!("    Key bindings: q/Esc quit, c clear lissajous, \u{2191}/\u{2193} engage,");
+    eprintln!("    PgUp/PgDn disengage, \u{2190}/\u{2192} amplitude. SL3 deck A:");
+    eprintln!("    --input-channels 3,4. Calibration UX in M5.4.2 will persist these.");
 }
 
 fn smoke() -> Result<()> {

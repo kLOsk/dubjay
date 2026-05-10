@@ -55,6 +55,21 @@ use ringbuf::HeapCons;
 
 use dub_timecode::{DecodeOutput, Decoder, Format};
 
+// -------------------------------------------------------------------
+// Re-exports from this module's public API:
+//   - LiftPolicy / LiftIntent: the state machine, decoupled from the
+//     ringbuf/decoder. The scope and calibration tools use these
+//     without touching `TimecodeInput`.
+//   - TimecodeInput / TimecodeInputConfig / AttachError /
+//     DEFAULT_*: the engine-side wrapper that owns a `LiftPolicy`
+//     plus a ringbuf consumer + decoder.
+//
+// `TimecodeInput` is the only shape the audio thread sees;
+// `LiftPolicy` is the only shape diagnostic tools see. Both ship
+// the same lift logic — so M5.4.1's `dub scope` and M5.4.2's
+// `dub calibrate` cannot drift from M5.3's playback policy.
+// -------------------------------------------------------------------
+
 /// Default confidence threshold to *engage* the timecode lock.
 ///
 /// Picked from the M5.1 + M5.2 empirical data: real cartridges through
@@ -196,25 +211,30 @@ pub enum AttachError {
     InvalidAmplitudeThreshold { value: f32 },
 }
 
-/// One deck's-worth of timecode input. Owned by the engine after
-/// [`crate::Engine::attach_timecode_input`] succeeds.
-pub struct TimecodeInput {
-    /// Single-producer/single-consumer ring; producer is the CoreAudio
-    /// input IOProc inside `dub-audio`'s `AudioInput`.
-    rx: HeapCons<f32>,
-
-    /// Per-deck phase tracker. Holds prev-sample state across blocks.
-    decoder: Decoder,
-
-    /// Pre-allocated workspace for one block of input samples. Sized
-    /// `max_block_frames * 2` (interleaved stereo) at attach time.
-    scratch: Vec<f32>,
-
-    /// Latest decoded block result. Cached so the engine can surface
-    /// `(rate, position, confidence)` to the UI without reaching into
-    /// the decoder.
-    last_output: Option<DecodeOutput>,
-
+/// Lift / engage policy state machine, decoupled from the
+/// ringbuf and decoder. Owns all state needed to decide, for any
+/// given [`DecodeOutput`], whether the deck should be driven
+/// (and at what rate). Pure data with one method ([`Self::step`]);
+/// allocation-free; the only non-`Copy` field is the `f64` rate,
+/// so the whole struct is `Copy` and there are no heap
+/// allocations at all.
+///
+/// This is the shared truth between three callers:
+///
+/// 1. [`TimecodeInput`] — the audio-thread wrapper that calls
+///    `step` once per render block from inside `Engine::render`.
+/// 2. `dub scope` (M5.4.1) — the standalone TUI inspector. Owns
+///    its own [`LiftPolicy`] + [`Decoder`] + input buffer so it
+///    can run without an engine attached.
+/// 3. `dub calibrate` (M5.4.2) — replays recorded carrier samples
+///    through a `LiftPolicy` to evaluate candidate thresholds
+///    against historical data.
+///
+/// All three see *exactly the same* lift behavior because they
+/// share this code path. If the policy changes, every diagnostic
+/// tool follows.
+#[derive(Debug, Clone, Copy)]
+pub struct LiftPolicy {
     /// Upper hysteresis edge — see [`TimecodeInputConfig::confidence_threshold`].
     engage_threshold: f32,
 
@@ -248,6 +268,156 @@ pub struct TimecodeInput {
     last_locked_rate: f64,
 }
 
+impl LiftPolicy {
+    /// Build a policy from the same threshold fields as a
+    /// [`TimecodeInputConfig`]. Starts disengaged with
+    /// `last_locked_rate = 0`. Allocation-free.
+    #[must_use]
+    pub fn new(config: &TimecodeInputConfig) -> Self {
+        Self {
+            engage_threshold: config.confidence_threshold,
+            disengage_threshold: config.disengage_threshold,
+            sticky_blocks_to_disengage: config.sticky_blocks_to_disengage,
+            amplitude_threshold: config.amplitude_threshold,
+            engaged: false,
+            consecutive_below: 0,
+            last_locked_rate: 0.0,
+        }
+    }
+
+    /// Whether the policy is currently driving the deck (i.e. the
+    /// last call to [`Self::step`] returned [`LiftIntent::Locked`]
+    /// from the engaged branch). Diagnostic UIs read this to color
+    /// the engaged/disengaged indicator.
+    #[must_use]
+    pub fn is_engaged(&self) -> bool {
+        self.engaged
+    }
+
+    /// Number of consecutive blocks the policy has spent below the
+    /// disengage threshold while engaged. Reaches
+    /// `sticky_blocks_to_disengage` exactly when the policy
+    /// disengages. Diagnostic UIs render this as a count-down bar
+    /// during lift.
+    #[must_use]
+    pub fn consecutive_below(&self) -> u32 {
+        self.consecutive_below
+    }
+
+    /// Last rate the policy locked to. Held during dropouts so the
+    /// deck (or the diagnostic) doesn't snap to zero on a single
+    /// dust tick.
+    #[must_use]
+    pub fn last_locked_rate(&self) -> f64 {
+        self.last_locked_rate
+    }
+
+    /// Advance the state machine by one decoder block.
+    ///
+    /// **Amplitude gate.** If `out.amplitude < amplitude_threshold`
+    /// the carrier is considered dead — *whatever* the confidence
+    /// reads — and the block is treated as "below floor" (counts
+    /// toward the sticky disengage window; cannot re-engage). This
+    /// closes the lift hole where the cartridge picks up
+    /// handling/rumble noise that the decoder finds *some* coherent
+    /// rotation in (moderate confidence) but the RMS is near-zero.
+    /// Ignoring amplitude here is what made M5.3's second iteration
+    /// leak track-audio bursts during stylus lift on the SL3.
+    ///
+    /// **Confidence bands** (only checked when the carrier is alive):
+    ///
+    /// - `conf ≥ engage_threshold` → "fully locked" — track current
+    ///   block's rate.
+    /// - `disengage_threshold ≤ conf < engage_threshold` → "lukewarm"
+    ///   while engaged — keep last good rate, stay engaged (no
+    ///   countdown). When *disengaged*, this band does *not*
+    ///   re-engage (avoids letting noise sneak the deck back on).
+    /// - `conf < disengage_threshold` → if engaged, increment the
+    ///   countdown; disengage when it hits
+    ///   `sticky_blocks_to_disengage`.
+    pub fn step(&mut self, out: DecodeOutput) -> LiftIntent {
+        let carrier_alive = out.amplitude >= self.amplitude_threshold;
+
+        if self.engaged {
+            if carrier_alive && out.confidence >= self.engage_threshold {
+                self.consecutive_below = 0;
+                self.last_locked_rate = out.rate;
+                LiftIntent::Locked { rate: out.rate }
+            } else if carrier_alive && out.confidence >= self.disengage_threshold {
+                // Lukewarm scratch transient — hold the last good
+                // rate (don't trust the noisy current-block estimate)
+                // but keep the deck engaged. Don't count toward the
+                // disengage window: scratches can sit in this band
+                // for tens of ms while the cartridge is firmly on the
+                // groove. This branch is *only* reached when the
+                // carrier is alive, so handling-noise during lift no
+                // longer counts as "scratch transient".
+                self.consecutive_below = 0;
+                LiftIntent::Locked {
+                    rate: self.last_locked_rate,
+                }
+            } else {
+                // Below floor: either confidence collapsed
+                // (carrier-alive but coherence gone — e.g. dust tick
+                // mid-scratch), or amplitude collapsed (carrier dead
+                // — e.g. stylus lift). Either way, count toward the
+                // sticky disengage window.
+                self.consecutive_below = self.consecutive_below.saturating_add(1);
+                if self.consecutive_below >= self.sticky_blocks_to_disengage {
+                    self.engaged = false;
+                    LiftIntent::DropoutHoldRate {
+                        rate: self.last_locked_rate,
+                    }
+                } else {
+                    // Inside the sticky window — keep the deck running
+                    // at the last good rate. Single-block dust ticks
+                    // and brief carrier dips never reach the user.
+                    LiftIntent::Locked {
+                        rate: self.last_locked_rate,
+                    }
+                }
+            }
+        } else if carrier_alive && out.confidence >= self.engage_threshold {
+            self.engaged = true;
+            self.consecutive_below = 0;
+            self.last_locked_rate = out.rate;
+            LiftIntent::Locked { rate: out.rate }
+        } else {
+            // Disengaged and not confident *and* alive enough to
+            // re-engage. Amplitude check matters here too: a quiet
+            // burst of structured noise must not re-engage.
+            LiftIntent::DropoutHoldRate {
+                rate: self.last_locked_rate,
+            }
+        }
+    }
+}
+
+/// One deck's-worth of timecode input. Owned by the engine after
+/// [`crate::Engine::attach_timecode_input`] succeeds.
+pub struct TimecodeInput {
+    /// Single-producer/single-consumer ring; producer is the CoreAudio
+    /// input IOProc inside `dub-audio`'s `AudioInput`.
+    rx: HeapCons<f32>,
+
+    /// Per-deck phase tracker. Holds prev-sample state across blocks.
+    decoder: Decoder,
+
+    /// Pre-allocated workspace for one block of input samples. Sized
+    /// `max_block_frames * 2` (interleaved stereo) at attach time.
+    scratch: Vec<f32>,
+
+    /// Latest decoded block result. Cached so the engine can surface
+    /// `(rate, position, confidence)` to the UI without reaching into
+    /// the decoder.
+    last_output: Option<DecodeOutput>,
+
+    /// Lift / engage state machine. Owns the rate hold + sticky
+    /// countdown + amplitude-gated hysteresis. See [`LiftPolicy`]
+    /// for the algorithm.
+    policy: LiftPolicy,
+}
+
 impl TimecodeInput {
     /// Off-RT constructor. Allocates the scratch buffer and the decoder
     /// state; both pre-sized so the audio-thread side touches no heap.
@@ -260,13 +430,7 @@ impl TimecodeInput {
             decoder,
             scratch,
             last_output: None,
-            engage_threshold: config.confidence_threshold,
-            disengage_threshold: config.disengage_threshold,
-            sticky_blocks_to_disengage: config.sticky_blocks_to_disengage,
-            amplitude_threshold: config.amplitude_threshold,
-            engaged: false,
-            consecutive_below: 0,
-            last_locked_rate: 0.0,
+            policy: LiftPolicy::new(&config),
         }
     }
 
@@ -298,7 +462,7 @@ impl TimecodeInput {
     /// Returns `None` if nothing was processed this block (no input
     /// available, or fewer than 1 stereo frame). Callers should hold
     /// the deck's previous transport state in that case.
-    pub(crate) fn drive(&mut self) -> Option<Intent> {
+    pub(crate) fn drive(&mut self) -> Option<LiftIntent> {
         let cap = self.scratch.len();
         let popped = self.rx.pop_slice(&mut self.scratch[..cap]);
         // Decoder requires interleaved stereo (even-length input).
@@ -316,104 +480,38 @@ impl TimecodeInput {
         // is defensive belt-and-braces.
         let out = self.decoder.process(&self.scratch[..popped_even]);
         self.last_output = Some(out);
-        Some(self.step_policy(out))
-    }
-
-    /// Pure policy step: given one decoder output, return the resulting
-    /// [`Intent`] and update the state machine. Split out from
-    /// [`Self::drive`] so tests can drive the policy with synthetic
-    /// `DecodeOutput`s without going through ringbuf + decoder.
-    ///
-    /// **Amplitude gate.** If `out.amplitude < amplitude_threshold`
-    /// the carrier is considered dead — *whatever* the confidence
-    /// reads — and the block is treated as "below floor" (counts
-    /// toward the sticky disengage window; cannot re-engage). This
-    /// closes the lift hole where the cartridge picks up
-    /// handling/rumble noise that the decoder finds *some* coherent
-    /// rotation in (moderate confidence) but the RMS is near-zero.
-    /// Ignoring amplitude here is what made M5.3's second iteration
-    /// leak track-audio bursts during stylus lift on the SL3.
-    ///
-    /// **Confidence bands** (only checked when carrier is alive):
-    ///
-    /// - `conf ≥ engage_threshold` → "fully locked" — track current
-    ///   block's rate.
-    /// - `disengage_threshold ≤ conf < engage_threshold` → "lukewarm"
-    ///   while engaged — keep last good rate, stay engaged (no
-    ///   countdown). When *disengaged*, this band does *not* re-engage
-    ///   (avoids letting noise sneak the deck back on).
-    /// - `conf < disengage_threshold` → if engaged, increment the
-    ///   countdown; disengage when it hits
-    ///   `sticky_blocks_to_disengage`.
-    fn step_policy(&mut self, out: DecodeOutput) -> Intent {
-        let carrier_alive = out.amplitude >= self.amplitude_threshold;
-
-        if self.engaged {
-            if carrier_alive && out.confidence >= self.engage_threshold {
-                self.consecutive_below = 0;
-                self.last_locked_rate = out.rate;
-                Intent::Locked { rate: out.rate }
-            } else if carrier_alive && out.confidence >= self.disengage_threshold {
-                // Lukewarm scratch transient — hold the last good
-                // rate (don't trust the noisy current-block estimate)
-                // but keep the deck engaged. Don't count toward the
-                // disengage window: scratches can sit in this band
-                // for tens of ms while the cartridge is firmly on the
-                // groove. This branch is *only* reached when the
-                // carrier is alive, so handling-noise during lift no
-                // longer counts as "scratch transient".
-                self.consecutive_below = 0;
-                Intent::Locked {
-                    rate: self.last_locked_rate,
-                }
-            } else {
-                // Below floor: either confidence collapsed
-                // (carrier-alive but coherence gone — e.g. dust tick
-                // mid-scratch), or amplitude collapsed (carrier dead
-                // — e.g. stylus lift). Either way, count toward the
-                // sticky disengage window.
-                self.consecutive_below = self.consecutive_below.saturating_add(1);
-                if self.consecutive_below >= self.sticky_blocks_to_disengage {
-                    self.engaged = false;
-                    Intent::DropoutHoldRate {
-                        rate: self.last_locked_rate,
-                    }
-                } else {
-                    // Inside the sticky window — keep the deck running
-                    // at the last good rate. Single-block dust ticks
-                    // and brief carrier dips never reach the user.
-                    Intent::Locked {
-                        rate: self.last_locked_rate,
-                    }
-                }
-            }
-        } else if carrier_alive && out.confidence >= self.engage_threshold {
-            self.engaged = true;
-            self.consecutive_below = 0;
-            self.last_locked_rate = out.rate;
-            Intent::Locked { rate: out.rate }
-        } else {
-            // Disengaged and not confident *and* alive enough to
-            // re-engage. Amplitude check matters here too: a quiet
-            // burst of structured noise must not re-engage.
-            Intent::DropoutHoldRate {
-                rate: self.last_locked_rate,
-            }
-        }
+        Some(self.policy.step(out))
     }
 }
 
-/// What [`TimecodeInput::drive`] tells the engine to do with the deck
-/// after one block of input. Engine-private; not part of the public
-/// surface (the public surface is `Engine::attach_timecode_input` plus
-/// `TimecodeInput::last_output` for UI observability).
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Intent {
+/// What [`LiftPolicy::step`] tells the caller to do with the deck
+/// after observing one decoder block.
+///
+/// Public so diagnostic tools (`dub scope`, `dub calibrate`) can
+/// match on it. The engine's [`crate::Engine::render`] is the
+/// primary consumer — it translates the intent into deck transport
+/// state (rate + paused/playing).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LiftIntent {
     /// Confidence is above threshold — engage transport at this rate.
-    Locked { rate: f64 },
+    Locked {
+        /// Playback rate for the deck this block: `1.0` for unity
+        /// forward, `-1.0` for reverse, etc. While inside the
+        /// "lukewarm" hysteresis band, this is the *last* good rate
+        /// (the policy doesn't trust mid-scratch confidence-dipped
+        /// estimates); inside the engage band it's the current
+        /// block's decoded rate.
+        rate: f64,
+    },
     /// Confidence dropped — the deck is paused; rate is held in case
     /// confidence comes back this very next block (chatter immunity).
-    DropoutHoldRate { rate: f64 },
+    DropoutHoldRate {
+        /// Last rate the policy locked to before this dropout.
+        /// Diagnostic UIs render this dimmed; the engine sets it
+        /// on the deck so the rate is already correct when the
+        /// carrier returns.
+        rate: f64,
+    },
 }
 
 impl TimecodeInputConfig {
@@ -449,30 +547,25 @@ impl TimecodeInputConfig {
 mod policy_tests {
     //! Tests the hysteresis state machine in isolation. We bypass the
     //! decoder by feeding synthetic [`DecodeOutput`]s straight into
-    //! `step_policy` — that's the *whole point* of factoring the policy
-    //! out of `drive`: data sourcing and policy are independent.
+    //! [`LiftPolicy::step`] — that's the *whole point* of factoring
+    //! the policy out of `drive`: data sourcing and policy are
+    //! independent. Tests target [`LiftPolicy`] directly; the
+    //! [`TimecodeInput`] wrapper is exercised separately by the
+    //! crate's integration tests.
     use super::*;
-    use ringbuf::traits::Split as _;
-    use ringbuf::HeapRb;
 
-    /// Build a `TimecodeInput` plus its (unused-in-these-tests) producer.
-    /// Tests want the policy state machine; the ring is only here
-    /// because `TimecodeInput` owns it.
-    fn make(engage: f32, disengage: f32, sticky: u32) -> TimecodeInput {
-        let rb = HeapRb::<f32>::new(8);
-        let (_tx, rx) = rb.split();
-        TimecodeInput::new(
-            rx,
-            TimecodeInputConfig {
-                format: Format::SeratoCv02,
-                input_sample_rate: 48_000.0,
-                max_block_frames: 64,
-                confidence_threshold: engage,
-                disengage_threshold: disengage,
-                sticky_blocks_to_disengage: sticky,
-                amplitude_threshold: 0.01,
-            },
-        )
+    /// Build a [`LiftPolicy`] with the given thresholds and the
+    /// canonical SL3 amplitude gate (0.01).
+    fn make(engage: f32, disengage: f32, sticky: u32) -> LiftPolicy {
+        LiftPolicy::new(&TimecodeInputConfig {
+            format: Format::SeratoCv02,
+            input_sample_rate: 48_000.0,
+            max_block_frames: 64,
+            confidence_threshold: engage,
+            disengage_threshold: disengage,
+            sticky_blocks_to_disengage: sticky,
+            amplitude_threshold: 0.01,
+        })
     }
 
     /// Most policy tests want a *live* carrier (amplitude well above
@@ -495,11 +588,11 @@ mod policy_tests {
     fn engages_only_at_or_above_engage_threshold() {
         // Engage threshold 0.8 → 0.79 below it must not engage even
         // though it's well above the disengage threshold (0.5).
-        let mut tc = make(0.8, 0.5, 4);
-        let i = tc.step_policy(out(1.0, 0.79));
-        assert!(matches!(i, Intent::DropoutHoldRate { .. }));
-        let i = tc.step_policy(out(1.0, 0.80));
-        assert!(matches!(i, Intent::Locked { rate } if (rate - 1.0).abs() < 1e-9));
+        let mut p = make(0.8, 0.5, 4);
+        let i = p.step(out(1.0, 0.79));
+        assert!(matches!(i, LiftIntent::DropoutHoldRate { .. }));
+        let i = p.step(out(1.0, 0.80));
+        assert!(matches!(i, LiftIntent::Locked { rate } if (rate - 1.0).abs() < 1e-9));
     }
 
     #[test]
@@ -507,15 +600,12 @@ mod policy_tests {
         // Engage, then suffer 3 consecutive sub-disengage blocks with
         // sticky=4. Deck must stay engaged and emit Locked at the last
         // locked rate the whole time.
-        let mut tc = make(0.8, 0.5, 4);
-        assert!(matches!(
-            tc.step_policy(out(1.0, 0.95)),
-            Intent::Locked { .. }
-        ));
+        let mut p = make(0.8, 0.5, 4);
+        assert!(matches!(p.step(out(1.0, 0.95)), LiftIntent::Locked { .. }));
         for _ in 0..3 {
-            match tc.step_policy(out(0.0, 0.0)) {
-                Intent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
-                Intent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
+            match p.step(out(0.0, 0.0)) {
+                LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
+                LiftIntent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
             }
         }
     }
@@ -524,20 +614,17 @@ mod policy_tests {
     fn disengages_exactly_after_sticky_window() {
         // sticky=4 → 4th consecutive sub-disengage block flips engaged
         // off; subsequent blocks emit DropoutHoldRate.
-        let mut tc = make(0.8, 0.5, 4);
-        tc.step_policy(out(1.0, 0.95));
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out(1.0, 0.95));
         for _ in 0..3 {
-            assert!(matches!(
-                tc.step_policy(out(0.0, 0.0)),
-                Intent::Locked { .. }
-            ));
+            assert!(matches!(p.step(out(0.0, 0.0)), LiftIntent::Locked { .. }));
         }
         // 4th below-threshold block: disengage fires this block.
-        let i = tc.step_policy(out(0.0, 0.0));
-        assert!(matches!(i, Intent::DropoutHoldRate { rate } if (rate - 1.0).abs() < 1e-9));
+        let i = p.step(out(0.0, 0.0));
+        assert!(matches!(i, LiftIntent::DropoutHoldRate { rate } if (rate - 1.0).abs() < 1e-9));
         // And stays disengaged.
-        let i = tc.step_policy(out(0.0, 0.0));
-        assert!(matches!(i, Intent::DropoutHoldRate { .. }));
+        let i = p.step(out(0.0, 0.0));
+        assert!(matches!(i, LiftIntent::DropoutHoldRate { .. }));
     }
 
     #[test]
@@ -545,30 +632,27 @@ mod policy_tests {
         // While engaged, a confidence in [disengage, engage) should
         // hold the last rate (don't trust noisy mid-scratch estimates)
         // but stay engaged and reset the disengage countdown.
-        let mut tc = make(0.8, 0.5, 4);
-        tc.step_policy(out(1.0, 0.95));
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out(1.0, 0.95));
         // Burn 3 sub-disengage blocks toward the sticky window edge.
         for _ in 0..3 {
-            tc.step_policy(out(0.0, 0.0));
+            p.step(out(0.0, 0.0));
         }
         // Lukewarm block: should not disengage, should reset countdown,
         // and should hold the last good rate (1.0) — *not* trust the
         // current 0.5 rate estimate.
-        match tc.step_policy(out(0.5, 0.6)) {
-            Intent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
-            Intent::DropoutHoldRate { .. } => panic!("disengaged in lukewarm band"),
+        match p.step(out(0.5, 0.6)) {
+            LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
+            LiftIntent::DropoutHoldRate { .. } => panic!("disengaged in lukewarm band"),
         }
         // Now we have a fresh sticky window; need 4 more sub-disengage
         // blocks to actually disengage.
         for _ in 0..3 {
-            assert!(matches!(
-                tc.step_policy(out(0.0, 0.0)),
-                Intent::Locked { .. }
-            ));
+            assert!(matches!(p.step(out(0.0, 0.0)), LiftIntent::Locked { .. }));
         }
         assert!(matches!(
-            tc.step_policy(out(0.0, 0.0)),
-            Intent::DropoutHoldRate { .. }
+            p.step(out(0.0, 0.0)),
+            LiftIntent::DropoutHoldRate { .. }
         ));
     }
 
@@ -576,17 +660,17 @@ mod policy_tests {
     fn lukewarm_does_not_re_engage_from_disengaged() {
         // Once disengaged, only confidence ≥ engage_threshold (0.8)
         // re-engages. A lukewarm 0.7 must stay disengaged.
-        let mut tc = make(0.8, 0.5, 1);
-        tc.step_policy(out(1.0, 0.95));
-        tc.step_policy(out(0.0, 0.0)); // sticky=1 → disengages now
-        let i = tc.step_policy(out(1.0, 0.7));
+        let mut p = make(0.8, 0.5, 1);
+        p.step(out(1.0, 0.95));
+        p.step(out(0.0, 0.0)); // sticky=1 → disengages now
+        let i = p.step(out(1.0, 0.7));
         assert!(
-            matches!(i, Intent::DropoutHoldRate { .. }),
+            matches!(i, LiftIntent::DropoutHoldRate { .. }),
             "lukewarm shouldn't re-engage; got {i:?}"
         );
         // Crossing the engage threshold finally re-engages.
-        let i = tc.step_policy(out(1.0, 0.85));
-        assert!(matches!(i, Intent::Locked { .. }));
+        let i = p.step(out(1.0, 0.85));
+        assert!(matches!(i, LiftIntent::Locked { .. }));
     }
 
     #[test]
@@ -594,22 +678,19 @@ mod policy_tests {
         // Three sub-disengage blocks should burn ¾ of the sticky=4
         // window; then a fully-locked block should reset it, not just
         // emit Locked once.
-        let mut tc = make(0.8, 0.5, 4);
-        tc.step_policy(out(1.0, 0.95));
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out(1.0, 0.95));
         for _ in 0..3 {
-            tc.step_policy(out(0.0, 0.0));
+            p.step(out(0.0, 0.0));
         }
-        tc.step_policy(out(1.2, 0.95)); // full re-lock — countdown reset
-                                        // Now a fresh full window of 4 below-threshold blocks needed.
+        p.step(out(1.2, 0.95)); // full re-lock — countdown reset
+                                // Now a fresh full window of 4 below-threshold blocks needed.
         for _ in 0..3 {
-            assert!(matches!(
-                tc.step_policy(out(0.0, 0.0)),
-                Intent::Locked { .. }
-            ));
+            assert!(matches!(p.step(out(0.0, 0.0)), LiftIntent::Locked { .. }));
         }
         assert!(matches!(
-            tc.step_policy(out(0.0, 0.0)),
-            Intent::DropoutHoldRate { rate } if (rate - 1.2).abs() < 1e-9
+            p.step(out(0.0, 0.0)),
+            LiftIntent::DropoutHoldRate { rate } if (rate - 1.2).abs() < 1e-9
         ));
     }
 
@@ -633,21 +714,21 @@ mod policy_tests {
         // engaged at last_locked_rate and burst-plays the track. With
         // the gate, lukewarm-but-quiet counts as below-floor and the
         // sticky window disengages within sticky_blocks_to_disengage.
-        let mut tc = make(0.8, 0.5, 4);
-        tc.step_policy(out_with_amp(1.0, 0.95, 0.5));
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out_with_amp(1.0, 0.95, 0.5));
         // Three quiet "lukewarm-by-confidence" blocks: amplitude
         // override should classify them as below-floor; deck stays
         // engaged at last rate (sticky window not yet expired).
         for _ in 0..3 {
-            match tc.step_policy(out_with_amp(0.0, 0.7, 0.001)) {
-                Intent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
-                Intent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
+            match p.step(out_with_amp(0.0, 0.7, 0.001)) {
+                LiftIntent::Locked { rate } => assert!((rate - 1.0).abs() < 1e-9),
+                LiftIntent::DropoutHoldRate { .. } => panic!("disengaged inside sticky window"),
             }
         }
         // 4th quiet block: actually disengage.
-        let i = tc.step_policy(out_with_amp(0.0, 0.7, 0.001));
+        let i = p.step(out_with_amp(0.0, 0.7, 0.001));
         assert!(
-            matches!(i, Intent::DropoutHoldRate { .. }),
+            matches!(i, LiftIntent::DropoutHoldRate { .. }),
             "amplitude gate should disengage even with lukewarm confidence; got {i:?}"
         );
     }
@@ -659,18 +740,18 @@ mod policy_tests {
         // report high confidence on quiet structured noise — e.g.
         // 60 Hz hum from a lifted cartridge near a transformer — and
         // we don't want that to grab the deck back on.)
-        let mut tc = make(0.8, 0.5, 1);
-        tc.step_policy(out_with_amp(1.0, 0.95, 0.5));
+        let mut p = make(0.8, 0.5, 1);
+        p.step(out_with_amp(1.0, 0.95, 0.5));
         // sticky=1 → first below-floor block disengages.
-        tc.step_policy(out_with_amp(0.0, 0.0, 0.001));
-        let i = tc.step_policy(out_with_amp(1.0, 0.95, 0.001));
+        p.step(out_with_amp(0.0, 0.0, 0.001));
+        let i = p.step(out_with_amp(1.0, 0.95, 0.001));
         assert!(
-            matches!(i, Intent::DropoutHoldRate { .. }),
+            matches!(i, LiftIntent::DropoutHoldRate { .. }),
             "quiet block must not re-engage even with high confidence; got {i:?}"
         );
         // Carrier returns (amplitude back up): re-engage.
-        let i = tc.step_policy(out_with_amp(1.0, 0.95, 0.5));
-        assert!(matches!(i, Intent::Locked { .. }));
+        let i = p.step(out_with_amp(1.0, 0.95, 0.5));
+        assert!(matches!(i, LiftIntent::Locked { .. }));
     }
 
     #[test]
@@ -679,22 +760,43 @@ mod policy_tests {
         // collapse to confidence-only (the M5.3 first-cut policy).
         // Useful as a diagnostic mode and worth pinning so we don't
         // accidentally regress it.
-        let mut tc = TimecodeInput::new(
-            HeapRb::<f32>::new(8).split().1,
-            TimecodeInputConfig {
-                format: Format::SeratoCv02,
-                input_sample_rate: 48_000.0,
-                max_block_frames: 64,
-                confidence_threshold: 0.8,
-                disengage_threshold: 0.5,
-                sticky_blocks_to_disengage: 1,
-                amplitude_threshold: 0.0,
-            },
-        );
+        let mut p = LiftPolicy::new(&TimecodeInputConfig {
+            format: Format::SeratoCv02,
+            input_sample_rate: 48_000.0,
+            max_block_frames: 64,
+            confidence_threshold: 0.8,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.0,
+        });
         // High confidence + zero amplitude must engage when the gate
         // is off.
-        let i = tc.step_policy(out_with_amp(1.0, 0.95, 0.0));
-        assert!(matches!(i, Intent::Locked { .. }));
+        let i = p.step(out_with_amp(1.0, 0.95, 0.0));
+        assert!(matches!(i, LiftIntent::Locked { .. }));
+    }
+
+    #[test]
+    fn accessors_track_state_machine() {
+        // Diagnostic UIs read these — pin the contract.
+        let mut p = make(0.8, 0.5, 3);
+        assert!(!p.is_engaged());
+        assert_eq!(p.consecutive_below(), 0);
+        assert!((p.last_locked_rate() - 0.0).abs() < 1e-12);
+
+        p.step(out(1.5, 0.95));
+        assert!(p.is_engaged());
+        assert_eq!(p.consecutive_below(), 0);
+        assert!((p.last_locked_rate() - 1.5).abs() < 1e-9);
+
+        p.step(out(0.0, 0.0));
+        assert!(p.is_engaged());
+        assert_eq!(p.consecutive_below(), 1);
+
+        p.step(out(0.0, 0.0));
+        assert_eq!(p.consecutive_below(), 2);
+
+        p.step(out(0.0, 0.0));
+        assert!(!p.is_engaged(), "sticky=3 should disengage on 3rd block");
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub use deck::Deck;
 pub use handle::{CommandError, DeckCommand, DeckSnapshot, EngineHandle};
 pub use realtime::{RealtimeContext, RtError};
 pub use timecode::{
-    AttachError as TimecodeAttachError, TimecodeInput, TimecodeInputConfig,
+    AttachError as TimecodeAttachError, LiftIntent, LiftPolicy, TimecodeInput, TimecodeInputConfig,
     DEFAULT_AMPLITUDE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD, DEFAULT_DISENGAGE_THRESHOLD,
     DEFAULT_STICKY_BLOCKS_TO_DISENGAGE,
 };
@@ -306,8 +306,9 @@ impl Engine {
     /// Borrow gymnastics: `self.timecode_inputs[idx]` and
     /// `self.decks[idx]` overlap through `&mut self`, so we run the
     /// decoder inside an inner scope that drops the input borrow
-    /// before reaching for the deck. The intermediate `Intent` carries
-    /// only `Copy` data across the borrow boundary.
+    /// before reaching for the deck. The intermediate
+    /// [`timecode::LiftIntent`] carries only `Copy` data across the
+    /// borrow boundary.
     fn drive_timecode_inputs(&mut self) {
         for idx in 0..DECK_COUNT {
             let intent = match self.timecode_inputs[idx].as_mut() {
@@ -322,7 +323,7 @@ impl Engine {
             };
             let deck = &mut self.decks[idx];
             match intent {
-                timecode::Intent::Locked { rate } => {
+                timecode::LiftIntent::Locked { rate } => {
                     deck.set_rate(rate);
                     if !deck.is_playing() {
                         // First lock after silence / dropout: start
@@ -331,7 +332,7 @@ impl Engine {
                         deck.set_playing(true);
                     }
                 }
-                timecode::Intent::DropoutHoldRate { rate } => {
+                timecode::LiftIntent::DropoutHoldRate { rate } => {
                     // Keep the rate in case confidence comes back next
                     // block (single-tick dropouts shouldn't reset
                     // scratch state), but mute the deck so the user
