@@ -98,7 +98,7 @@ Roadmap is detailed in [`docs/PRD.md`](docs/PRD.md). Bookmark order:
 | **M5.4.1** | ✅ shipped | TUI scope + `LiftPolicy` refactor |
 | **M5.4.2** | ✅ shipped | Per-rig calibration + fingerprint-based auto-detection |
 | **M5.4.3** | 📋 planned | Calibration speed (≤5 s first-time, ≤1 s probe) — match Traktor |
-| **M5.4.4** | 📋 planned | Named per-cartridge profiles |
+| **M5.4.4** | 📋 planned | Independent per-deck calibration (probes + thresholds per deck, not just per soundcard) |
 | **M5.5.1** | ✅ shipped | Engine routing primitive (`render_routed`, `OutputRouting`) |
 | **M5.5.2** | ✅ shipped | External-mixer 4-channel output: SL3 (✅ verified) / Audio 6 (⚠️ unverified) profiles + manual override |
 | **M5.6** | ✅ shipped | Two-deck timecode (single CoreAudio input AU, IOProc demux into per-deck SPSC rings) |

@@ -926,13 +926,18 @@ both decks. This is correct when both turntables have matched
 cartridges (the common case). For mismatched cartridges, a
 startup line warns and the user can pin per-knob thresholds via
 `--confidence` / `--amplitude-threshold` etc., or fall back to
-M5.3 defaults via `--no-calibrate`. M5.4.4 will add per-deck
-named profiles so the right cartridge profile is auto-loaded
-for each deck, but it would have been premature to ship that
-machinery before the actual two-deck driver landed — the most
-useful thing a multi-cartridge feature can do is *recognise*
-that two decks have different cartridges, which only makes
-sense once two decks are running.
+M5.3 defaults via `--no-calibrate`. M5.4.4 will add independent
+per-deck calibration (probe + threshold-derive each deck on
+startup, key the JSON by `(device, deck_index, format)`), but
+it would have been premature to ship that before the two-deck
+*driver* landed — the most useful thing a per-deck calibration
+feature can do is have two decks to calibrate, which only makes
+sense once they're running. The earlier "library of named
+cartridge profiles" framing was dropped: with M5.4.3-fast
+calibration, "always recalibrate on startup" is simpler than
+"manage a profile library", has no UX surface, and matches what
+real DJs expect (auto-calibrate on app start, manual button on
+cartridge swap — the latter belongs in M10's UI).
 
 **Output side untouched.** M5.5.2's per-deck output routing
 already supports two decks — M5.6 just provides two real input
