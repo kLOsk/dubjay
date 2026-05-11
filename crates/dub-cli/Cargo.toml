@@ -16,9 +16,11 @@ dub-engine = { workspace = true }
 dub-ffi = { workspace = true }
 dub-io = { workspace = true }
 dub-audio = { workspace = true }
+dub-bpm = { workspace = true }
 dub-timecode = { workspace = true }
 anyhow = { workspace = true }
 hound = { workspace = true }
+ringbuf = { workspace = true }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 serde = { version = "1.0.228", features = ["derive"] }

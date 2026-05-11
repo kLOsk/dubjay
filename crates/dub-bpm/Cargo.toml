@@ -1,0 +1,26 @@
+[package]
+name = "dub-bpm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "BPM/tempo estimation for Dub. Offline analysis (M7.5) and streaming driver (M8). Pure-Rust onset-detection + autocorrelation baseline; aubio-rs backend may be added later as an opt-in feature."
+
+[dependencies]
+realfft = { workspace = true }
+thiserror = { workspace = true }
+# Lock-free SPSC ringbuf for the audio-thread → analysis-thread tee
+# (M8 streaming driver). Same crate the engine uses for its
+# command/trash channels, so no second async primitive enters the
+# project.
+ringbuf = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# WAV round-trip integration test: synthesize a click-track via hound,
+# load it through dub-io's Symphonia path, run analyze_bpm. Exercises
+# the full real-world pipeline a track-load + library-import scan will
+# follow at the application layer (see PRD §5.3).
+dub-io = { workspace = true }
+hound = { workspace = true }

@@ -6,6 +6,7 @@ members = [
     "crates/dub-stretch",
     "crates/dub-io",
     "crates/dub-audio",
+    "crates/dub-bpm",
     "crates/dub-timecode",
     "crates/dub-thru",
     "crates/dub-fingerprint",
@@ -21,7 +22,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.87"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/kLOsk/dubjay"
+repository = "https://github.com/kLOsk/dub"
 authors = ["klos"]
 
 [workspace.dependencies]
@@ -37,6 +38,7 @@ dub-library = { path = "crates/dub-library" }
 dub-controller = { path = "crates/dub-controller" }
 dub-ffi = { path = "crates/dub-ffi" }
 dub-audio = { path = "crates/dub-audio" }
+dub-bpm = { path = "crates/dub-bpm" }
 
 # External (only what's needed for M0–M2; more added per milestone)
 assert_no_alloc = { version = "1.1", default-features = false }
@@ -78,6 +80,12 @@ coreaudio-rs = "0.14"
 objc2-core-audio = "0.3"
 objc2-core-audio-types = "0.3"
 objc2-audio-toolbox = "0.3"
+
+# FFT for onset detection in dub-bpm (M7.5). realfft is a thin wrapper on
+# rustfft that takes real input → half-spectrum complex output; ~2× faster
+# than going through full-complex rustfft for our offline use. Pure Rust,
+# no system deps.
+realfft = "3"
 
 # Test-only
 proptest = "1"

@@ -42,22 +42,31 @@ we are **not** building a controller-only DJ app (no Serato/rekordbox territory)
 
 ```
 crates/
-  dub-engine/        Audio graph, transport, RT-safety types. Hot path.
-  dub-dsp/           Resamplers, filters, FX building blocks.
-  dub-stretch/       Rubber Band FFI wrapper (license-isolated).
+  dub-engine/        Audio graph, transport, RT-safety types, ThruSource (M7). Hot path.
+  dub-audio/         CoreAudio HAL input + output, ringbuf-buffered handoff.
+  dub-dsp/           Resamplers, filters, FX building blocks (placeholder for v1 FX).
+  dub-stretch/       Rubber Band FFI wrapper (license-isolated, M14).
   dub-io/            symphonia-based decoders, in-memory track buffers.
-  dub-timecode/      Serato CV02 + Traktor MK2 LFSR decoders (xwax-derived).
-  dub-thru/          Thru-mode pipeline + auto-detection classifier.
+  dub-timecode/      Serato CV02 + Traktor MK1 + Traktor MK2 decoders (clean-room).
+  dub-thru/          Thru-mode source-detection classifier only (§5.1.1; placeholder).
+                     The Thru *passthrough itself* (ThruSource) lives in dub-engine.
+  dub-bpm/           M7.5 + M8 — BpmEstimator (DSP core), BpmTracker (estimator + hysteresis), BpmStream (per-deck off-RT analysis thread), analyze_bpm (offline). Pure-Rust spectral-flux + harmonic-summed autocorrelation. Aubio backend deferred to a future opt-in feature flag.
+                     Aubio's LGPL boundary is confined to this leaf crate.
   dub-fingerprint/   Chromaprint FFI (v1.1).
   dub-library/       SQLite + import adapters (Serato/Traktor/rekordbox/iTunes/Lexicon).
   dub-controller/    HID/MIDI abstractions (placeholder; v1.x+).
-  dub-ffi/           UniFFI Swift bindings.
-  dub-cli/           Headless smoke test + offline render harness.
+  dub-ffi/           UniFFI Swift bindings (placeholder; M0.5).
+  dub-cli/           `dub` binary — smoke / play / capture / levels /
+                     timecode-deck / thru / scope / calibrate / analyze /
+                     decode-timecode.
 
 apple/               SwiftUI + AppKit shell (M0.5+).
 tools/rt-audit/      RT-thread allocation auditor (binary tool).
-docs/                PRD, architecture, ADRs, format docs.
-scripts/             Build, codesign, notarize helpers.
+docs/                PRD.md (forward-looking spec),
+                     SHIPPED.md (M0 → M7 design history),
+                     ARCHITECTURE.md (how the crates fit together),
+                     LIBRARY-FORMATS.md (Serato/Traktor/… format notes).
+scripts/             Build, codesign, notarize helpers (M0.5 / M20).
 .cursor/             Cursor rules + hooks for AI-assisted dev.
 .github/workflows/   CI pipeline.
 ```
@@ -151,7 +160,8 @@ We run TDD on Rust code. See PRD §2.2 for full philosophy. Quick rules:
 - `symphonia` (MPL-2.0) — audio decoding
 - `rubato` (MIT) — sinc resampling
 - `rubberband` (FFI, **GPL-3.0**) — time-stretch (forces project to GPL)
-- `aubio` (FFI, LGPL-3.0) — beat detection, live tempo tracking
+- `aubio` (FFI, LGPL-3.0) — *not currently linked.* M7.5 shipped a pure-Rust BPM engine in `dub-bpm`; aubio is parked as a future opt-in feature backend if real-music validation demands more accuracy.
+- `realfft` / `rustfft` (MIT/Apache) — pure-Rust FFT used by `dub-bpm` for spectral-flux onset detection
 - `chromaprint` (FFI, LGPL-2.1) — fingerprinting (v1.1)
 - `assert_no_alloc` (MIT) — RT-safety enforcement
 - `ringbuf` (MIT) — lock-free SPSC

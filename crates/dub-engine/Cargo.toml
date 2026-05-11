@@ -12,6 +12,11 @@ ringbuf = { workspace = true }
 thiserror = { workspace = true }
 dub-io = { workspace = true }
 dub-timecode = { workspace = true }
+# M8 — the engine wires Thru-source attach optionally to a
+# `BpmStream` analysis thread. Only the dub-bpm types are pulled
+# in here; spawning the thread is opt-in via
+# `EngineHandle::attach_thru_source_with_bpm_tracking`.
+dub-bpm = { workspace = true }
 
 [dev-dependencies]
 assert_no_alloc = { workspace = true }

@@ -22,15 +22,17 @@
 //! is M5.4; multi-deck routing and external-mixer output is M5.5.
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use ringbuf::HeapCons;
 
-use crate::calibrate::{measure_inline, MeasureOptions};
+use crate::audio_routing::{build_input_options, resolve_output_routing, RoutingArgs};
+use crate::calibrate::{measure_inline, MeasureOptions, MeasurementInputs};
 use crate::calibration::{default_calibration_dir, Calibration, CalibrationThresholds};
-use crate::device_profiles;
 use crate::input_cmds::{parse_input_args, InputArgs};
 use dub_audio::AudioInput;
 use dub_engine::{
@@ -40,9 +42,14 @@ use dub_engine::{
 use dub_io::Track;
 use dub_timecode::Format;
 
-/// Default duration if `--duration` isn't given. 60 s is comfortably
-/// long for a tactile validation run; the user can Ctrl-C earlier.
-const DEFAULT_RUN_SECS: f64 = 60.0;
+// `--duration` is now optional: omitted means "run until Ctrl-C"
+// (the takeover use case from M5.4.5 needs unbounded runtime — the
+// incoming DJ may wait minutes for the previous DJ to vacate deck
+// B). The legacy 60 s default belonged to the M5.3 "validation
+// run" era; with the calibrator able to wait indefinitely for a
+// carrier, a hard wall-clock exit would silently lose deck B's
+// calibration window. Pass `--duration N` to keep the bounded
+// behaviour for scripted/CI runs.
 
 /// Length of the auto-startup full calibration phases. Pin the
 /// M5.4.3 single-phase defaults so auto-calibration produces a
@@ -50,9 +57,17 @@ const DEFAULT_RUN_SECS: f64 = 60.0;
 /// `AUTO_LIFT_SECS` is unused on the default M5.4.3 single-phase
 /// path; kept for parallelism with [`MeasureOptions`] in case the
 /// internal call sites later need to opt into two-phase.
+///
+/// M5.4.5 deleted `AUTO_DETECT_TIMEOUT_SECS` from the production
+/// path — `dub timecode-deck` now passes
+/// [`MeasureOptions::detect_timeout_secs`] = `None` so deck B's
+/// calibrator can wait indefinitely during a DJ takeover (the
+/// incoming DJ may not get access to deck B for many minutes after
+/// launching the app). The standalone `dub calibrate` command
+/// keeps a 30 s timeout — see the
+/// [`crate::calibrate::DETECT_TIMEOUT_SECS`] private constant.
 const AUTO_CARRIER_SECS: f64 = 3.0;
 const AUTO_LIFT_SECS: f64 = 5.0;
-const AUTO_DETECT_TIMEOUT_SECS: f64 = 30.0;
 
 /// CLI options for `dub timecode-deck`. Built on top of the shared
 /// [`InputArgs`] so the `--input-channels`/`--device`/`--sr` flags
@@ -124,10 +139,14 @@ struct Opts {
     /// deck immediately without touching the calibrator. Per-knob
     /// overrides still apply on top.
     no_calibrate: bool,
-    /// Wall-clock duration to run before stopping. Distinct from
-    /// `InputArgs::duration` because we want timecode-deck to default
-    /// to 60 s, not the 5 s default of capture/levels.
-    duration_secs: f64,
+    /// Wall-clock duration to run before stopping. `None` = run
+    /// until Ctrl-C (the default; matches the M5.4.5 takeover use
+    /// case where the operator can't predict when deck B will be
+    /// available). `Some(d)` = exit after `d` seconds, kept for
+    /// scripted / CI smoke tests. Distinct from `InputArgs::duration`
+    /// because levels/capture default to 5 s; here unset means
+    /// unbounded, not "use the levels default".
+    duration_secs: Option<f64>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts> {
@@ -345,7 +364,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     Ok(Opts {
         track_a: PathBuf::from(positional[0]),
         track_b,
-        duration_secs: input.duration.unwrap_or(DEFAULT_RUN_SECS),
+        duration_secs: input.duration,
         input,
         deck_b_input_channels,
         format,
@@ -437,17 +456,27 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let engine_sr = input_sr;
     let engine_block = 256_usize;
-    let mut engine = Engine::new(engine_sr, engine_block);
+    // M5.4.5: build the engine *with a handle* so we can attach
+    // timecode inputs mid-stream via the SPSC command channel after
+    // `AudioOutput::start_with_options` has consumed the engine.
+    // Pre-M5.4.5 this used `Engine::new` (no handle) and attached
+    // synchronously before starting the output — which forced
+    // calibration to complete before any audio could play, the
+    // exact UX failure that breaks the DJ-takeover use case.
+    let (mut engine, mut handle) = Engine::new_with_handle(engine_sr, engine_block);
     println!(
         "engine:       sr={engine_sr} Hz block={engine_block} frames\n\
          output:       device sr={} Hz (target {engine_sr} Hz) buffer={} frames",
         device.sample_rate, device.buffer_frames,
     );
 
-    // 4. Configure deck 0 with track A; in two-deck mode also load
-    //    track B onto deck 1. Crucially we do NOT set_playing(true)
-    //    on either deck — the decoder will do that per-deck on the
-    //    first locked block (see `Engine::drive_timecode_inputs`).
+    // 4. Configure decks with their tracks. We do NOT set_playing —
+    //    decks default to paused, and the timecode driver (when it
+    //    eventually attaches) will drive transport from carrier
+    //    state. Until then, both decks render silence into the
+    //    output bus, which is fine: the user sees a working audio
+    //    chain (output device alive, no clicks) while calibrators
+    //    work in the background.
     {
         let deck = engine.deck_mut(0);
         deck.set_source(Arc::new(track_a));
@@ -459,137 +488,35 @@ pub fn run(args: &[String]) -> Result<()> {
         deck.set_gain(1.0);
     }
 
-    // 4b. Resolve thresholds **per deck**. M5.4.4 makes calibration
-    //     independent across decks: deck B no longer borrows deck A's
-    //     thresholds, so a mismatched-cartridge rig (Concorde on A,
-    //     Nightclub on B — common in scratch DJing where you want a
-    //     more aggressive cartridge for routine play and a smoother
-    //     one for cueing) gets correct lift behaviour on both sides.
-    //
-    //     CLI flag overrides applied last so partial overrides work
-    //     (calibration handles 3 of 4 thresholds, user pins one).
-    //     Overrides currently apply uniformly to both decks; if you
-    //     need asymmetric overrides, hand-edit the per-deck JSONs
-    //     under `~/.dub/calibration/`.
-    //
-    //     Calibration must happen BEFORE we hand the input consumers
-    //     to the engine, because the calibration helpers consume
-    //     samples from the input pairs. After `take_consumer_pair`
-    //     is called, that pair is engine-owned and the calibrator
-    //     can no longer reach it.
-    //
-    //     Sequencing matters in two-deck mode: deck A's full
-    //     calibration (carrier + lift) runs first, then deck B's.
-    //     The user lifts the needle on A before dropping it on B,
-    //     and the per-deck status banners (`calibration A:` /
-    //     `calibration B:`) make the two phases obvious.
-    let resolved_a = resolve_thresholds(&mut input, 0, &opts)?;
-    let resolved_b = if two_deck {
-        Some(resolve_thresholds(&mut input, 1, &opts)?)
+    // 5. Take both input consumers up front so each can be moved
+    //    into its own calibrator worker thread (M5.4.5). Pre-M5.4.5
+    //    the calibrator borrowed the AudioInput exclusively and the
+    //    consumers were only moved out *after* calibration; with
+    //    parallel calibrators that's no longer an option.
+    let device_name = input.device_name().to_string();
+    let consumer_a = input
+        .take_consumer_pair(0)
+        .ok_or_else(|| anyhow!("AudioInput pair 0 consumer already taken"))?;
+    let consumer_b = if two_deck {
+        Some(
+            input
+                .take_consumer_pair(1)
+                .ok_or_else(|| anyhow!("AudioInput pair 1 consumer already taken"))?,
+        )
     } else {
         None
     };
 
-    // 5. Drain stale audio from every pair before handing the
-    //    consumers to the engine.
-    //
-    //    Why: the IOProc starts demuxing into all pair ringbuffers
-    //    the moment AudioInput::start_with_options succeeds, and it
-    //    keeps pushing whether or not anything is reading. During
-    //    M5.4.4 sequential per-deck calibration, pair 0 sits idle
-    //    while pair 1's full ~25 s carrier+lift runs (and pair 1
-    //    sits idle during pair 0's ~3 s probe). At 48 kHz a 4-second
-    //    ring fills up well inside that window, the IOProc's
-    //    `push_demuxed_frames` flips `in_overflow=true`, and from
-    //    that point on the *new* samples are dropped while the
-    //    *old* samples (the first ones pushed) stay buffered. The
-    //    user sees this in the live test as `in_overflow=2142` at
-    //    startup.
-    //
-    //    If we hand the consumer to the engine without draining, the
-    //    engine's first ~4 s of timecode after start are decode
-    //    output from samples ~25 s old — i.e. silence/lift-state
-    //    audio from the calibration phase. The user perceives this
-    //    as a 4-second lag before deck A responds to needle drops.
-    //
-    //    The drain is RT-safe (we're still on the main thread; no
-    //    audio callback yet) and idempotent: if the ring is already
-    //    empty (e.g. single-deck mode where the post-probe gap is
-    //    short) the loop exits immediately.
-    let drained_a = drain_input_pair(&mut input, 0);
-    let drained_b = if two_deck {
-        drain_input_pair(&mut input, 1)
-    } else {
-        0
-    };
-    if drained_a > 0 || drained_b > 0 {
-        println!(
-            "input drain:  flushed stale calibration-era audio (deck A: {drained_a} \
-             samples, deck B: {drained_b} samples) — engine starts on live audio"
-        );
-    }
-
-    // 6. Hand each input pair's consumer to its deck. Pair 0 always
-    //    goes to engine deck 0 (deck A); pair 1, when present (M5.6
-    //    two-deck mode), goes to deck 1. Each deck attaches with its
-    //    own thresholds (M5.4.4).
-    let rx_a = input
-        .take_consumer_pair(0)
-        .ok_or_else(|| anyhow!("AudioInput pair 0 consumer already taken"))?;
-    let cfg = |format: Format, thresholds: &CalibrationThresholds| TimecodeInputConfig {
-        format,
-        input_sample_rate: input_sr,
-        // CoreAudio output blocks vary; 4096 is a safe upper bound.
-        max_block_frames: 4096,
-        confidence_threshold: thresholds.engage,
-        disengage_threshold: thresholds.disengage,
-        sticky_blocks_to_disengage: thresholds.sticky_blocks_to_disengage,
-        amplitude_threshold: thresholds.amplitude,
-    };
-    engine
-        .attach_timecode_input(0, rx_a, cfg(opts.format, &resolved_a))
-        .context("attaching timecode input to deck 0")?;
-    if let Some(resolved_b) = &resolved_b {
-        let rx_b = input
-            .take_consumer_pair(1)
-            .ok_or_else(|| anyhow!("AudioInput pair 1 consumer already taken"))?;
-        engine
-            .attach_timecode_input(1, rx_b, cfg(opts.format, resolved_b))
-            .context("attaching timecode input to deck 1")?;
-    }
-    println!(
-        "timecode A:   format={} ({:.0} Hz) engage={:.3} disengage={:.3} \
-         sticky={} blocks amp_floor={:.4}",
-        opts.format.cli_name(),
-        opts.format.carrier_hz(),
-        resolved_a.engage,
-        resolved_a.disengage,
-        resolved_a.sticky_blocks_to_disengage,
-        resolved_a.amplitude,
-    );
-    if let Some(resolved_b) = &resolved_b {
-        println!(
-            "timecode B:   format={} ({:.0} Hz) engage={:.3} disengage={:.3} \
-             sticky={} blocks amp_floor={:.4}",
-            opts.format.cli_name(),
-            opts.format.carrier_hz(),
-            resolved_b.engage,
-            resolved_b.disengage,
-            resolved_b.sticky_blocks_to_disengage,
-            resolved_b.amplitude,
-        );
-    }
-
-    // 6. Resolve output routing: known-device auto-detect, manual
-    //    per-deck flags, or the M4 internal-mixer fallback. See
-    //    `resolve_output_routing` for the full priority order.
-    let routing = resolve_output_routing(&device, &opts)?;
+    // 6. Resolve output routing (M5.5.2 — shared with `dub thru` in
+    //    M7 via [`crate::audio_routing`]).
+    let routing = resolve_output_routing(&device, &routing_args_from_opts(&opts))?;
     println!("{}", routing.describe());
 
-    // 7. Move the engine onto the audio thread. From here, AudioOutput
-    //    drives Engine::render_routed which drives the decoder which
-    //    drives deck transport — no main-thread participation in the
-    //    audio path.
+    // 7. Move the engine onto the audio thread. Output stage
+    //    starts producing audio immediately — both decks render
+    //    silence (paused, no timecode attached) until their
+    //    calibrators complete and call
+    //    `handle.attach_timecode_input(...)` mid-stream.
     let output_opts = dub_audio::OutputOptions {
         channels: routing.channels,
         buffer_frames: opts.output_buffer_size,
@@ -602,18 +529,168 @@ pub fn run(args: &[String]) -> Result<()> {
     let latency_ms = output.latency_seconds() * 1000.0;
     println!("output buffer: {achieved} frames -> {latency_ms:.2} ms one-way latency");
     println!();
+
+    // 8. M5.4.5 parallel calibrators. Each deck's calibrator runs
+    //    on its own worker thread, owning its `HeapCons<f32>`. As
+    //    each calibrator completes it sends back the consumer +
+    //    [`Calibration`] via the mpsc channel; main applies CLI
+    //    overrides + builds [`TimecodeInputConfig`] + calls
+    //    [`dub_engine::EngineHandle::attach_timecode_input`] —
+    //    that deck goes live mid-stream, the other one keeps
+    //    waiting.
+    //
+    //    Worker threads are *detached* (`std::thread::spawn` not
+    //    `std::thread::scope`). On the takeover path a calibrator
+    //    may sit indefinitely waiting for its carrier; using scope
+    //    would block forever at scope exit. Detached threads are
+    //    cleaned up by the OS at process termination — acceptable
+    //    for a CLI tool that exits via duration timer or Ctrl-C.
     println!(
-        "running for {:.1} s — drop the needle and play.",
-        opts.duration_secs
+        "calibration:  starting per-deck calibrators in parallel (M5.4.5).\n\
+         \u{2192} as each deck's carrier locks, that deck attaches and audio plays.\n\
+         \u{2192} the other deck keeps waiting — no blocking on a deck you don't have access to."
     );
     println!("(Ctrl-C to stop early)");
+    println!();
 
-    // 7. Sleep the wall-clock duration, sampling stats every 0.5 s so
-    //    the user gets live feedback.
+    let overrides = ThresholdOverrides::from_opts(&opts);
+    let calibration_dir = default_calibration_dir().ok();
+    let format = opts.format;
+
+    type CalibratorMsg = (u32, Result<(HeapCons<f32>, Calibration)>);
+    let (tx, rx) = mpsc::channel::<CalibratorMsg>();
+
+    if opts.no_calibrate {
+        // No-calibrate path: skip the workers entirely, attach
+        // immediately with the M5.3 defaults (+ CLI overrides).
+        // The decks go live the instant attach lands, mirroring
+        // the no-calibrate behaviour of pre-M5.4.5.
+        println!("calibration: skipped (--no-calibrate); attaching with M5.3 defaults");
+        let thresholds = overrides.apply_to(default_thresholds());
+        attach_timecode_via_handle(
+            &mut handle,
+            0,
+            consumer_a,
+            format,
+            input_sr,
+            &thresholds,
+            "deck A attached (no-calibrate)",
+        )?;
+        if let Some(c_b) = consumer_b {
+            attach_timecode_via_handle(
+                &mut handle,
+                1,
+                c_b,
+                format,
+                input_sr,
+                &thresholds,
+                "deck B attached (no-calibrate)",
+            )?;
+        }
+        // No calibrators in flight; rx will only ever yield "no
+        // more senders" once we drop tx below.
+        drop(tx);
+    } else {
+        // Spawn one worker per declared deck. Each worker owns its
+        // consumer + the metadata bundle + the optional save path
+        // — all of which are 'static-able after move.
+        let inputs_a = MeasurementInputs {
+            device_name: device_name.clone(),
+            input_sample_rate: input_sr,
+            deck_index: 0,
+            format,
+        };
+        let save_a = calibration_dir
+            .as_ref()
+            .map(|d| calibration_path_for(&device_name, 0, &opts, d));
+        let tx_a = tx.clone();
+        thread::spawn(move || {
+            let result = calibrate_one_deck(consumer_a, inputs_a, save_a);
+            // Send may fail if main has already exited; that's
+            // fine, the worker just drops its result.
+            let _ = tx_a.send((0, result));
+        });
+
+        if let Some(c_b) = consumer_b {
+            let inputs_b = MeasurementInputs {
+                device_name: device_name.clone(),
+                input_sample_rate: input_sr,
+                deck_index: 1,
+                format,
+            };
+            let save_b = calibration_dir
+                .as_ref()
+                .map(|d| calibration_path_for(&device_name, 1, &opts, d));
+            let tx_b = tx.clone();
+            thread::spawn(move || {
+                let result = calibrate_one_deck(c_b, inputs_b, save_b);
+                let _ = tx_b.send((1, result));
+            });
+        }
+        // Drop main's sender so `rx.try_recv` returns
+        // `Disconnected` once both workers have completed (or
+        // exited with an error). If we held it, `try_recv` would
+        // return `Empty` forever and we couldn't tell the
+        // difference between "still running" and "finished".
+        drop(tx);
+    }
+
+    match opts.duration_secs {
+        Some(d) => println!("running for {d:.1} s — drop the needle and play."),
+        None => println!("running until Ctrl-C — drop the needle and play."),
+    }
+
+    // 9. Main loop. Interleaves three jobs at ~20 Hz:
+    //   (a) drain the calibrator-result channel and call
+    //       handle.attach_timecode_input as each deck completes,
+    //   (b) reclaim trash so old TimecodeInputs don't accumulate
+    //       on a re-attach (cartridge swap, future M5.4.5+),
+    //   (c) print live stats every 500 ms.
     let start = Instant::now();
-    let total = Duration::from_secs_f64(opts.duration_secs);
+    let total = opts.duration_secs.map(Duration::from_secs_f64);
     let mut next_tick = start + Duration::from_millis(500);
-    while start.elapsed() < total {
+    while total.is_none_or(|t| start.elapsed() < t) {
+        // (a) Process completed calibrators.
+        loop {
+            match rx.try_recv() {
+                Ok((deck_idx, Ok((consumer, cal)))) => {
+                    let label = deck_label(deck_idx);
+                    let thresholds = overrides.apply_to(cal.thresholds);
+                    println!(
+                        "deck {label}:       format={} ({:.0} Hz) engage={:.3} disengage={:.3} \
+                         sticky={} blocks amp_floor={:.4}",
+                        format.cli_name(),
+                        format.carrier_hz(),
+                        thresholds.engage,
+                        thresholds.disengage,
+                        thresholds.sticky_blocks_to_disengage,
+                        thresholds.amplitude,
+                    );
+                    if let Err(e) = attach_timecode_via_handle(
+                        &mut handle,
+                        deck_idx as usize,
+                        consumer,
+                        format,
+                        input_sr,
+                        &thresholds,
+                        &format!("deck {label} attached, audio live"),
+                    ) {
+                        eprintln!("deck {label} attach failed: {e:#}");
+                    }
+                }
+                Ok((deck_idx, Err(e))) => {
+                    let label = deck_label(deck_idx);
+                    eprintln!("deck {label} calibration failed: {e:#} — deck stays silent");
+                }
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // (b) Reclaim trash from any displaced TimecodeInputs (no-
+        //     op today; future-proofs mid-set re-cal).
+        let _ = handle.reclaim();
+
+        // (c) Stats tick.
         let now = Instant::now();
         if now >= next_tick {
             let cb = output.callback_count();
@@ -622,7 +699,6 @@ pub fn run(args: &[String]) -> Result<()> {
             print_stats(&output, &input, cb, in_cb, in_of);
             next_tick += Duration::from_millis(500);
         }
-        // Coarse sleep — the polling rate above is ≥ 2 Hz.
         thread::sleep(Duration::from_millis(50));
     }
 
@@ -649,6 +725,38 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Build a [`TimecodeInputConfig`] from the resolved per-deck
+/// thresholds + format + engine SR, then push it through the
+/// [`dub_engine::EngineHandle`] command channel for mid-stream
+/// attach (M5.4.5). Prints `attach_msg` on success — gives the
+/// user a clear "deck N is now live" signal.
+fn attach_timecode_via_handle(
+    handle: &mut dub_engine::EngineHandle,
+    deck_idx: usize,
+    consumer: HeapCons<f32>,
+    format: Format,
+    input_sr: f32,
+    thresholds: &CalibrationThresholds,
+    attach_msg: &str,
+) -> Result<()> {
+    let cfg = TimecodeInputConfig {
+        format,
+        input_sample_rate: input_sr,
+        // CoreAudio output blocks vary; 4096 is a safe upper bound
+        // matching the pre-M5.4.5 synchronous attach path.
+        max_block_frames: 4096,
+        confidence_threshold: thresholds.engage,
+        disengage_threshold: thresholds.disengage,
+        sticky_blocks_to_disengage: thresholds.sticky_blocks_to_disengage,
+        amplitude_threshold: thresholds.amplitude,
+    };
+    handle
+        .attach_timecode_input(deck_idx, consumer, cfg)
+        .with_context(|| format!("attaching timecode input to deck {deck_idx}"))?;
+    println!("{attach_msg}");
+    Ok(())
+}
+
 fn print_stats(
     output: &dub_audio::AudioOutput,
     input: &AudioInput,
@@ -670,212 +778,20 @@ fn print_stats(
     );
 }
 
-/// Build [`dub_audio::InputOptions`] for the input AU, supporting
-/// both single-deck (M5.3) and two-deck (M5.6) modes.
-///
-/// In single-deck mode this is a thin wrapper around
-/// `InputArgs::to_options()` — the legacy path, untouched.
-///
-/// In two-deck mode (`deck_b_channels = Some([5, 6])`):
-///
-/// 1. The AU is opened with `channels = 4` (or however many we need
-///    to span both decks' channels).
-/// 2. `channel_map` is `[a_l-1, a_r-1, b_l-1, b_r-1]` — 0-based
-///    device channel indices for the SL3-style "deck A on 3+4,
-///    deck B on 5+6" layout.
-/// 3. `output_pairs = [(0, 1), (2, 3)]` — both pairs are stereo
-///    contiguous in the AU's logical (post-channel-map) frame, so
-///    pair indices map cleanly to logical positions.
-///
-/// Validation: deck A and deck B input pairs must not overlap (a
-/// shared channel between decks is almost always a bug).
-fn build_input_options(
-    input: &InputArgs,
-    deck_b_channels: Option<&[u32]>,
-) -> Result<dub_audio::InputOptions> {
-    let mut opts = input.to_options();
-    let Some(b) = deck_b_channels else {
-        return Ok(opts);
-    };
-    let a = input.input_channels.as_deref().ok_or_else(|| {
-        anyhow!("two-deck mode requires --input-channels for deck A (e.g. 3,4 for SL3 deck A)")
-    })?;
-    if a.len() != 2 {
-        return Err(anyhow!(
-            "two-deck mode requires --input-channels to be a pair (got {} channels)",
-            a.len()
-        ));
+/// Adapt this subcommand's `Opts` into the shared
+/// [`crate::audio_routing::RoutingArgs`] used by
+/// [`resolve_output_routing`]. Just a field-by-field copy of the
+/// routing-relevant flags; the resolver doesn't know about
+/// `--track`, `--format`, or anything timecode-specific. Same
+/// adapter pattern is used in `dub thru` (M7).
+fn routing_args_from_opts(opts: &Opts) -> RoutingArgs {
+    RoutingArgs {
+        internal_mixer: opts.internal_mixer,
+        deck_a_out_ch: opts.deck_a_out_ch,
+        deck_b_out_ch: opts.deck_b_out_ch,
+        output_channels: opts.output_channels,
+        device_profile: opts.device_profile.clone(),
     }
-    if b.len() != 2 {
-        return Err(anyhow!(
-            "--deck-b-input-channels must be a pair (got {} channels)",
-            b.len()
-        ));
-    }
-    let overlap = a.iter().any(|c| b.contains(c));
-    if overlap {
-        return Err(anyhow!(
-            "--input-channels {a:?} and --deck-b-input-channels {b:?} share a channel; \
-             each deck needs its own stereo pair (SL3: 3,4 + 5,6)"
-        ));
-    }
-    // Combine into a 4-channel logical AU layout: [a_l, a_r, b_l, b_r],
-    // converted from 1-based to 0-based.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let channel_map: Vec<i32> = a.iter().chain(b.iter()).map(|&c| (c as i32) - 1).collect();
-    opts.channels = 4;
-    opts.channel_map = Some(channel_map);
-    opts.output_pairs = Some(vec![(0, 1), (2, 3)]);
-    Ok(opts)
-}
-
-/// Resolved output routing. Captured ahead of `AudioOutput::start_with_options`
-/// so we can print a clear "what we chose, and why" line before any
-/// audio starts — saves the user from wondering why deck B is silent
-/// on an unknown interface.
-struct ResolvedOutputRouting {
-    /// Total channels to open the AU with.
-    channels: u32,
-    /// Per-deck routing handed to `Engine::render_routed`.
-    routing: dub_engine::OutputRouting,
-    /// Human-readable summary, printed at startup.
-    summary: String,
-}
-
-impl ResolvedOutputRouting {
-    fn describe(&self) -> &str {
-        &self.summary
-    }
-}
-
-/// Resolve the M5.5.2 output routing in priority order:
-///
-/// 1. `--internal-mixer` → 2-ch internal mixer (debug only). Loud and
-///    explicit; mutually exclusive with all other routing flags.
-/// 2. Explicit `--deck-a-out-ch` + `--deck-b-out-ch` → manual routing
-///    over `--output-channels` (or the device's reported channel
-///    count). Most permissive — works for unknown devices.
-/// 3. `--device-profile NAME` → look up the profile by exact pattern
-///    and apply its routing. Useful when the system default is the
-///    wrong device.
-/// 4. Auto-detect by `device.device_name` against
-///    `device_profiles::KNOWN_DEVICES`. The path users hit when they
-///    plug in their SL3 and run `dub timecode-deck` with no flags.
-/// 5. Fallback (unknown device, no flags) → 2-ch internal mixer with a
-///    loud warning. Matches Serato's "preparation mode" semantics for
-///    laptop-only situations: the user can hear playback but should
-///    not run a live set.
-fn resolve_output_routing(
-    device: &dub_audio::DeviceInfo,
-    opts: &Opts,
-) -> Result<ResolvedOutputRouting> {
-    if opts.internal_mixer {
-        return Ok(ResolvedOutputRouting {
-            channels: 2,
-            routing: dub_engine::INTERNAL_MIXER_ROUTING,
-            summary: "output routing: internal mixer (2 ch, both decks → ch 1+2)\n\
-                 ⚠️  --internal-mixer is debug-only; not for live performance"
-                .to_string(),
-        });
-    }
-
-    if let (Some(a), Some(b)) = (opts.deck_a_out_ch, opts.deck_b_out_ch) {
-        let a0 = device_profiles::one_based_to_zero_based(a)
-            .ok_or_else(|| anyhow!("--deck-a-out-ch must be ≥ 1 (1-based), got {a}"))?;
-        let b0 = device_profiles::one_based_to_zero_based(b)
-            .ok_or_else(|| anyhow!("--deck-b-out-ch must be ≥ 1 (1-based), got {b}"))?;
-        let channels = opts.output_channels.unwrap_or(device.channels);
-        if channels < 2 {
-            return Err(anyhow!(
-                "--output-channels must be ≥ 2; got {channels} (device reports {} ch)",
-                device.channels
-            ));
-        }
-        if a0 + 2 > channels || b0 + 2 > channels {
-            return Err(anyhow!(
-                "deck-a-out-ch={a} or deck-b-out-ch={b} doesn't fit in {channels} channels \
-                 (each deck takes 2 channels). Pass --output-channels N if your device has \
-                 more outputs than the default detected."
-            ));
-        }
-        return Ok(ResolvedOutputRouting {
-            channels,
-            routing: [Some(a0), Some(b0)],
-            summary: format!(
-                "output routing: manual ({} ch, deck A → ch {}+{}, deck B → ch {}+{})",
-                channels,
-                a,
-                a + 1,
-                b,
-                b + 1,
-            ),
-        });
-    }
-
-    let profile = if let Some(pattern) = opts.device_profile.as_deref() {
-        device_profiles::profile_by_pattern(pattern).ok_or_else(|| {
-            anyhow!(
-                "--device-profile {pattern:?} not found in known-device table; \
-                 known patterns: {}",
-                device_profiles::KNOWN_DEVICES
-                    .iter()
-                    .map(|d| d.name_pattern)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?
-    } else if let Some(p) = device_profiles::match_device(&device.device_name) {
-        p
-    } else {
-        // Unknown device, no manual routing — fall back to internal
-        // mixer with a loud warning. Per the M5.5.2 design call: this
-        // is preparation-mode-equivalent (the user can audition tracks
-        // but the routing isn't right for an external mixer).
-        return Ok(ResolvedOutputRouting {
-            channels: 2,
-            routing: dub_engine::INTERNAL_MIXER_ROUTING,
-            summary: format!(
-                "output routing: unknown device '{}' — falling back to internal mixer.\n\
-                 ⚠️  no recognised interface profile; deck audio is summed to ch 1+2.\n\
-                 ⚠️  for an external mixer, pass --deck-a-out-ch / --deck-b-out-ch (1-based) \
-                 + --output-channels N, or --device-profile <name> if your interface is \
-                 listed in the known-device table",
-                device.device_name
-            ),
-        });
-    };
-
-    let channels = opts.output_channels.unwrap_or(profile.output_channels);
-    if profile.deck_a_first_channel + 2 > channels || profile.deck_b_first_channel + 2 > channels {
-        return Err(anyhow!(
-            "device profile '{}' wants {} channels but --output-channels {} is too small",
-            profile.display_name,
-            profile.output_channels,
-            channels
-        ));
-    }
-    let verified_note = if profile.verified {
-        ""
-    } else {
-        "\n⚠️  this profile is unverified against real hardware — double-check the routing"
-    };
-    Ok(ResolvedOutputRouting {
-        channels,
-        routing: [
-            Some(profile.deck_a_first_channel),
-            Some(profile.deck_b_first_channel),
-        ],
-        summary: format!(
-            "output routing: {} ({} ch, deck A → ch {}+{}, deck B → ch {}+{}){}",
-            profile.display_name,
-            channels,
-            profile.deck_a_first_channel + 1,
-            profile.deck_a_first_channel + 2,
-            profile.deck_b_first_channel + 1,
-            profile.deck_b_first_channel + 2,
-            verified_note,
-        ),
-    })
 }
 
 /// Human-friendly label for an engine deck index. `0 → "A"`,
@@ -883,50 +799,6 @@ fn resolve_output_routing(
 /// SL1200-style deck letters while the internals stay numeric.
 fn deck_label(deck_idx: u32) -> char {
     char::from(b'A' + u8::try_from(deck_idx).unwrap_or(0))
-}
-
-/// Read-and-discard every sample currently buffered in
-/// `input`'s pair ring at `pair_idx`. Returns the total sample count
-/// drained for diagnostics.
-///
-/// Called between calibration and `take_consumer_pair`: the IOProc
-/// has been pushing into both pair rings since `AudioInput::start`,
-/// but only the pair currently being calibrated is being read. The
-/// idle pair's ring fills up (and overflows) during the time the
-/// other pair is being probed — see the `in_overflow` counter on
-/// the live test. Without this drain, the engine would consume
-/// stale calibration-era audio for the first few seconds after
-/// startup, and the user would perceive a multi-second lag before
-/// the deck responds to needle action.
-///
-/// Bounded by a generous loop cap so a misbehaving HAL that keeps
-/// returning samples can't hang the main thread; in practice the
-/// ring is drained in a handful of iterations and the cap is never
-/// reached.
-fn drain_input_pair(input: &mut dub_audio::AudioInput, pair_idx: usize) -> usize {
-    /// Per-iteration scratch buffer. 4096 stereo samples = 2048 frames =
-    /// ~43 ms at 48 kHz. Bigger than any plausible ring so two iterations
-    /// usually empty even a fully overflowed ring.
-    const SCRATCH_SAMPLES: usize = 4096;
-    /// Hard cap on iterations to avoid pathological loops if the
-    /// underlying ring keeps refilling faster than we can drain.
-    /// At ~43 ms drained per iter, 64 iters = ~2.7 s of audio,
-    /// plenty above any real ring capacity.
-    const MAX_ITERS: usize = 64;
-
-    if pair_idx >= input.pair_count() {
-        return 0;
-    }
-    let mut scratch = vec![0.0_f32; SCRATCH_SAMPLES];
-    let mut total = 0_usize;
-    for _ in 0..MAX_ITERS {
-        let n = input.read_into_pair(pair_idx, &mut scratch);
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-    total
 }
 
 /// Resolve the four lift-policy thresholds for a single deck.
@@ -972,32 +844,73 @@ fn drain_input_pair(input: &mut dub_audio::AudioInput, pair_idx: usize) -> usize
 /// pair 0 → deck A, pair 1 → deck B. `run_full_calibration` reads
 /// from `pair_idx = deck_idx` so each deck calibrates against its
 /// own physical input pair.
-fn resolve_thresholds(
-    input: &mut AudioInput,
-    deck_idx: u32,
-    opts: &Opts,
-) -> Result<CalibrationThresholds> {
-    let label = deck_label(deck_idx);
+/// Snapshot of the per-deck CLI override knobs that `resolve_thresholds`
+/// needs to apply on top of the auto-derived calibration. Stripping
+/// the worker thread's view of `Opts` to just these `Copy`/owned
+/// values means the worker doesn't need to clone the entire `Opts`
+/// (it carries `PathBuf`, `InputArgs`, etc., which are bigger and
+/// irrelevant to threshold derivation).
+#[derive(Debug, Clone, Copy)]
+struct ThresholdOverrides {
+    confidence: Option<f32>,
+    disengage: Option<f32>,
+    sticky_blocks: Option<u32>,
+    amplitude_threshold: Option<f32>,
+}
 
-    if opts.no_calibrate {
-        println!("calibration {label}: skipped (--no-calibrate); using M5.3 defaults");
-        return Ok(apply_overrides(default_thresholds(), opts));
+impl ThresholdOverrides {
+    fn from_opts(opts: &Opts) -> Self {
+        Self {
+            confidence: opts.confidence,
+            disengage: opts.disengage,
+            sticky_blocks: opts.sticky_blocks,
+            amplitude_threshold: opts.amplitude_threshold,
+        }
     }
 
-    println!("calibration {label}: running fresh measurement (M5.4.6 always-fresh)");
-    let cal = run_full_calibration(input, deck_idx, opts.format)?;
+    fn apply_to(self, base: CalibrationThresholds) -> CalibrationThresholds {
+        CalibrationThresholds {
+            engage: self.confidence.unwrap_or(base.engage),
+            disengage: self.disengage.unwrap_or(base.disengage),
+            amplitude: self.amplitude_threshold.unwrap_or(base.amplitude),
+            sticky_blocks_to_disengage: self
+                .sticky_blocks
+                .unwrap_or(base.sticky_blocks_to_disengage),
+        }
+    }
+}
 
-    // Best-effort diagnostic save. The runtime no longer reads
-    // these files (M5.4.6) but we still write them so a power user
-    // can inspect "what did this rig look like" after the fact, and
-    // so future analysis tooling has cross-session data to work
-    // with. A save failure is non-fatal — we already have the
-    // thresholds we need in memory.
-    let dir = default_calibration_dir().context("resolving default calibration dir")?;
-    let path = calibration_path_for(input.device_name(), deck_idx, opts, &dir);
-    save_calibration(&cal, &path);
+/// Run a fresh calibration on a single deck's input consumer in a
+/// worker thread (M5.4.5). Returns the consumer back along with the
+/// resulting [`Calibration`] so the caller can extract thresholds,
+/// apply CLI overrides, and call
+/// [`dub_engine::EngineHandle::attach_timecode_input`] to attach
+/// this deck mid-stream.
+///
+/// **M5.4.5 worker entry point.** Designed to be moved by value
+/// into a [`std::thread::spawn`] closure — `consumer`, `inputs`,
+/// and `save_path` are all owned values with no borrows from the
+/// main thread's stack. Two of these can run in parallel without
+/// any shared mutable state.
+///
+/// The save step is best-effort — failure is logged via
+/// [`save_calibration`] but never propagated, so a read-only home
+/// directory or sandbox doesn't block the live performance flow.
+/// The runtime no longer reads these files (M5.4.6) but we still
+/// write them so a power user can inspect "what did this rig look
+/// like" after the fact.
+fn calibrate_one_deck(
+    mut consumer: HeapCons<f32>,
+    inputs: MeasurementInputs,
+    save_path: Option<PathBuf>,
+) -> Result<(HeapCons<f32>, Calibration)> {
+    let cal = run_full_calibration(&mut consumer, &inputs)?;
 
-    Ok(apply_overrides(cal.thresholds, opts))
+    if let Some(path) = save_path {
+        save_calibration(&cal, &path);
+    }
+
+    Ok((consumer, cal))
 }
 
 /// M5.3 defaults — the floor that every higher-priority source
@@ -1015,27 +928,44 @@ fn default_thresholds() -> CalibrationThresholds {
 /// Each override replaces exactly one value, leaving the others
 /// untouched — partial overrides ("auto-everything except force
 /// amplitude=0.05") are first-class.
+///
+/// Thin wrapper over [`ThresholdOverrides::apply_to`] so the
+/// existing override tests (which take an `Opts`) keep their
+/// shape without coupling them to the [`Opts`] internals. The
+/// production hot path uses `ThresholdOverrides` directly to keep
+/// the worker-thread move set small.
+#[cfg(test)]
 fn apply_overrides(base: CalibrationThresholds, opts: &Opts) -> CalibrationThresholds {
-    CalibrationThresholds {
-        engage: opts.confidence.unwrap_or(base.engage),
-        disengage: opts.disengage.unwrap_or(base.disengage),
-        amplitude: opts.amplitude_threshold.unwrap_or(base.amplitude),
-        sticky_blocks_to_disengage: opts
-            .sticky_blocks
-            .unwrap_or(base.sticky_blocks_to_disengage),
-    }
+    ThresholdOverrides::from_opts(opts).apply_to(base)
 }
 
-/// Run a full calibration against an open `AudioInput` and return
-/// the populated [`Calibration`]. A wrapper around
-/// [`measure_inline`] that pins the auto-startup defaults.
+/// Run a full calibration against a single deck's input ringbuffer
+/// consumer and return the populated [`Calibration`].
+///
+/// **M5.4.5** changed the parameter set from `(&mut AudioInput,
+/// deck_idx, format)` to `(&mut HeapCons<f32>, &MeasurementInputs)`
+/// so the function can run on a worker thread without an exclusive
+/// borrow on the `AudioInput`. Now two of these can run in parallel,
+/// one per deck, and the calibrator that finishes first attaches its
+/// deck to the engine via the command channel — no waiting on the
+/// other deck.
+///
+/// The `detect_timeout` is `None` (wait indefinitely) for the
+/// `dub timecode-deck` startup path: in the DJ-takeover scenario
+/// the incoming DJ launches the app while the previous DJ still
+/// has the turntables, and deck B's calibrator may sit waiting for
+/// many minutes. Once the carrier eventually appears (DJ drops a
+/// record), the calibrator wakes up, completes, and attaches
+/// mid-stream without disturbing whichever deck is already live.
 fn run_full_calibration(
-    input: &mut AudioInput,
-    deck_idx: u32,
-    format: Format,
+    consumer: &mut HeapCons<f32>,
+    inputs: &MeasurementInputs,
 ) -> Result<Calibration> {
     println!();
-    println!("=== auto-calibration (deck {}) ===", deck_label(deck_idx));
+    println!(
+        "=== auto-calibration (deck {}) ===",
+        deck_label(inputs.deck_index)
+    );
     // M5.4.3: auto-calibration uses single-phase mode (carrier-only).
     // The two-phase opt-out is reachable from the `dub calibrate
     // --two-phase` CLI; auto-calibration prioritizes "drop the needle,
@@ -1043,26 +973,30 @@ fn run_full_calibration(
     // catches stylus / preamp / cabling problems but adds ~25 s the
     // user is unlikely to notice when something's already working).
     let cal = measure_inline(
-        input,
-        usize::try_from(deck_idx).expect("deck index fits in usize"),
-        deck_idx,
-        format,
+        consumer,
+        inputs,
         MeasureOptions {
             carrier_secs: AUTO_CARRIER_SECS,
             lift_secs: AUTO_LIFT_SECS,
-            detect_timeout_secs: AUTO_DETECT_TIMEOUT_SECS,
+            // M5.4.5: no timeout — the incoming DJ may not have
+            // access to deck B's turntable for many minutes during
+            // a takeover. We wait until the carrier appears.
+            detect_timeout_secs: None,
             two_phase: false,
         },
     )?;
     println!(
-        "  derived: engage={:.3} disengage={:.3} amp={:.4} sticky={} (SNR {:.0}×)",
+        "  derived: engage={:.3} disengage={:.3} amp={:.4} sticky={} (SNR {:.0}\u{00d7})",
         cal.thresholds.engage,
         cal.thresholds.disengage,
         cal.thresholds.amplitude,
         cal.thresholds.sticky_blocks_to_disengage,
         cal.snr_margin,
     );
-    println!("=== end calibration ===");
+    println!(
+        "=== end calibration (deck {}) ===",
+        deck_label(inputs.deck_index)
+    );
     println!();
     Ok(cal)
 }
@@ -1134,7 +1068,7 @@ mod tests {
             output_channels: None,
             deck_a_out_ch: None,
             deck_b_out_ch: None,
-            duration_secs: 0.0,
+            duration_secs: None,
         }
     }
 
@@ -1406,7 +1340,7 @@ mod tests {
     fn resolve_output_routing_internal_mixer_flag() {
         let mut opts = opts_default();
         opts.internal_mixer = true;
-        let r = resolve_output_routing(&dev("SL 3", 6), &opts).unwrap();
+        let r = resolve_output_routing(&dev("SL 3", 6), &routing_args_from_opts(&opts)).unwrap();
         assert_eq!(r.channels, 2);
         assert_eq!(r.routing, dub_engine::INTERNAL_MIXER_ROUTING);
         assert!(
@@ -1421,7 +1355,8 @@ mod tests {
         let mut opts = opts_default();
         opts.deck_a_out_ch = Some(3);
         opts.deck_b_out_ch = Some(5);
-        let r = resolve_output_routing(&dev("Mystery USB DAC", 6), &opts).unwrap();
+        let r = resolve_output_routing(&dev("Mystery USB DAC", 6), &routing_args_from_opts(&opts))
+            .unwrap();
         // Device has 6 channels by default → channels=6.
         assert_eq!(r.channels, 6);
         // 1-based → 0-based: 3 → 2, 5 → 4.
@@ -1435,7 +1370,8 @@ mod tests {
         opts.deck_a_out_ch = Some(1);
         opts.deck_b_out_ch = Some(3);
         opts.output_channels = Some(4);
-        let r = resolve_output_routing(&dev("Mystery USB DAC", 8), &opts).unwrap();
+        let r = resolve_output_routing(&dev("Mystery USB DAC", 8), &routing_args_from_opts(&opts))
+            .unwrap();
         assert_eq!(r.channels, 4);
         assert_eq!(r.routing, [Some(0), Some(2)]);
     }
@@ -1446,16 +1382,17 @@ mod tests {
         opts.deck_a_out_ch = Some(5);
         opts.deck_b_out_ch = Some(7);
         // Device only has 4 channels; deck B at ch 7 doesn't fit.
-        let r = resolve_output_routing(&dev("Mystery USB DAC", 4), &opts);
+        let r = resolve_output_routing(&dev("Mystery USB DAC", 4), &routing_args_from_opts(&opts));
         assert!(r.is_err(), "deck-b-out-ch=7 with 4ch device should error");
     }
 
     #[test]
     fn resolve_output_routing_auto_detects_sl3() {
         let opts = opts_default();
-        let r = resolve_output_routing(&dev("Rane SL 3", 6), &opts).unwrap();
+        let r =
+            resolve_output_routing(&dev("Rane SL 3", 6), &routing_args_from_opts(&opts)).unwrap();
         assert_eq!(r.channels, 6);
-        assert_eq!(r.routing, [Some(2), Some(4)]); // deck A 3+4, deck B 5+6
+        assert_eq!(r.routing, [Some(2), Some(4)]);
         assert!(r.summary.contains("Serato SL 3"), "got: {}", r.summary);
         assert!(
             !r.summary.contains("unverified"),
@@ -1467,7 +1404,8 @@ mod tests {
     #[test]
     fn resolve_output_routing_auto_detects_audio6_warns_unverified() {
         let opts = opts_default();
-        let r = resolve_output_routing(&dev("Traktor Audio 6", 6), &opts).unwrap();
+        let r = resolve_output_routing(&dev("Traktor Audio 6", 6), &routing_args_from_opts(&opts))
+            .unwrap();
         assert_eq!(r.routing, [Some(0), Some(2)]);
         assert!(
             r.summary.contains("unverified"),
@@ -1479,7 +1417,11 @@ mod tests {
     #[test]
     fn resolve_output_routing_unknown_device_falls_back_internal() {
         let opts = opts_default();
-        let r = resolve_output_routing(&dev("MacBook Pro Speakers", 2), &opts).unwrap();
+        let r = resolve_output_routing(
+            &dev("MacBook Pro Speakers", 2),
+            &routing_args_from_opts(&opts),
+        )
+        .unwrap();
         assert_eq!(r.channels, 2);
         assert_eq!(r.routing, dub_engine::INTERNAL_MIXER_ROUTING);
         assert!(
@@ -1491,22 +1433,17 @@ mod tests {
 
     #[test]
     fn resolve_output_routing_device_profile_override() {
-        // User has the SL3 connected but their default output is the
-        // built-in MacBook (oversight). --device-profile lets them
-        // pin the routing without changing macOS audio settings.
         let mut opts = opts_default();
         opts.device_profile = Some("SL 3".to_string());
-        let r = resolve_output_routing(&dev("MacBook Pro Speakers", 2), &opts).unwrap();
-        // We pin the SL3 profile but the *device* only has 2 outputs
-        // — that's an error; the user must also pass --output-channels
-        // or fix their default device. Pin the error semantic.
-        // Actually the user's profile says SL3 (output_channels=6),
-        // and we don't override-check against the device, we just
-        // open the AU with `channels`. The macOS default-output AU
-        // can still be opened with N channels even if the underlying
-        // device has fewer (the AU aggregates), so this is the
-        // user's own footgun. We pass through and let CoreAudio
-        // reject if it must.
+        let r = resolve_output_routing(
+            &dev("MacBook Pro Speakers", 2),
+            &routing_args_from_opts(&opts),
+        )
+        .unwrap();
+        // Profile says SL3 (output_channels=6); the AU can be opened
+        // with N channels even if the physical device has fewer
+        // (CoreAudio's default-output AU aggregates). User's own
+        // footgun if it actually fails.
         assert_eq!(r.channels, 6);
         assert_eq!(r.routing, [Some(2), Some(4)]);
     }

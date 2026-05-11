@@ -104,10 +104,17 @@ const LIFT_DETECT_AMP: f32 = 0.005;
 /// outs (dust ticks, brief inter-track gap on the record).
 const LIFT_BLOCKS: u32 = 10;
 
-/// Default timeout for each detection phase. After this long without
-/// hitting the criteria, the calibrator aborts with a clear error
-/// — almost always the user forgot to drop the needle, or the wrong
-/// channels are configured.
+/// Default timeout for each detection phase used by the standalone
+/// `dub calibrate` command. After this long without hitting the
+/// criteria, the calibrator aborts with a clear error — almost always
+/// the user forgot to drop the needle, or the wrong channels are
+/// configured.
+///
+/// **Not used by `dub timecode-deck`** (M5.4.5): startup-time
+/// calibrators run with [`MeasureOptions::detect_timeout_secs`]
+/// = `None` so the deck-B calibrator can wait indefinitely during a
+/// DJ takeover (the incoming DJ may not get access to deck B for many
+/// minutes after the app is launched).
 const DETECT_TIMEOUT_SECS: f64 = 30.0;
 
 /// Status-line refresh rate during waits + captures. 4 Hz is
@@ -138,8 +145,12 @@ struct Opts {
     /// [`Opts::two_phase`] is `true`. Default 5.0 s preserved
     /// from M5.4.2 for comparable two-phase output.
     lift_secs: f64,
-    /// Detection timeout for both waits.
-    detect_timeout_secs: f64,
+    /// Detection timeout for both waits. Always `Some` for the
+    /// standalone `dub calibrate` command (default
+    /// [`DETECT_TIMEOUT_SECS`]); `dub timecode-deck` startup
+    /// calibrators set this to `None` for the takeover use case
+    /// (M5.4.5).
+    detect_timeout_secs: Option<f64>,
     /// Override the on-disk save location. `None` = standard
     /// `~/.dub/calibration/<device_key>.json` path.
     output: Option<PathBuf>,
@@ -164,7 +175,7 @@ impl Default for Opts {
             deck: 0,
             carrier_secs: DEFAULT_CARRIER_SECS,
             lift_secs: DEFAULT_LIFT_SECS,
-            detect_timeout_secs: DETECT_TIMEOUT_SECS,
+            detect_timeout_secs: Some(DETECT_TIMEOUT_SECS),
             output: None,
             no_save: false,
             two_phase: false,
@@ -217,9 +228,10 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                 let v = iter
                     .next()
                     .ok_or_else(|| anyhow!("--detect-timeout expects a number"))?;
-                opts.detect_timeout_secs = v
+                let parsed = v
                     .parse::<f64>()
                     .with_context(|| format!("--detect-timeout {v}"))?;
+                opts.detect_timeout_secs = Some(parsed);
             }
             "--format" => {
                 let v = iter.next().ok_or_else(|| {
@@ -273,7 +285,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
             opts.lift_secs
         ));
     }
-    if opts.detect_timeout_secs <= 0.0 {
+    if matches!(opts.detect_timeout_secs, Some(t) if t <= 0.0) {
         return Err(anyhow!("--detect-timeout must be > 0"));
     }
     Ok(opts)
@@ -311,18 +323,28 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     println!();
 
-    // pair_idx=0 because `dub calibrate` opens a dedicated 2-channel
-    // AudioInput — only pair 0 exists. The `--deck` flag controls
-    // *only* the on-disk metadata so a user calibrating deck B's
-    // separate hardware on the same SL3 (different cartridge,
-    // different turntable) gets a `..._deck_1_<format>.json` file
-    // that `dub timecode-deck` will pick up automatically. See the
-    // pair_idx-vs-deck_index note in `measure_inline`'s doc.
+    // M5.4.5 plumbing: the calibrator now takes a HeapCons<f32>
+    // directly (so it can run on a worker thread without holding a
+    // borrow on the AudioInput). `dub calibrate` opens a dedicated
+    // 2-channel AudioInput so pair 0 is the only consumer; we lift
+    // it out and hand it to `measure_inline`. The `--deck` flag
+    // still controls *only* the on-disk metadata so a user
+    // calibrating deck B's separate hardware on the same SL3
+    // (different cartridge, different turntable) gets a
+    // `..._deck_1_<format>.json` file that `dub timecode-deck`
+    // will pick up automatically.
+    let inputs = MeasurementInputs {
+        device_name: input.device_name().to_string(),
+        input_sample_rate: input.sample_rate(),
+        deck_index: opts.deck,
+        format: opts.format,
+    };
+    let mut consumer = input
+        .take_consumer_pair(0)
+        .ok_or_else(|| anyhow!("AudioInput pair 0 consumer already taken"))?;
     let cal = measure_inline(
-        &mut input,
-        0,
-        opts.deck,
-        opts.format,
+        &mut consumer,
+        &inputs,
         MeasureOptions {
             carrier_secs: opts.carrier_secs,
             lift_secs: opts.lift_secs,
@@ -358,21 +380,71 @@ pub fn run(args: &[String]) -> Result<()> {
 
 /// Per-call options for [`measure_inline`]. Bundled to keep the
 /// function signature stable across the M5.4.2 (two-phase) →
-/// M5.4.3 (single-phase default) → future tuning passes.
+/// M5.4.3 (single-phase default) → M5.4.5 (parallel calibrators)
+/// → future tuning passes.
 #[derive(Debug, Clone, Copy)]
 pub struct MeasureOptions {
     pub carrier_secs: f64,
     /// Used only when `two_phase == true`. Ignored otherwise.
     pub lift_secs: f64,
-    pub detect_timeout_secs: f64,
+    /// Detection-phase timeout. `Some(secs)` aborts each wait
+    /// (`wait_for_stable_carrier`, `wait_for_lift`) after `secs`
+    /// of no-progress; `None` waits indefinitely.
+    ///
+    /// `dub calibrate` always passes `Some(30.0)` so a forgotten
+    /// needle doesn't hang the CLI. `dub timecode-deck` startup
+    /// calibrators (M5.4.5) pass `None` to support the DJ-takeover
+    /// flow: deck B's calibrator may sit waiting for many minutes
+    /// until the previous DJ vacates the turntable.
+    pub detect_timeout_secs: Option<f64>,
     /// `false` (M5.4.3 default) → carrier-only single-phase.
     /// `true`  → legacy carrier+lift two-phase with SNR check.
     pub two_phase: bool,
 }
 
-/// Run a calibration against an already-open [`AudioInput`].
-/// Returns the fully populated [`Calibration`] without saving —
-/// the caller decides where (and whether) to persist.
+/// Bundle of metadata the calibrator needs for the on-disk
+/// [`Calibration`] record. Pulled from the [`AudioInput`] by the
+/// caller and passed through; M5.4.5 introduced this split so
+/// [`measure_inline`] can run on a worker thread that *doesn't*
+/// own the [`AudioInput`] (only the [`HeapCons`] consumer end).
+///
+/// The fields here are the bare minimum needed by the calibration
+/// JSON schema — the audio data flows through `consumer` separately.
+#[derive(Debug, Clone)]
+pub struct MeasurementInputs {
+    /// Hardware label (e.g. `"SL 3"`) — recorded in
+    /// [`Calibration::device_name`] for diagnostics.
+    pub device_name: String,
+    /// Engine sample rate. The decoder is built at this SR;
+    /// downstream consumers expect input audio to match.
+    pub input_sample_rate: f32,
+    /// Engine deck index this calibration is for (0 = A, 1 = B).
+    /// Written to [`Calibration::deck_index`] and the on-disk
+    /// filename key.
+    pub deck_index: u32,
+    /// Timecode format being calibrated. The decoder is built for
+    /// this format; the calibration result is per-format because
+    /// different vinyl have different reference amplitudes.
+    pub format: Format,
+}
+
+/// Run a calibration on a [`HeapCons<f32>`] consumer end of an
+/// input ringbuffer. Returns the fully populated [`Calibration`]
+/// without saving — the caller decides where (and whether) to
+/// persist.
+///
+/// **M5.4.5 signature change.** Pre-M5.4.5 this took
+/// `&mut AudioInput + pair_idx`; the exclusive borrow forced
+/// sequential calibration (only one calibrator at a time can hold
+/// the AudioInput). Now it takes a [`HeapCons<f32>`] for one pair
+/// directly, so two calibrators on two different consumers can
+/// run on two different threads with no shared mutable state.
+/// The [`MeasurementInputs`] bundle carries the metadata that
+/// previously came off `AudioInput` (device name, SR, etc.). The
+/// caller — `dub calibrate` for the single-deck case,
+/// `dub timecode-deck` startup for the two-deck case — owns the
+/// [`AudioInput`], pulls these values off it once, and hands them
+/// to each calibrator thread alongside its consumer.
 ///
 /// In single-phase mode (M5.4.3 default,
 /// [`MeasureOptions::two_phase`] = false), only the carrier phase
@@ -384,40 +456,23 @@ pub struct MeasureOptions {
 ///
 /// Used by both `dub calibrate` (saves to
 /// `~/.dub/calibration/...`) and `dub timecode-deck`'s startup
-/// auto-calibration path (saves to the same location, but the user
-/// didn't explicitly ask for it). Sharing this code path means
-/// "you got auto-calibrated" produces a JSON file indistinguishable
-/// from "you ran `dub calibrate`".
-///
-/// `pair_idx` selects **which AudioInput pair** to read from (M5.6
-/// demuxing — pair 0 is deck A, pair 1 is deck B in two-deck mode).
-/// `deck_index` is the **on-disk metadata** identifying which
-/// engine deck this calibration is for; it lands in the
-/// [`Calibration::deck_index`] field and the path key.
-///
-/// In the timecode-deck two-deck path these are the same value
-/// (deck N reads from pair N), but `dub calibrate` opens a single-
-/// pair input regardless of which deck the user wants the file
-/// to apply to (e.g. `--input-channels 5,6 --deck 1` opens a
-/// 2-channel SL3 input over physical channels 5,6 — that's still
-/// pair 0 of the AudioInput — and stamps the result as deck 1).
-/// Keeping them separate avoids the trap of "the user picked deck
-/// 1 so we try to read pair 1, but only pair 0 exists, so we read
-/// silence".
+/// parallel-calibration path (saves to the same location, but the
+/// user didn't explicitly ask for it). Sharing this code path
+/// means "you got auto-calibrated" produces a JSON file
+/// indistinguishable from "you ran `dub calibrate`".
 ///
 /// # Errors
-/// Detection timeout (no carrier / no lift in two-phase),
-/// 0-block capture, or — in two-phase mode only — SNR below
+/// Detection timeout (only when
+/// [`MeasureOptions::detect_timeout_secs`] = `Some`), 0-block
+/// capture, or — in two-phase mode only — SNR below
 /// [`SNR_FAIL_THRESHOLD`] (rejected by [`derive_thresholds`]).
 pub fn measure_inline(
-    input: &mut AudioInput,
-    pair_idx: usize,
-    deck_index: u32,
-    format: Format,
+    consumer: &mut ringbuf::HeapCons<f32>,
+    inputs: &MeasurementInputs,
     opts: MeasureOptions,
 ) -> Result<Calibration> {
-    let sr = input.sample_rate();
-    let mut decoder = Decoder::new(format, sr);
+    let sr = inputs.input_sample_rate;
+    let mut decoder = Decoder::new(inputs.format, sr);
 
     let step_label = if opts.two_phase {
         "step 1/2: carrier"
@@ -425,10 +480,10 @@ pub fn measure_inline(
         "step 1/1: carrier"
     };
     println!("{step_label}  —  spin the record at 33\u{2153} on a clean section");
-    wait_for_stable_carrier(input, pair_idx, &mut decoder, opts.detect_timeout_secs)?;
+    wait_for_stable_carrier(consumer, &mut decoder, opts.detect_timeout_secs)?;
     println!();
     let (carrier_amps, carrier_confs) =
-        capture_phase(input, pair_idx, &mut decoder, opts.carrier_secs, "carrier")?;
+        capture_phase(consumer, &mut decoder, opts.carrier_secs, "carrier")?;
     println!();
 
     let mut carrier_amps_owned = carrier_amps;
@@ -437,10 +492,10 @@ pub fn measure_inline(
 
     let lift = if opts.two_phase {
         println!("step 2/2: lift     —  lift the needle off and rest it");
-        wait_for_lift(input, pair_idx, &mut decoder, opts.detect_timeout_secs)?;
+        wait_for_lift(consumer, &mut decoder, opts.detect_timeout_secs)?;
         println!();
         let (lift_amps, lift_confs) =
-            capture_phase(input, pair_idx, &mut decoder, opts.lift_secs, "lift")?;
+            capture_phase(consumer, &mut decoder, opts.lift_secs, "lift")?;
         println!();
         let mut lift_amps_owned = lift_amps;
         let mut lift_confs_owned = lift_confs;
@@ -482,9 +537,9 @@ pub fn measure_inline(
 
     Ok(Calibration {
         schema_version: SCHEMA_VERSION,
-        device_name: input.device_name().to_string(),
-        deck_index,
-        format: format_string(format).to_string(),
+        device_name: inputs.device_name.clone(),
+        deck_index: inputs.deck_index,
+        format: format_string(inputs.format).to_string(),
         calibrated_at,
         input_sample_rate: sr,
         #[allow(clippy::cast_possible_truncation)]
@@ -497,23 +552,24 @@ pub fn measure_inline(
 }
 
 /// Wait until [`STABLE_BLOCKS`] consecutive blocks meet the carrier-
-/// detection criteria, or `timeout_secs` elapses.
+/// detection criteria, or `timeout_secs` elapses (when `Some`).
 ///
 /// While waiting, prints a rolling 4 Hz status line so the user
 /// sees what the decoder is observing in real time.
 fn wait_for_stable_carrier(
-    input: &mut AudioInput,
-    pair_idx: usize,
+    consumer: &mut ringbuf::HeapCons<f32>,
     decoder: &mut Decoder,
-    timeout_secs: f64,
+    timeout_secs: Option<f64>,
 ) -> Result<()> {
+    use ringbuf::traits::Consumer as _;
+
     let mut consecutive: u32 = 0;
     let block_samples = BLOCK_FRAMES * 2;
     let mut acc = vec![0_f32; block_samples * 4];
     let mut acc_len = 0_usize;
 
     let start = Instant::now();
-    let timeout = Duration::from_secs_f64(timeout_secs);
+    let timeout = timeout_secs.map(Duration::from_secs_f64);
     let mut last_status = Instant::now() - Duration::from_millis(STATUS_REFRESH_MS);
 
     let mut last_amp = 0.0_f32;
@@ -521,18 +577,21 @@ fn wait_for_stable_carrier(
     let mut last_rate = 0.0_f64;
 
     loop {
-        if start.elapsed() > timeout {
-            eprintln!();
-            return Err(anyhow!(
-                "no stable carrier detected within {timeout_secs:.0} s.\n\
-                 Common causes: needle not on the record, wrong --input-channels \
-                 (SL3 deck A is 3,4), or platter not spinning at unity. \
-                 Last seen: conf={last_conf:.2} rate={last_rate:+.3} amp={last_amp:.4}",
-            ));
+        if let Some(t) = timeout {
+            if start.elapsed() > t {
+                eprintln!();
+                return Err(anyhow!(
+                    "no stable carrier detected within {} s.\n\
+                     Common causes: needle not on the record, wrong --input-channels \
+                     (SL3 deck A is 3,4), or platter not spinning at unity. \
+                     Last seen: conf={last_conf:.2} rate={last_rate:+.3} amp={last_amp:.4}",
+                    t.as_secs_f64()
+                ));
+            }
         }
         let space = acc.len() - acc_len;
         if space > 0 {
-            let n = input.read_into_pair(pair_idx, &mut acc[acc_len..acc_len + space]);
+            let n = consumer.pop_slice(&mut acc[acc_len..acc_len + space]);
             acc_len += n;
         }
         while acc_len >= block_samples {
@@ -569,37 +628,40 @@ fn wait_for_stable_carrier(
 }
 
 /// Wait until [`LIFT_BLOCKS`] consecutive blocks have amplitude
-/// below [`LIFT_DETECT_AMP`], or [`Opts::detect_timeout_secs`]
-/// elapses.
+/// below [`LIFT_DETECT_AMP`], or `timeout_secs` elapses (when `Some`).
 fn wait_for_lift(
-    input: &mut AudioInput,
-    pair_idx: usize,
+    consumer: &mut ringbuf::HeapCons<f32>,
     decoder: &mut Decoder,
-    timeout_secs: f64,
+    timeout_secs: Option<f64>,
 ) -> Result<()> {
+    use ringbuf::traits::Consumer as _;
+
     let mut consecutive: u32 = 0;
     let block_samples = BLOCK_FRAMES * 2;
     let mut acc = vec![0_f32; block_samples * 4];
     let mut acc_len = 0_usize;
 
     let start = Instant::now();
-    let timeout = Duration::from_secs_f64(timeout_secs);
+    let timeout = timeout_secs.map(Duration::from_secs_f64);
     let mut last_status = Instant::now() - Duration::from_millis(STATUS_REFRESH_MS);
 
     let mut last_amp = 0.0_f32;
 
     loop {
-        if start.elapsed() > timeout {
-            eprintln!();
-            return Err(anyhow!(
-                "no lift detected within {timeout_secs:.0} s.\n\
-                 Lift the stylus off the record and place it on its rest. \
-                 Last seen amp = {last_amp:.4}",
-            ));
+        if let Some(t) = timeout {
+            if start.elapsed() > t {
+                eprintln!();
+                return Err(anyhow!(
+                    "no lift detected within {} s.\n\
+                     Lift the stylus off the record and place it on its rest. \
+                     Last seen amp = {last_amp:.4}",
+                    t.as_secs_f64()
+                ));
+            }
         }
         let space = acc.len() - acc_len;
         if space > 0 {
-            let n = input.read_into_pair(pair_idx, &mut acc[acc_len..acc_len + space]);
+            let n = consumer.pop_slice(&mut acc[acc_len..acc_len + space]);
             acc_len += n;
         }
         while acc_len >= block_samples {
@@ -633,12 +695,13 @@ fn wait_for_lift(
 /// amplitude + confidence vectors. Print a rolling progress
 /// indicator at 4 Hz.
 fn capture_phase(
-    input: &mut AudioInput,
-    pair_idx: usize,
+    consumer: &mut ringbuf::HeapCons<f32>,
     decoder: &mut Decoder,
     secs: f64,
     label: &str,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    use ringbuf::traits::Consumer as _;
+
     let block_samples = BLOCK_FRAMES * 2;
     let mut acc = vec![0_f32; block_samples * 4];
     let mut acc_len = 0_usize;
@@ -653,7 +716,7 @@ fn capture_phase(
     while start.elapsed() < dur {
         let space = acc.len() - acc_len;
         if space > 0 {
-            let n = input.read_into_pair(pair_idx, &mut acc[acc_len..acc_len + space]);
+            let n = consumer.pop_slice(&mut acc[acc_len..acc_len + space]);
             acc_len += n;
         }
         while acc_len >= block_samples {

@@ -25,12 +25,14 @@ use dub_engine::{Engine, EngineHandle, RealtimeContext};
 use dub_io::Track;
 
 mod analyze;
+mod audio_routing;
 mod calibrate;
 mod calibration;
 mod decode_timecode;
 mod device_profiles;
 mod input_cmds;
 mod scope;
+mod thru;
 mod timecode_deck;
 
 fn main() -> ExitCode {
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
         "levels" => input_cmds::levels(&args[2..]),
         "capture" => input_cmds::capture(&args[2..]),
         "timecode-deck" => timecode_deck::run(&args[2..]),
+        "thru" => thru::run(&args[2..]),
         "scope" => scope::run(&args[2..]),
         "calibrate" => calibrate::run(&args[2..]),
         "measure-latency" => measure_latency(),
@@ -119,6 +122,24 @@ fn print_help() {
         "                                    live timecode (1- or 2-deck, Serato + Traktor) \
          (M5.3+M5.4.2+M5.5.2+M5.6+M6)"
     );
+    eprintln!("  thru              --input-channels N,M [--deck-b-input-channels N,M]");
+    eprintln!("                    [--device NAME] [--sr SR] [--buffer-size F]");
+    eprintln!("                    [--output-buffer-size FRAMES] [--duration SECS]");
+    eprintln!("                    [--internal-mixer | (--deck-a-out-ch N --deck-b-out-ch N");
+    eprintln!("                                         [--output-channels N])]");
+    eprintln!("                    [--device-profile NAME] [--no-bpm-track]");
+    eprintln!(
+        "                                    M7+M8: route real (non-timecode) records through\n\
+         \u{0020}                                  the engine — input ring → engine → output, always.\n\
+         \u{0020}                                  One buffer of round-trip latency (~2.7 ms at\n\
+         \u{0020}                                  64-frame buffer / 48 kHz). The signal is always\n\
+         \u{0020}                                  in software so BPM detect (M8 — on by default,\n\
+         \u{0020}                                  prints searching/tentative/locked transitions to\n\
+         \u{0020}                                  stderr; --no-bpm-track to disable), waveform\n\
+         \u{0020}                                  capture (M9), and FX (M15+) can hook into the\n\
+         \u{0020}                                  chain. Hardware-bypass Thru on the interface\n\
+         \u{0020}                                  itself is outside Dub's scope (defeats those)."
+    );
     eprintln!("  scope             [--device NAME] [--input-channels N,M] [--sr SR]");
     eprintln!("                    [--buffer-size F] [--duration SECS]");
     eprintln!("                    [--engage T] [--disengage T] [--sticky N]");
@@ -173,24 +194,36 @@ fn print_help() {
     eprintln!("    lukewarm band down to disengage rides scratch transients; (3) sticky window");
     eprintln!("    — N consecutive below-floor blocks before muting.");
     eprintln!();
-    eprintln!("    Calibration (M5.4.6 always-fresh): on startup, runs a fresh single-phase");
-    eprintln!("    calibration against the actual rig in front of you (~3.5 s per deck) and");
-    eprintln!("    derives thresholds from the live measurement. Result is saved to");
-    eprintln!("    ~/.dub/calibration/<device>_deck_<idx>_<format>.json as a diagnostic");
-    eprintln!("    artifact \u{2014} nothing in the runtime path reads it back. The save model");
-    eprintln!("    used to be load-and-fingerprint-probe-on-startup (M5.4.2 \u{2026} M5.4.5),");
-    eprintln!("    but for touring DJs every venue brings a different turntable + cartridge");
-    eprintln!("    so the probe always mismatched and burnt ~1.7 s confirming what we already");
-    eprintln!("    knew. Always-measure-the-rig-in-front-of-you is simpler and faster on the");
-    eprintln!("    real-world production path. Per-knob CLI flags (--confidence,");
-    eprintln!("    --amplitude-threshold, --disengage-threshold, --sticky-blocks) override");
-    eprintln!("    individual thresholds on top of the fresh measurement; --no-calibrate");
-    eprintln!("    skips calibration entirely and falls back to M5.3 defaults (mostly useful");
-    eprintln!("    for testing the audio path without hardware).");
+    eprintln!("    Calibration (M5.4.5 parallel + M5.4.6 always-fresh): on startup, audio output");
+    eprintln!("    is brought up immediately (silence on both decks until they're calibrated)");
+    eprintln!("    and one calibrator thread is spawned per declared deck. Each calibrator runs");
+    eprintln!("    independently against its own input ringbuffer, deriving thresholds from a");
+    eprintln!("    fresh single-phase measurement against the actual rig. As each deck's");
+    eprintln!("    carrier locks (~3.5 s after the needle drops), that deck's TimecodeInput is");
+    eprintln!("    attached to the engine via the SPSC command channel and audio plays on that");
+    eprintln!("    deck \u{2014} the other deck keeps waiting independently.");
+    eprintln!();
+    eprintln!("    This unblocks the DJ-takeover use case: the incoming DJ launches the app");
+    eprintln!("    while the previous DJ still has the turntables. Deck A's calibrator finishes");
+    eprintln!("    the moment the incoming DJ drops a needle on A, audio plays on A. Deck B's");
+    eprintln!("    calibrator sits waiting (no detect timeout) until the previous DJ leaves and");
+    eprintln!(
+        "    the incoming DJ gets to drop a record on B \u{2014} could be minutes later. When"
+    );
+    eprintln!("    that finally happens, deck B attaches mid-stream without disturbing deck A.");
+    eprintln!();
+    eprintln!("    The result is saved to ~/.dub/calibration/<device>_deck_<idx>_<format>.json");
+    eprintln!("    as a diagnostic artifact \u{2014} nothing in the runtime path reads it back");
+    eprintln!("    (M5.4.6). Per-knob CLI flags (--confidence, --amplitude-threshold,");
+    eprintln!("    --disengage-threshold, --sticky-blocks) override individual thresholds on");
+    eprintln!("    top of the fresh measurement; --no-calibrate skips calibration entirely,");
+    eprintln!("    attaches both decks immediately with M5.3 defaults (mostly useful for");
+    eprintln!("    testing the audio path without hardware).");
     eprintln!();
     eprintln!("    Output device SR is forced to engine SR so playback runs on a single clock");
-    eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. Default duration 60 s; Ctrl-C");
-    eprintln!("    to stop.");
+    eprintln!("    — no SRC. SL3 deck A: --input-channels 3,4. By default the command runs");
+    eprintln!("    until Ctrl-C (the M5.4.5 takeover use case can wait minutes for deck B);");
+    eprintln!("    pass --duration SECS for a bounded scripted/CI run.");
     eprintln!();
     eprintln!("    Output routing (M5.5.2): on startup, the CoreAudio default-output device's");
     eprintln!("    name is matched against the known-device table. SL3 routes deck A to physical");

@@ -38,28 +38,49 @@ buffers, never callbacks across thread boundaries.
 ## Crate dependency graph
 
 ```
-                      ┌────────────────┐
-                      │     dub-cli    │   (binary, smoke harness)
-                      └───────┬────────┘
-                              │
-                              ▼
-                      ┌────────────────┐
-                      │     dub-ffi    │   (UniFFI surface)
-                      └───────┬────────┘
-                              │
-                              ▼
-                      ┌────────────────┐
-                      │   dub-engine   │ ─┬─ ringbuf
-                      └───────┬────────┘  │
-              ┌───────────────┼──────────┐
-              ▼               ▼          ▼
-         dub-dsp         dub-stretch   dub-thru
-         dub-io          dub-timecode  dub-fingerprint  dub-library
-         dub-controller  (placeholders for v1+)
+              ┌────────────────┐         ┌────────────────┐
+              │     dub-cli    │         │     dub-ffi    │  (UniFFI Swift bindings;
+              │ (binary;       │         │  placeholder   │   wired up in M0.5)
+              │  smoke /       │         │  in v1 — empty │
+              │  play /        │         │  shell)        │
+              │  timecode-deck/│         └───────┬────────┘
+              │  thru / scope /│                 │
+              │  capture /     │                 ▼
+              │  levels /      │         ┌────────────────┐
+              │  calibrate /   │         │   dub-engine   │ ─── ringbuf
+              │  analyze /     │         │  (audio-thread │     coreaudio-rs (via dub-audio)
+              │  decode-       │         │   owner; the   │     assert_no_alloc
+              │  timecode)     │────────▶│   only RT-     │
+              └───────┬────────┘         │   sensitive    │
+                      │                  │   crate)       │
+                      ▼                  └───────┬────────┘
+              ┌────────────────┐                 │
+              │   dub-audio    │◀────────────────┤   (engine consumes the
+              │  CoreAudio HAL │                 │    ringbuf consumer from
+              │  input + output│                 │    AudioInput, owns the
+              └────────────────┘                 │    AudioOutput callback)
+                                                 │
+              ┌────────────────────┬─────────────┼─────────────┬────────────────┐
+              ▼                    ▼             ▼             ▼                ▼
+          dub-timecode         dub-dsp       dub-stretch   dub-io           dub-bpm
+          (Serato CV02 +      (rubato,      (Rubber Band  (symphonia       (M7.5 — pure-Rust
+           Traktor MK1/MK2,    biquads,      FFI; GPLv3   decoders, in-    FFI; LGPL
+           clean-room)         FX placeholders)            license)         RAM tracks)        boundary)
+
+          ┌─────────────────────────────────────────────────────────────────────┐
+          │ Off-RT / placeholder for v1:                                        │
+          │   dub-thru        (source-detection classifier, §5.1.1 — empty)     │
+          │   dub-fingerprint (Chromaprint FFI for v1.1)                        │
+          │   dub-library     (SQLite + import adapters for M11/M12)            │
+          │   dub-controller  (HID/MIDI abstractions for v1.x+)                 │
+          └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Only `dub-engine` is on the audio thread. Everything else is either
-preparatory work, off-thread workers, or non-RT services.
+**Two things to note that aren't obvious from the diagram:**
+
+1. **Only `dub-engine` runs on the audio thread.** Everything else is either preparatory work (decoders, format parsers, calibration), off-RT workers (M5.4.5 calibrators, M8 per-Thru-deck BPM analysis threads via `dub_bpm::BpmStream`, M5.1.1 source-detection classifier), or non-RT services (library DB, UI bindings). Crates with FFI dependencies — `dub-stretch` (GPLv3) and `dub-fingerprint` (LGPL planned) — are deliberately leaf crates so license boundaries don't leak upstream. `dub-bpm` shipped M7.5+M8 as pure-Rust so it has no FFI obligation today; if an aubio backend ever lands behind a feature flag it would stay confined to that same leaf crate.
+
+2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only and is currently an empty placeholder; wiring it up against UniFFI is part of M0.5.
 
 ## RT-safety enforcement
 
@@ -158,23 +179,49 @@ pops at the start of each render block. Producer side lives in
   blocks, 10k pre-staged transport commands, and 20 hot-loads, all
   under `assert_no_alloc`.
 
-### Trash channel (audio → UI for `Arc<Track>` disposal) — M3
+### Trash channels (audio → UI for heap-bearing disposal) — M3 + M5.4.5 + M7
 
-`ringbuf::HeapRb<Arc<Track>>` (SPSC, capacity 32). The audio thread
-NEVER drops `Arc<Track>` — `Arc::drop` decrements the strong count and
-calls `dealloc()` if it hits zero. `dealloc` is a syscall, forbidden on
-the RT thread.
+The audio thread NEVER drops anything that owns a heap allocation.
+`Arc::drop` decrements the strong count and calls `dealloc()` on
+zero; `Box::drop` runs the destructor of the inner type, which for
+the engine's heap-bearing payloads (`TimecodeInput`'s `Vec<f32>` +
+`Decoder` + `HeapCons<f32>`, `ThruSource`'s `Vec<f32>` scratch +
+`HeapCons<f32>`) calls `dealloc` on each. `dealloc` is a syscall,
+forbidden on the RT thread.
 
-When the engine applies `DeckLoad`, it `swap_source`s the new Arc onto
-the deck and pushes the old Arc into the trash channel. The main thread
-drains the channel via `EngineHandle::reclaim()` (called automatically
-inside `DeckCommand::load` and on `EngineHandle::drop`).
+Three independent SPSC trash channels carry displaced payloads back
+to the main thread for disposal:
 
-If the trash channel ever overflows (UI not draining + storm of loads),
-the audio thread `mem::forget`s the rejected Arc (leaking it) and
-increments an atomic `trash_overflow_count`. Leaking is the lesser evil
-versus a forbidden `dealloc` on the RT thread, and the counter surfaces
-the contract violation to the UI for logging.
+| Channel | Capacity | What flows through it | When |
+|---|---|---|---|
+| `HeapRb<Arc<Track>>` | 32 | Old `Arc<Track>` from `Command::DeckLoad` | M3 — track-load on a deck |
+| `HeapRb<Box<TimecodeInput>>` | 8 | Displaced `Box<TimecodeInput>` from `Command::AttachTimecodeInput` | M5.4.5 — re-attach on a deck whose slot was already filled |
+| `HeapRb<Box<ThruSource>>` | 8 | Displaced `Box<ThruSource>` from `Command::AttachThruSource` | M7 — re-attach on a Thru deck whose slot was already filled |
+
+When the engine applies `DeckLoad`, it `swap_source`s the new Arc
+onto the deck and pushes the old Arc into the track trash channel.
+When the engine applies `AttachTimecodeInput` or
+`AttachThruSource`, it `slot.replace(*payload)` and pushes any
+displaced predecessor into the corresponding trash channel. The
+main thread drains all three channels via a single
+`EngineHandle::reclaim()` (called automatically inside
+`DeckCommand::load`, `EngineHandle::attach_timecode_input`,
+`EngineHandle::attach_thru_source`, and on `EngineHandle::drop`).
+
+If any channel ever overflows (UI not draining + storm of
+operations), the audio thread `mem::forget`s the rejected payload
+(leaking it) and increments the corresponding atomic overflow
+counter (`trash_overflow_count` for tracks,
+`timecode_trash_overflow_count` for timecode inputs,
+`thru_trash_overflow_count` for Thru sources). Leaking is the
+lesser evil versus a forbidden `dealloc` on the RT thread, and the
+counter surfaces the contract violation to the UI for logging.
+
+The timecode-input and thru-source channels are sized smaller (8
+vs. 32) because re-attach is at most "one cartridge or input swap
+per deck per song" during a tight set — well below half this —
+whereas track-load can burst more readily during quick-cue UI
+flows.
 
 ### De-click envelope on transport changes — M3.5
 
@@ -617,6 +664,16 @@ written by either is indistinguishable. The data model + math live
 in `crates/dub-cli/src/calibration.rs` (pure, fully unit-tested);
 the interactive driver lives in `calibrate.rs`.
 
+**M5.4.5 worker-thread split.** `measure_inline`,
+`wait_for_stable_carrier`, `wait_for_lift`, and `capture_phase`
+were refactored from `(&mut AudioInput, pair_idx, …)` to
+`(&mut HeapCons<f32>, &MeasurementInputs, …)` so each calibrator
+can run on its own thread (owning its consumer ring) without
+holding an exclusive borrow on the AudioInput. `MeasurementInputs`
+bundles the device name + sample rate + deck index + format that
+the old signature pulled off `AudioInput`; the caller fills it
+once on the main thread and hands it to the worker by value.
+
 **Status as of M5.4.6:** the JSON file is a *diagnostic artifact*
 only. `dub timecode-deck` always runs a fresh calibration on
 startup and writes a new file (overwriting any previous one); the
@@ -717,21 +774,91 @@ in clubs vs. lab, which would false-flag every venue change as
 dominant over ambient noise on the wire — so it tracks the rig
 identity, not the room.
 
-**Startup flow on `dub timecode-deck` (always-fresh, M5.4.6).**
+**Startup flow on `dub timecode-deck` (parallel calibration + always-fresh, M5.4.5 + M5.4.6).**
 
-1. Open input device.
-2. If `--no-calibrate`: use M5.3 defaults + per-knob overrides.
-   Done.
-3. Else: run a fresh single-phase calibration against the rig
-   currently in front of the user (≈ 3.5 s wall time per deck).
-4. Save the result to
-   `~/.dub/calibration/<device>_deck_<idx>_<format>.json` as a
-   diagnostic artifact. Save failure is non-fatal (warned, then
-   ignored — the thresholds we need are already in memory).
-5. Apply per-knob CLI overrides on top so partial overrides
-   ("auto-everything except force amplitude=0.05") still work.
+```text
+main thread:
+  1. Open input device, load tracks.
+  2. take_consumer_pair(0) → consumer_a; take_consumer_pair(1) → consumer_b (if two-deck).
+  3. Engine::new_with_handle → (engine, handle).
+     decks default to paused, no TimecodeInput attached on either.
+  4. AudioOutput::start_with_options(engine, …)  ← engine moves to audio thread.
+     output is producing audio NOW — silence on both decks until they're attached.
+  5. spawn worker_a:                  spawn worker_b (if two-deck):
+       run_full_calibration              run_full_calibration
+       (reads consumer_a)                (reads consumer_b)
+       send (0, Ok(consumer_a, cal))     send (1, Ok(consumer_b, cal))
+       via mpsc                          via mpsc
+  6. main loop (50 ms tick):
+       rx.try_recv → for each completed worker:
+         apply CLI overrides on top of cal.thresholds
+         handle.attach_timecode_input(idx, consumer, cfg)
+           → audio for that deck goes live mid-stream
+       handle.reclaim()  ← drain trash from any displaced TimecodeInputs
+       print stats every 500 ms
+       sleep 50 ms
+       …until duration_secs elapses or Ctrl-C.
+```
 
-That's the whole flow. The pre-M5.4.6 design layered on top of
+Two key shifts vs. pre-M5.4.5:
+
+- **Audio output starts before calibration.** The pre-M5.4.5 flow
+  ran calibration first then started the output device with both
+  decks pre-attached; the audio output appearing "alive" was the
+  user's signal that everything was up. Now the output appears
+  alive *immediately* (silence on both decks) and decks attach
+  one at a time as they finish calibrating.
+- **Calibrators are parallel worker threads owning their own
+  ringbuffer consumers.** Each worker takes an owned
+  `HeapCons<f32>` + a `MeasurementInputs` bundle by value;
+  `measure_inline` and its helpers were refactored to take
+  `&mut HeapCons<f32>` instead of `&mut AudioInput + pair_idx`
+  precisely so the AudioInput's exclusive borrow doesn't force
+  sequential calibration.
+
+**Mid-stream attach via the SPSC command channel (M5.4.5).** Once
+the engine has been moved into `AudioOutput::start_with_options`,
+no `&mut Engine` access is possible from the main thread. Mid-
+stream attach goes through a new `Command` variant:
+
+```text
+EngineHandle::attach_timecode_input(idx, rx, cfg)
+  → main thread: TimecodeInput::new(rx, cfg)   ← allocates, off-RT
+  → main thread: Box::new(timecode_input)      ← 8-byte pointer
+  → push Command::AttachTimecodeInput { idx, input: Box<…> }
+       through the existing 256-deep SPSC command channel
+  → audio thread (Engine::apply_command):
+       slot = engine.timecode_inputs.get_mut(idx)
+       displaced = slot.replace(*input)  ← move out of the Box
+       if Some(old) = displaced:
+           send Box::new(old) to second trash channel
+            (NEVER drop on the audio thread)
+```
+
+Single-deck mode is the same flow with worker_b skipped and
+`handle.attach_timecode_input(1, …)` never called — deck 1 stays
+paused and silent forever.
+
+**Why no hot-keys for the takeover use case.** Worker_b's
+`wait_for_stable_carrier` is called with
+`MeasureOptions::detect_timeout_secs = None`: the worker sits
+indefinitely waiting for deck B's carrier to appear. During a
+takeover, the incoming DJ's app is running with worker_b still
+waiting; whenever the previous DJ finally vacates and a record
+drops on deck B, worker_b wakes up, completes, attaches mid-
+stream. Deck A audio (already attached) is undisturbed. **Hot-
+key-driven mid-stream re-attach** (e.g., DJ launches single-deck
+and later decides to add deck B, or DJ swaps cartridges mid-set)
+is a follow-up — the engine surface is ready (replace-and-trash
+on `AttachTimecodeInput`), but the CLI plumbing for crossterm
+hot-keys + dynamic `AudioInput` reconfiguration is its own work.
+
+**No-calibrate path (`--no-calibrate`).** Skips the worker
+threads entirely; main calls `handle.attach_timecode_input` for
+each deck immediately with M5.3-default thresholds + CLI
+overrides. Useful for testing the audio path without hardware,
+and for first-time users who want to hear the deck immediately
+even without a calibrated rig. The pre-M5.4.6 design layered on top of
 this a *load-the-saved-JSON-and-fingerprint-probe-on-startup* path
 to skip recalibration on repeat sessions. M5.4.3 cut fresh
 calibration to ~3.5 s, at which point the probe (~1.7 s) was only
@@ -769,6 +896,241 @@ directly. The matching code (`RigFingerprint::matches /
 max_relative_delta / within_relative / relative_delta`,
 `DEFAULT_FINGERPRINT_TOLERANCE`) is gone — nothing compares
 fingerprints at runtime any more.
+
+### Thru Mode — M7
+
+Thru Mode lets a deck source audio from the audio interface input
+(a real, non-timecode record on the platter) instead of a loaded
+file. `Engine::render_routed` dispatches per-deck: if a Thru source
+is attached, it owns that deck's output channels for the block and
+the deck's own transport (loaded track, position, rate) is *not*
+advanced — a real record has no track to walk a playhead through.
+When no Thru source is attached the M0–M6 Track render path runs
+unchanged, byte-identical to pre-M7.
+
+**One mode, always on.** `ThruSource` is a dumb passthrough: read
+input ringbuf → add gain-scaled samples into the deck's routed
+output channels → done. No state machine, no FX-engaged refcount,
+no Direct/Processed split. The signal is always in software
+because that is the entire point of Thru Mode in Dub: BPM
+detection (M8), waveform capture (M9), and FX (M15+) all live in
+the software path. Hardware-bypass Thru (the interface's physical
+button) is intentionally outside Dub's scope — see PRD §5.2.2 for
+the design rationale.
+
+**Parallel array layout.** Mirrors the M5.3 `timecode_inputs` shape:
+
+```text
+Engine {
+    decks:           [Deck; 2],
+    timecode_inputs: [Option<TimecodeInput>; 2],   // M5.3
+    thru_sources:    [Option<ThruSource>;    2],   // M7
+    ...
+}
+```
+
+`render_routed` walks `0..DECK_COUNT` and, for each routed deck,
+picks the right source:
+
+```text
+if let Some(thru) = self.thru_sources[idx].as_mut() {
+    let gain = self.decks[idx].gain();
+    thru.render_into(out, gain, num_channels, first_us);
+} else {
+    self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
+}
+```
+
+The deck's `gain` is still respected on a Thru deck — only the
+*source* of the audio is swapped, not the per-deck mixer fader.
+Master gain applies once across the whole bus after the deck loop,
+same as before.
+
+**`ThruSource` internals.**
+
+```text
+struct ThruSource {
+    rx: HeapCons<f32>,    // SPSC consumer; producer is the CoreAudio IOProc
+    scratch: Vec<f32>,    // pre-allocated max_block_frames * 2 interleaved
+}
+```
+
+`render_into(out, gain, stride, offset)`:
+
+1. `rx.pop_slice(&mut scratch[..frames * 2])` — load + memcpy, no alloc.
+2. Zero the tail of `scratch` past whatever was popped, so underrun
+   renders as silence-additive (no panic, no audible artifact past
+   the dry input continuing).
+3. Loop: `out[offset + i * stride] += scratch[2 * i] * gain` and the
+   `+1 / +1` companions.
+
+All steps alloc-free under `assert_no_alloc`. Underrun (empty
+ring) adds 0.0 to the output and is therefore transparent to
+upstream content — important because the IOProc takes a few
+hundred microseconds to start producing data after `AudioInput::
+start`.
+
+**FX engagement (forward-looking — M15+).** FX modules will live
+*inside* the per-deck signal chain on top of Thru's passthrough
+output. Each FX owns its own engage/disengage semantics with a
+per-module declick on the FX's *wet* output. The *dry* path
+through `ThruSource` is never paused, never crossfaded, never re-
+timed on FX engagement — so the input-to-output latency stays
+constant across the whole set, which is what makes scratch muscle
+memory transferable from a session's first scratch to its last.
+
+This is the Option A in-chain bypass model. The alternative
+("Option B": switch between an FX-loaded chain and an FX-free
+chain on engage) was prototyped in M7's first ship (the
+`ThruMode { Direct, Processed, ProcessingHold }` state machine,
+the 5 ms equal-power Direct↔Processed crossfade, the
+`Command::SetDeckThruFxEngaged` refcount-driven auto-switch) and
+removed in the same milestone for two reasons:
+
+1. *Hardware-Thru incompatibility.* `Direct` mode was supposed to
+   render silence in software and rely on the interface's hardware
+   monitoring for audible passthrough. CoreAudio doesn't drive the
+   hw-monitor switch on SL3-class devices under plain HAL access,
+   so `Direct` was silent in practice. A follow-up PR could have
+   added vendor-specific hw-monitor control to fix that — but
+   that path takes BPM/waveform/FX off the table for the deck,
+   defeating Thru's purpose.
+2. *Latency-jitter on FX engage.* Any path-swap model introduces
+   a latency delta between the two paths (FX modules with
+   look-ahead, slightly different DSP chains, etc.). Toggling FX
+   would shift the input-to-output delay by sub-millisecond
+   amounts, which scratch DJs *can* feel and which would break
+   muscle-memory calibration. Constant-latency Option A defends
+   the M3.5 / M6 / M7 latency work end-to-end.
+
+The simplified `ThruSource` keeps the engine RT-safe, makes Thru
+testable as a pure data type with eight tight unit tests, and
+matches the user-facing model in PRD §5.2.1.
+
+**Trash channel.** Mid-stream re-attach (operator switches input
+pairs or swaps cartridges on a Thru deck mid-set) replaces the
+existing `ThruSource` in the slot; the displaced predecessor is
+shipped through the `HeapRb<Box<ThruSource>>` trash channel for
+main-thread disposal — mirroring M5.4.5's `Box<TimecodeInput>`
+pattern. See "Trash channels" above for the full picture.
+
+**Off-RT construction.** The `ThruSource` is constructed on the
+main thread, boxed, and pushed through the command channel as a
+single 8-byte pointer; the audio thread does `*Box<ThruSource>`
+and a `slot.replace`, both alloc-free. No `DeclickEnvelope`
+plumbing in or out of `ThruSource` — the simplified design has
+no audibility crossfade to drive (constant audibility means no
+transition to declick).
+
+### BPM engine — M7.5 (offline DSP core) + M8 (streaming driver on Thru) — both shipped
+
+The BPM stack is built in two layers, both shipped. **M7.5** shipped
+the DSP core as the `dub-bpm` crate (offline `analyze_bpm` +
+streaming-agnostic `BpmEstimator`, plus `Track::bpm` field on
+`dub-io::Track`). **M8** wrapped that core in a streaming driver
+plumbed into Thru-attached decks via a per-deck audio-thread tee +
+per-deck off-RT analysis thread + confidence state machine. Both
+halves share the same `BpmEstimator` so the offline answer remains
+the oracle for the streaming convergence test
+(`crates/dub-bpm/tests/known_bpm.rs::streaming_estimator_converges_to_offline_result`,
+plus the end-to-end `crates/dub-bpm/src/stream.rs::click_track_streams_to_lock`).
+
+```text
+                          ┌──────────────────────────┐
+                          │      dub-bpm crate       │
+                          │  (M7.5 + M8, leaf,       │
+                          │   pure Rust)             │
+                          │                          │
+                          │   BpmEstimator           │
+                          │     feed(block)          │
+                          │     recompute()          │
+                          │     current()            │
+                          │                          │
+                          │   ConfidenceTracker      │
+                          │   (searching/tentative/  │
+                          │    locked hysteresis)    │
+                          │                          │
+                          │   BpmTracker             │
+                          │   (estimator + state     │
+                          │    machine + throttle)   │
+                          │                          │
+                          │   BpmStream              │
+                          │   (analysis thread +     │
+                          │    events ringbuf)      │
+                          │                          │
+                          │   analyze_bpm(...)       │
+                          │   (offline whole-buffer  │
+                          │    driver)               │
+                          └─────────┬────────────────┘
+                                    │
+                  ┌─────────────────┼────────────────────┐
+                  │                                      │
+                  ▼ (M7.5 — file path)                   ▼ (M8 — live Thru path)
+        ┌──────────────────┐                  ┌─────────────────────────────────┐
+        │  let est =       │                  │  ThruSource::with_bpm_tee:      │
+        │   analyze_bpm(   │                  │   audio thread mono-downmixes   │
+        │     track.samples│                  │   each block & push_slice's it  │
+        │     , track.sr,  │                  │   into the tee SPSC ringbuf     │
+        │     track.chans);│                  │   (alloc-free, drop-on-full).   │
+        │  let track =     │                  │                                 │
+        │   track.with_bpm │                  │  BpmStream's analysis thread    │
+        │   (Some(est.bpm));│                 │   reads the tee ring off-RT,    │
+        │                  │                  │   feeds BpmTracker, emits       │
+        │  Runs at load    │                  │   StateChanged events to a      │
+        │  time, off-RT.   │                  │   second SPSC ring the UI polls.│
+        │  Used by §8.3    │                  │                                 │
+        │  beatgrid auto-  │                  │  Audio thread NEVER runs        │
+        │  detect fallback │                  │  the estimator. ThruSource      │
+        │  + display path. │                  │  stays a pure passthrough.      │
+        └──────────────────┘                  └─────────────────────────────────┘
+```
+
+**Algorithm (M7.5 baseline, used by both paths).** Pure-Rust
+spectral-flux onset detection function (Hann-windowed FFT magnitude
+differences at `FRAME_SIZE = 1024` / `HOP_SIZE = 512`) → 3-tap-
+smoothed autocorrelation → harmonic-summed peak search at
+fractional lag resolution (step 0.25) → confidence = peak /
+acf-at-zero, refused below 0.05. See
+[`docs/SHIPPED.md#m75`](SHIPPED.md#m75) for the algorithm
+walkthrough, the four-pass bug-find history, and why aubio was
+dropped from the M7.5 critical path (3-years-stale FFI + LGPL
+dynamic-link friction for an architectural milestone).
+
+**Why the streaming side doesn't touch the audio thread for
+analysis.** The autocorrelation search is O(odf_len × max_lag) and
+grows quadratically with track length — too expensive to run inside
+the per-block budget alongside the existing decoder + resampler +
+declick + render load. M8 splits `BpmEstimator::process` into
+`feed` (cheap, runs every block) + `recompute` (expensive, runs on
+demand) so the `BpmTracker` can drive the search at a throttled
+~1 Hz cadence on the off-RT analysis thread while the audio thread
+just does an alloc-free mono-downmix + `push_slice` into the tee
+ringbuf. The audio-thread cost is ≈ 3 floating-point ops per stereo
+frame plus one SPSC write per block — well within budget and
+verified alloc-free under `assert_no_alloc`.
+
+**Why the tee, not the existing input ring.** The Thru source's
+ring is consumed by the audio thread to produce output; reading
+the same consumer end from the BPM analyzer would race the engine.
+M8 takes the audio-thread-duplicates approach: after `pop_slice`
+fills the per-block scratch buffer (for the output path), the
+audio thread mono-downmixes that scratch into a second pre-allocated
+buffer and `push_slice`s it into the BPM tee ring. The alternative
+(IOProc demuxer pushes into both rings on the producer side) would
+have coupled the demuxer to BPM, which is the wrong direction of
+dependency.
+
+**Confidence state machine** lives in `dub_bpm::ConfidenceTracker`,
+not in `BpmEstimator`. The estimator emits raw `BpmEstimate { bpm,
+confidence }`; the tracker applies hysteresis (`LOCK_CONSECUTIVE`
+agreeing updates inside `LOCK_TOLERANCE_BPM` to transition
+`tentative → locked`, asymmetric loss thresholds so brief silence
+doesn't break lock) to give PRD §5.2.3's UI states a clean,
+well-defined behaviour. Same separation we already have between
+`dub-timecode::Decoder` (pure DSP) and `dub_engine::LiftPolicy`
+(state machine on top). Tuning constants live in
+`crates/dub-bpm/src/confidence.rs` and are re-exported at the
+crate root for future per-genre profiles to bind to.
 
 ### Two decks + debug internal mixer — M4
 
@@ -1138,6 +1500,6 @@ covers everything we need through M4.
 
 ## See also
 
-- `docs/PRD.md` — product spec (source of truth)
-- `docs/LIBRARY-FORMATS.md` — Serato / Traktor / rekordbox / iTunes / Lexicon
-- `docs/adr/` — architecture decision records (not yet populated)
+- [`docs/PRD.md`](PRD.md) — product spec (source of truth)
+- [`docs/SHIPPED.md`](SHIPPED.md) — full design history of M0 → M7 (per-milestone rationale, what was deliberately removed, etc.)
+- [`docs/LIBRARY-FORMATS.md`](LIBRARY-FORMATS.md) — Serato / Traktor / rekordbox / iTunes / Lexicon parsing notes

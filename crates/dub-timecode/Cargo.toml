@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Serato CV02 + Traktor MK2 timecode decoder. xwax-derived."
+description = "Serato CV02 + Traktor MK1/MK2 timecode decoder. Clean-room implementation from the xwax algorithm description; no xwax code copied. Relative mode only in v1."
 
 [dependencies]
 

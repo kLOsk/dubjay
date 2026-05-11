@@ -50,12 +50,28 @@ impl From<SymphoniaError> for LoadError {
 ///
 /// Tracks are immutable after construction; the engine accesses them via
 /// `Arc<Track>` so multiple decks can hold the same track without copies.
+///
+/// ## Metadata
+///
+/// Tempo lives here as an optional field, filled in by callers that have
+/// run BPM analysis. `dub-io` deliberately does *not* depend on
+/// `dub-bpm` — that would force every audio-loading site to pay the
+/// analysis cost up-front. Instead, a typical pipeline is:
+///
+/// ```ignore
+/// let track = Track::load_from_path(p)?;
+/// let est = dub_bpm::analyze_bpm(track.samples(), track.sample_rate(), track.channels())?;
+/// let track = track.with_bpm(Some(est.bpm));
+/// ```
+///
+/// See PRD §5.3 (M7.5 / library import).
 #[derive(Debug, Clone)]
 pub struct Track {
     samples: Arc<[f32]>,
     sample_rate: u32,
     channels: u8,
     frames: usize,
+    bpm: Option<f64>,
 }
 
 impl Track {
@@ -78,6 +94,7 @@ impl Track {
             sample_rate,
             channels,
             frames,
+            bpm: None,
         })
     }
 
@@ -197,7 +214,26 @@ impl Track {
             sample_rate,
             channels,
             frames,
+            bpm: None,
         })
+    }
+
+    /// Return a copy of this track with its BPM annotation updated.
+    ///
+    /// Cloning is cheap — the underlying `Arc<[f32]>` sample buffer is
+    /// shared. This is a builder-style helper because `Track` is
+    /// otherwise immutable after construction, which keeps the engine
+    /// thread free of mutation hazards.
+    #[must_use]
+    pub fn with_bpm(self, bpm: Option<f64>) -> Self {
+        Self { bpm, ..self }
+    }
+
+    /// Tempo annotation, or `None` if BPM analysis has not been run on
+    /// this track yet.
+    #[must_use]
+    pub fn bpm(&self) -> Option<f64> {
+        self.bpm
     }
 
     /// Number of audio frames (one frame = one sample per channel).
@@ -311,6 +347,25 @@ mod tests {
             assert_eq!(track.frame(0), [0.7, 0.7]);
             assert_eq!(track.frame(1), [-0.3, -0.3]);
         }
+    }
+
+    #[test]
+    fn bpm_defaults_to_none() {
+        let track = Track::from_interleaved(vec![0.1, 0.2], 48_000, 2).unwrap();
+        assert!(track.bpm().is_none());
+    }
+
+    #[test]
+    fn with_bpm_attaches_and_overrides() {
+        let track = Track::from_interleaved(vec![0.1, 0.2], 48_000, 2).unwrap();
+        let with = track.clone().with_bpm(Some(128.0));
+        assert_eq!(with.bpm(), Some(128.0));
+        // Original is unchanged (builder-style).
+        assert!(track.bpm().is_none());
+
+        // Override clears.
+        let cleared = with.with_bpm(None);
+        assert!(cleared.bpm().is_none());
     }
 
     proptest! {

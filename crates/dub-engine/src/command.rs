@@ -5,31 +5,61 @@
 //! (main thread); the consumer side is drained by [`crate::Engine::render`]
 //! at the start of each block.
 //!
-//! Per PRD §4.2: lock-free SPSC, no allocation on send/receive, no `Box`,
-//! no `dyn Trait`. Adding a new command means adding an enum variant and
-//! its match arm in [`crate::Engine::apply_command`] — that's all.
+//! Per PRD §4.2: lock-free SPSC, no allocation on send/receive. Adding a
+//! new command means adding an enum variant and its match arm in
+//! [`crate::Engine::apply_command`] — that's all.
 //!
-//! Most commands are tiny `Copy` values (≤ 24 bytes). The exception is
-//! [`Command::DeckLoad`], which carries an `Arc<Track>`. The audio thread
-//! never drops this Arc — when it swaps it onto the deck, the *old* Arc
-//! is bounced back through the trash channel for disposal on the main
-//! thread (see crate-level docs in `lib.rs`).
+//! **Heap-bearing variants.** Most commands are tiny `Copy` values
+//! (≤ 24 bytes). Three variants carry heap pointers because the work
+//! being commanded is fundamentally about handing a heap-allocated
+//! resource to the audio thread:
+//!
+//! - [`Command::DeckLoad`] carries an `Arc<Track>` (PCM samples + metadata).
+//! - [`Command::AttachTimecodeInput`] carries a `Box<TimecodeInput>` (M5.4.5;
+//!   the box owns the SPSC consumer end of the input ringbuffer plus the
+//!   pre-allocated decoder + lift policy).
+//! - [`Command::AttachThruSource`] carries a `Box<ThruSource>` (M7;
+//!   the box owns the SPSC consumer end of the input ringbuffer plus
+//!   the scratch buffer for the Thru render path).
+//!
+//! The audio thread *never* drops these allocations — when it swaps
+//! any onto its slot, any displaced predecessor is bounced back
+//! through a corresponding trash channel for disposal on the main thread
+//! (see crate-level docs in `lib.rs`). Track trash, TimecodeInput trash,
+//! and ThruSource trash are separate ringbufs because their item types
+//! differ; all three follow the same overflow-counter "leak rather than
+//! drop" pattern.
 
 use std::sync::Arc;
 
 use dub_io::Track;
+
+use crate::thru::ThruSource;
+use crate::timecode::TimecodeInput;
 
 /// One mutation request to the engine. Variants name the deck index where
 /// applicable; engine-wide commands use no index.
 ///
 /// Field naming is uniform across variants: `idx` is the deck index,
 /// other fields name the property being set.
+///
+/// **Not [`Clone`].** Two variants ([`Self::DeckLoad`],
+/// [`Self::AttachTimecodeInput`]) carry uniquely-owned heap resources
+/// (`Arc<Track>` and `Box<TimecodeInput>`). Cloning a command would
+/// bump the `Arc` refcount silently or fail outright on the `Box`, so
+/// we don't derive [`Clone`]; consumers move commands through the
+/// SPSC channel as the only path.
+///
+/// [`Debug`] is hand-written (rather than derived) for the same
+/// reason: [`TimecodeInput`] is not [`Debug`] (it owns a decoder + a
+/// scratch buffer with no useful Debug rendering); we render a
+/// placeholder so the `unreachable!` and trace formatting in
+/// [`crate::EngineHandle`] stay usable.
 //
 // `Deck` prefix on per-deck variants is load-bearing namespacing
 // (engine-wide commands such as `SetMasterGain` distinguish themselves
 // by *not* having it). Allow the `enum_variant_names` lint accordingly.
 #[allow(missing_docs, clippy::enum_variant_names)]
-#[derive(Debug, Clone)]
 pub enum Command {
     /// Start playback on deck `idx`.
     DeckPlay { idx: u8 },
@@ -59,6 +89,98 @@ pub enum Command {
     /// in the debug/internal mixer mode; external-mixer mode (M5+) bypasses
     /// the master and routes each deck to its own output pair raw.
     SetMasterGain { gain: f32 },
+
+    /// Mid-stream attach of a [`TimecodeInput`] to deck `idx` (M5.4.5).
+    /// The box is constructed on the main thread — `TimecodeInput::new`
+    /// allocates a scratch buffer and a decoder — and handed across the
+    /// command channel as a single 8-byte pointer.
+    ///
+    /// On the audio thread, [`crate::Engine::apply_command`] takes the
+    /// box out of the variant and slots it into
+    /// `engine.timecode_inputs[idx]`. If the slot was already occupied
+    /// (mid-stream re-calibration after a cartridge swap, M5.4.5+
+    /// extension), the *displaced* `Box<TimecodeInput>` is sent back
+    /// through the timecode-input trash channel for main-thread
+    /// disposal — never dropped on the audio thread.
+    ///
+    /// Why command-channel attach (vs. the existing `&mut Engine`
+    /// [`crate::Engine::attach_timecode_input`]): once the engine has
+    /// been moved into `dub_audio::AudioOutput`, no `&mut` access from
+    /// the main thread is possible. M5.4.5 needs to attach decks
+    /// *while audio is running* (the DJ-takeover use case), so the
+    /// attach must route through the SPSC channel like every other
+    /// runtime mutation.
+    AttachTimecodeInput { idx: u8, input: Box<TimecodeInput> },
+
+    /// Mid-stream attach of a [`ThruSource`] to deck `idx` (M7). The
+    /// box is constructed on the main thread —
+    /// [`crate::ThruSource::new`] allocates a scratch buffer — and
+    /// handed across the command channel as a single 8-byte pointer.
+    ///
+    /// On the audio thread, [`crate::Engine::apply_command`] takes the
+    /// box out of the variant and slots it into
+    /// `engine.thru_sources[idx]`. If the slot was already occupied
+    /// (the operator re-attaches mid-set, e.g. swaps cartridges or
+    /// switches inputs), the *displaced* `Box<ThruSource>` is sent
+    /// back through the thru-source trash channel for main-thread
+    /// disposal — never dropped on the audio thread.
+    ///
+    /// Mirrors [`Self::AttachTimecodeInput`]'s shape exactly because
+    /// the constraint (heap-bearing payload that the audio thread
+    /// can't drop) is the same; M5.4.5's trash-channel pattern
+    /// generalises trivially to a third channel.
+    ///
+    /// Thru Mode in Dub is a single always-on passthrough — there
+    /// are no mode commands. FX engagement is handled inside the
+    /// per-deck signal chain by individual FX modules (M15+), not
+    /// by switching the Thru source between paths. See
+    /// `crate::thru` module docs for the design rationale.
+    AttachThruSource { idx: u8, source: Box<ThruSource> },
+}
+
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeckPlay { idx } => f.debug_struct("DeckPlay").field("idx", idx).finish(),
+            Self::DeckPause { idx } => f.debug_struct("DeckPause").field("idx", idx).finish(),
+            Self::DeckSeek {
+                idx,
+                position_frames,
+            } => f
+                .debug_struct("DeckSeek")
+                .field("idx", idx)
+                .field("position_frames", position_frames)
+                .finish(),
+            Self::DeckSetRate { idx, rate } => f
+                .debug_struct("DeckSetRate")
+                .field("idx", idx)
+                .field("rate", rate)
+                .finish(),
+            Self::DeckSetGain { idx, gain } => f
+                .debug_struct("DeckSetGain")
+                .field("idx", idx)
+                .field("gain", gain)
+                .finish(),
+            Self::DeckLoad { idx, .. } => f
+                .debug_struct("DeckLoad")
+                .field("idx", idx)
+                .field("source", &"<Arc<Track>>")
+                .finish(),
+            Self::SetMasterGain { gain } => {
+                f.debug_struct("SetMasterGain").field("gain", gain).finish()
+            }
+            Self::AttachTimecodeInput { idx, .. } => f
+                .debug_struct("AttachTimecodeInput")
+                .field("idx", idx)
+                .field("input", &"<Box<TimecodeInput>>")
+                .finish(),
+            Self::AttachThruSource { idx, .. } => f
+                .debug_struct("AttachThruSource")
+                .field("idx", idx)
+                .field("source", &"<Box<ThruSource>>")
+                .finish(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -66,17 +188,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_is_send_sync_and_bounded() {
-        // The non-DeckLoad commands are still Copy-equivalent in size,
-        // but we now carry an Arc<Track> in DeckLoad so the enum itself
-        // is not Copy. Send+Sync still required for cross-thread use.
+    fn command_is_send_and_bounded() {
+        // The non-Copy variants (DeckLoad's Arc<Track>, M5.4.5's
+        // AttachTimecodeInput's Box<TimecodeInput>) make the enum
+        // non-Copy, but each only adds an 8-byte pointer to the
+        // payload.
+        //
+        // We require `Send` only — the SPSC channel moves a command
+        // from the producer thread to the consumer thread by value,
+        // never sharing &Command across threads. We dropped the
+        // `Sync` bound when M5.4.5 added `Box<TimecodeInput>`: the
+        // inner `HeapCons<f32>` is intentionally `!Sync` (an SPSC
+        // consumer is unsound to access from two threads at once),
+        // and `Sync` was never actually needed by the channel
+        // contract.
         const _: fn() = || {
-            fn assert_send_sync<T: Send + Sync>() {}
-            assert_send_sync::<Command>();
+            fn assert_send<T: Send>() {}
+            assert_send::<Command>();
         };
         // 32 bytes upper bound today (DeckLoad: 1 tag + 1 idx + 8-byte
-        // pad + 8-byte Arc pointer = 24, padded). Cap at 64 to catch
-        // accidental bloat — push variants above this through indirection.
+        // pad + 8-byte Arc pointer = 24, padded). AttachTimecodeInput
+        // is the same shape (1 tag + 1 idx + 6-byte pad + 8-byte Box).
+        // Cap at 64 to catch accidental bloat — push variants above
+        // this through indirection.
         assert!(
             std::mem::size_of::<Command>() <= 64,
             "Command grew to {} bytes; consider redesigning",

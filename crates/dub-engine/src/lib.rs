@@ -29,12 +29,17 @@ mod deck;
 pub mod declick;
 mod handle;
 pub mod realtime;
+pub mod thru;
 pub mod timecode;
 
 pub use command::Command;
 pub use deck::Deck;
-pub use handle::{CommandError, DeckCommand, DeckSnapshot, EngineHandle};
+pub use handle::{
+    CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
+    BPM_TEE_RING_CAPACITY_SECS,
+};
 pub use realtime::{RealtimeContext, RtError};
+pub use thru::{ThruAttachError, ThruInputConfig, ThruSource};
 pub use timecode::{
     AttachError as TimecodeAttachError, LiftIntent, LiftPolicy, TimecodeInput, TimecodeInputConfig,
     DEFAULT_AMPLITUDE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD, DEFAULT_DISENGAGE_THRESHOLD,
@@ -103,12 +108,47 @@ pub struct Engine {
     /// when an old `Arc<Track>` needed to go back. Surfaced to the UI
     /// via [`EngineHandle::trash_overflow_count`].
     trash_overflow: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Producer end of the M5.4.5 timecode-input trash channel. `None`
+    /// for offline/test engines (built via [`Self::new`]). Used when
+    /// `Command::AttachTimecodeInput` lands on a slot that was already
+    /// filled — the displaced [`TimecodeInput`] is sent here for
+    /// disposal on the main thread.
+    trash_tx_timecode: Option<ringbuf::HeapProd<Box<TimecodeInput>>>,
+    /// Atomic counter incremented every time the timecode-input trash
+    /// channel was full when an old [`TimecodeInput`] needed to go
+    /// back. Surfaced to the UI via
+    /// [`EngineHandle::timecode_trash_overflow_count`].
+    trash_overflow_timecode: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Producer end of the M7 thru-source trash channel. `None` for
+    /// offline/test engines. Used when `Command::AttachThruSource`
+    /// lands on a slot that was already filled — the displaced
+    /// [`ThruSource`] is sent here for main-thread disposal.
+    trash_tx_thru: Option<ringbuf::HeapProd<Box<ThruSource>>>,
+    /// Atomic counter incremented every time the thru-source trash
+    /// channel was full when an old [`ThruSource`] needed to go back.
+    /// Surfaced to the UI via [`EngineHandle::thru_trash_overflow_count`].
+    trash_overflow_thru: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Per-deck timecode input. `None` means the deck runs free under
     /// normal command/handle control; `Some` means the deck's transport
     /// is driven by the decoded carrier each block (M5.3). One slot per
     /// deck so M5+ external-mixer routing can mix-and-match (deck A on
     /// timecode, deck B on file playback, or vice versa).
     timecode_inputs: [Option<TimecodeInput>; DECK_COUNT],
+    /// Per-deck Thru source (M7). When `Some`, the deck's own
+    /// transport+source state is bypassed entirely and the Thru source
+    /// owns the deck's output channels for this block — engine reads
+    /// from the input ringbuf and writes additively into the routed
+    /// output channels at the deck's gain. When `None`, the deck
+    /// renders normally (file playback or timecode-driven; the M0-M6
+    /// path).
+    ///
+    /// Thru and Track are mutually exclusive per deck within one
+    /// engine lifetime: a real record on the platter is the source,
+    /// not a loaded file underneath. FX engagement (M15+) does not
+    /// flip this slot — FX modules will live inside the per-deck
+    /// signal chain and own their own bypass semantics. See
+    /// `crate::thru` module docs.
+    thru_sources: [Option<ThruSource>; DECK_COUNT],
 }
 
 impl Engine {
@@ -120,15 +160,22 @@ impl Engine {
     #[must_use]
     pub fn new(sample_rate: f32, block_size: usize) -> Self {
         let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
+        let decks = std::array::from_fn(|_| Deck::new(envelope.clone()));
+        drop(envelope);
         Self {
             sample_rate,
             block_size,
-            decks: std::array::from_fn(|_| Deck::new(envelope.clone())),
+            decks,
             master_gain: 1.0,
             cmd_rx: None,
             trash_tx: None,
             trash_overflow: None,
+            trash_tx_timecode: None,
+            trash_overflow_timecode: None,
+            trash_tx_thru: None,
+            trash_overflow_thru: None,
             timecode_inputs: std::array::from_fn(|_| None),
+            thru_sources: std::array::from_fn(|_| None),
         }
     }
 
@@ -143,9 +190,10 @@ impl Engine {
     pub fn new_with_handle(sample_rate: f32, block_size: usize) -> (Self, EngineHandle) {
         let envelope = declick::DeclickEnvelope::new(sample_rate, declick::DEFAULT_DECLICK_MS);
         let decks: [Deck; DECK_COUNT] = std::array::from_fn(|_| Deck::new(envelope.clone()));
+        drop(envelope);
         let shared: [std::sync::Arc<deck::DeckSharedState>; DECK_COUNT] =
             std::array::from_fn(|i| decks[i].shared());
-        let (handle, side) = EngineHandle::new(shared);
+        let (handle, side) = EngineHandle::new(shared, sample_rate);
         let engine = Self {
             sample_rate,
             block_size,
@@ -154,7 +202,12 @@ impl Engine {
             cmd_rx: Some(side.cmd_rx),
             trash_tx: Some(side.trash_tx),
             trash_overflow: Some(side.overflow_counter),
+            trash_tx_timecode: Some(side.timecode_trash_tx),
+            trash_overflow_timecode: Some(side.timecode_trash_overflow),
+            trash_tx_thru: Some(side.thru_trash_tx),
+            trash_overflow_thru: Some(side.thru_trash_overflow),
             timecode_inputs: std::array::from_fn(|_| None),
+            thru_sources: std::array::from_fn(|_| None),
         };
         (engine, handle)
     }
@@ -213,6 +266,68 @@ impl Engine {
             .get(deck_idx)
             .and_then(|s| s.as_ref())
             .and_then(TimecodeInput::last_output)
+    }
+
+    /// Attach a Thru source to a deck (M7). After this call, the deck
+    /// is in Thru mode: the deck's own [`Deck`] state (loaded track,
+    /// transport) is bypassed by [`Self::render_routed`], and audio
+    /// for that deck's output channels comes from the
+    /// [`ThruSource`] — the ringbuf'd audio interface input, passed
+    /// through unchanged at the deck's gain.
+    ///
+    /// Off-RT — call once during engine setup (mirroring
+    /// [`Self::attach_timecode_input`]). The
+    /// [`EngineHandle::attach_thru_source`] command-channel path is
+    /// the production wire-up since the engine moves into the audio
+    /// thread before deck attach typically happens.
+    ///
+    /// # Errors
+    /// See [`ThruAttachError`] for the failure modes.
+    pub fn attach_thru_source(
+        &mut self,
+        deck_idx: usize,
+        rx: ringbuf::HeapCons<f32>,
+        config: ThruInputConfig,
+    ) -> Result<(), ThruAttachError> {
+        if deck_idx >= DECK_COUNT {
+            return Err(ThruAttachError::InvalidDeck {
+                idx: deck_idx,
+                count: DECK_COUNT,
+            });
+        }
+        config.validate(self.sample_rate)?;
+        self.thru_sources[deck_idx] = Some(ThruSource::new(rx, config));
+        Ok(())
+    }
+
+    /// Detach the Thru source from a deck (off-RT). Returns the
+    /// previously-attached source so the caller can drop it on the
+    /// main thread — the audio thread never drops a
+    /// [`ThruSource`] (it owns a `HeapCons<f32>` + a `Vec<f32>`
+    /// scratch, both of which `dealloc` on drop).
+    #[must_use = "the returned ThruSource holds a ringbuf consumer; \
+                  drop it on the main thread, not the audio thread"]
+    pub fn detach_thru_source(&mut self, deck_idx: usize) -> Option<ThruSource> {
+        self.thru_sources.get_mut(deck_idx).and_then(Option::take)
+    }
+
+    /// Whether a [`ThruSource`] is currently attached on deck
+    /// `deck_idx`. `false` for an out-of-range index. Off-RT
+    /// diagnostic / UI probe ("is this deck routing a real record?").
+    #[must_use]
+    pub fn thru_attached(&self, deck_idx: usize) -> bool {
+        self.thru_sources.get(deck_idx).is_some_and(Option::is_some)
+    }
+
+    /// Number of input samples buffered on a deck's Thru source.
+    /// Off-RT diagnostic ("is the IOProc keeping up?"). `None` if no
+    /// Thru source is attached.
+    #[must_use]
+    pub fn thru_available(&self, deck_idx: usize) -> Option<usize> {
+        self.thru_sources
+            .get(deck_idx)
+            .and_then(|s| s.as_ref())
+            .map(ThruSource::available)
     }
 
     /// Engine-wide master gain (linear, default 1.0). Used by the debug
@@ -330,7 +445,16 @@ impl Engine {
             *sample = 0.0;
         }
         let sr = self.sample_rate;
-        for (idx, deck) in self.decks.iter_mut().enumerate() {
+        // Per-deck render dispatch (M7). We can't use
+        // `decks.iter_mut().enumerate()` here because the body needs
+        // *disjoint* mutable access to both `self.thru_sources[idx]`
+        // and `self.decks[idx]` — a single `.iter_mut()` on `decks`
+        // would also alias with `self.thru_sources` through `&mut self`.
+        // The index-loop pattern is the idiomatic Rust workaround for
+        // parallel-array dispatch like this, and the bounded loop is
+        // trivially bounds-checked at the array level.
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..DECK_COUNT {
             let Some(first) = routing[idx] else { continue };
             let first_us = first as usize;
             debug_assert!(
@@ -338,7 +462,19 @@ impl Engine {
                 "deck {idx} routed to first channel {first_us} but only {num_channels} \
                  channels are available; needs at least 2 channels for stereo"
             );
-            deck.render_into(rt, out, sr, num_channels, first_us);
+            // If a Thru source is attached on this deck, it owns the
+            // deck's output channels for this block — Direct renders
+            // silence, Processed/Hold reads from the input ring and
+            // writes additively. The Deck struct's transport state is
+            // not advanced (a Thru deck has no track to advance).
+            // Otherwise we fall through to the M0-M6 deck render path,
+            // byte-identical to pre-M7.
+            if let Some(thru) = self.thru_sources[idx].as_mut() {
+                let gain = self.decks[idx].gain();
+                thru.render_into(out, gain, num_channels, first_us);
+            } else {
+                self.decks[idx].render_into(rt, out, sr, num_channels, first_us);
+            }
         }
 
         // Master gain (M4 / M5.5): single multiplicative scale across the
@@ -493,6 +629,41 @@ impl Engine {
             Command::SetMasterGain { gain } => {
                 self.master_gain = gain;
             }
+            Command::AttachTimecodeInput { idx, input } => {
+                let Some(slot) = self.timecode_inputs.get_mut(idx as usize) else {
+                    // Bad idx: we cannot drop the box here on the
+                    // audio thread (it owns a HeapCons + Vec<f32> +
+                    // Decoder, all of which dealloc on drop). Bounce
+                    // it back through the timecode trash channel for
+                    // main-thread disposal — symmetric with the
+                    // bad-idx branch in `Command::DeckLoad`.
+                    self.send_timecode_input_to_trash(input);
+                    return;
+                };
+                // Replace-and-trash. If the slot was empty, the
+                // displaced value is `None` and there's nothing to
+                // dispose. If it was occupied (mid-stream re-cal),
+                // the old `TimecodeInput` is moved out *boxed* and
+                // shipped back through the trash channel for
+                // main-thread drop.
+                let displaced = slot.replace(*input);
+                if let Some(old) = displaced {
+                    self.send_timecode_input_to_trash(Box::new(old));
+                }
+            }
+            Command::AttachThruSource { idx, source } => {
+                let Some(slot) = self.thru_sources.get_mut(idx as usize) else {
+                    // Bad idx: bounce back through the thru-source
+                    // trash channel — symmetric with the M5.4.5
+                    // bad-idx branch above.
+                    self.send_thru_source_to_trash(source);
+                    return;
+                };
+                let displaced = slot.replace(*source);
+                if let Some(old) = displaced {
+                    self.send_thru_source_to_trash(Box::new(old));
+                }
+            }
         }
     }
 
@@ -542,6 +713,52 @@ impl Engine {
         if let Err(rejected) = trash_tx.try_push(arc) {
             std::mem::forget(rejected);
             if let Some(counter) = self.trash_overflow.as_ref() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Push an old [`Box<TimecodeInput>`] back to the main thread for
+    /// disposal (M5.4.5). Symmetric to [`Self::send_to_trash`] for
+    /// `Arc<Track>`. On overflow (channel full) `mem::forget` the box
+    /// and bump the timecode overflow counter — leaking is the lesser
+    /// evil compared with a `dealloc` on the audio thread.
+    fn send_timecode_input_to_trash(&mut self, boxed: Box<TimecodeInput>) {
+        use ringbuf::traits::Producer;
+        let Some(trash_tx) = self.trash_tx_timecode.as_mut() else {
+            // No trash channel — offline engine. `Engine::new` callers
+            // never go through `Command::AttachTimecodeInput` because
+            // the command is only producible by an `EngineHandle`,
+            // which is only paired with the channel-bearing engine.
+            // Defensive fallback: drop here.
+            drop(boxed);
+            return;
+        };
+        if let Err(rejected) = trash_tx.try_push(boxed) {
+            std::mem::forget(rejected);
+            if let Some(counter) = self.trash_overflow_timecode.as_ref() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Push an old [`Box<ThruSource>`] back to the main thread for
+    /// disposal (M7). Symmetric to [`Self::send_timecode_input_to_trash`].
+    /// On overflow (channel full) `mem::forget` the box and bump the
+    /// thru overflow counter — leaking is the lesser evil compared
+    /// with a `dealloc` on the audio thread.
+    fn send_thru_source_to_trash(&mut self, boxed: Box<ThruSource>) {
+        use ringbuf::traits::Producer;
+        let Some(trash_tx) = self.trash_tx_thru.as_mut() else {
+            // Offline engine — `Engine::new` callers never go through
+            // `Command::AttachThruSource`. Defensive fallback: drop
+            // here. (Equivalent to the timecode variant's reasoning.)
+            drop(boxed);
+            return;
+        };
+        if let Err(rejected) = trash_tx.try_push(boxed) {
+            std::mem::forget(rejected);
+            if let Some(counter) = self.trash_overflow_thru.as_ref() {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -1457,5 +1674,707 @@ mod tests {
         engine
             .attach_timecode_input(0, rx2, TimecodeInputConfig::default())
             .expect("re-attach after detach should succeed");
+    }
+
+    // ============================================================
+    //  M5.4.5: command-channel attach (EngineHandle::attach_*)
+    // ============================================================
+
+    /// Synthetic forward-unity timecode helper used by the M5.4.5
+    /// command-channel attach tests. Pushes one block of carrier into
+    /// `tx`, drives the engine, returns the post-block decoder
+    /// snapshot if there is one.
+    fn drive_one_block_with_synth_carrier(
+        engine: &mut Engine,
+        tx: &mut ringbuf::HeapProd<f32>,
+        gen: &mut dub_timecode::signal::Generator,
+        sig: &mut [f32],
+        rt: &mut RealtimeContext<'_>,
+        buf: &mut [f32],
+    ) {
+        gen.render(sig, 1.0, 0.5);
+        let _ = tx.push_slice(sig);
+        engine.render(rt, buf);
+    }
+
+    #[test]
+    fn handle_attach_to_empty_slot_starts_decoding() {
+        // M5.4.5 happy path: build engine with handle, move the engine
+        // through a render block (mimicking AudioOutput taking
+        // ownership), then attach a timecode input mid-stream via the
+        // handle. After the next render, decoder output should appear.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, block);
+
+        // Pre-attach: nothing decoded.
+        assert!(engine.timecode_last_output(0).is_none());
+
+        // Build the input ringbuf on the main thread, push a few blocks
+        // of synthetic carrier, then attach via handle. (In the live
+        // CLI flow the calibrator thread is what populates the ring,
+        // not the test, but the assert is the same: input audio +
+        // attach → decode output.)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rb = HeapRb::<f32>::new((sr as usize) * 2);
+        let (mut tx, rx) = rb.split();
+
+        let mut gen = dub_timecode::signal::Generator::new(dub_timecode::Format::SeratoCv02, sr);
+        let mut sig = vec![0.0_f32; block * 2];
+        gen.render(&mut sig, 1.0, 0.5);
+        let _ = tx.push_slice(&sig);
+
+        handle
+            .attach_timecode_input(
+                0,
+                rx,
+                TimecodeInputConfig {
+                    format: dub_timecode::Format::SeratoCv02,
+                    input_sample_rate: sr,
+                    max_block_frames: block.max(64),
+                    confidence_threshold: 0.7,
+                    disengage_threshold: 0.5,
+                    sticky_blocks_to_disengage: 1,
+                    amplitude_threshold: 0.001,
+                },
+            )
+            .expect("empty-slot attach should succeed");
+
+        // First render: command channel is drained, AttachTimecodeInput
+        // is applied, decoder primes on the buffered carrier.
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        for _ in 0..4 {
+            drive_one_block_with_synth_carrier(
+                &mut engine,
+                &mut tx,
+                &mut gen,
+                &mut sig,
+                &mut rt,
+                &mut buf,
+            );
+        }
+
+        let last = engine
+            .timecode_last_output(0)
+            .expect("decoder should have run after handle attach");
+        assert!(
+            last.confidence > 0.95,
+            "synthetic input should lock high (got {})",
+            last.confidence
+        );
+    }
+
+    #[test]
+    fn handle_attach_to_filled_slot_replaces_and_trashes_previous() {
+        // M5.4.5 mid-stream re-attach: a deck already has a
+        // TimecodeInput, the calibrator runs again (e.g. cartridge
+        // swap), `attach_timecode_input` is called a second time. The
+        // previous TimecodeInput must be trashed (sent back to main
+        // thread for disposal), not dropped on the audio thread.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, block);
+
+        let cfg = TimecodeInputConfig {
+            format: dub_timecode::Format::SeratoCv02,
+            input_sample_rate: sr,
+            max_block_frames: block.max(64),
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+        };
+
+        // First attach.
+        let rb1 = HeapRb::<f32>::new(1024);
+        let (_tx1, rx1) = rb1.split();
+        handle.attach_timecode_input(0, rx1, cfg).unwrap();
+
+        // Drain the command channel into the engine so the slot is
+        // actually filled by the time the second attach lands.
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        engine.render(&mut rt, &mut buf);
+
+        // Second attach (different ringbuf; would replace).
+        let rb2 = HeapRb::<f32>::new(1024);
+        let (_tx2, rx2) = rb2.split();
+        handle
+            .attach_timecode_input(0, rx2, cfg)
+            .expect("re-attach should succeed via command channel");
+
+        // Drain the second command. The audio thread should now have
+        // sent the displaced (first) TimecodeInput back through the
+        // timecode trash channel.
+        engine.render(&mut rt, &mut buf);
+
+        // reclaim() drops the displaced box on the main thread and
+        // returns 1 (one item drained).
+        let n = handle.reclaim();
+        assert_eq!(
+            n, 1,
+            "re-attach should have produced exactly one trashed TimecodeInput"
+        );
+        assert_eq!(
+            handle.timecode_trash_overflow_count(),
+            0,
+            "trash channel should not have overflowed"
+        );
+    }
+
+    #[test]
+    fn handle_attach_rejects_invalid_deck_idx() {
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, block);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = handle
+            .attach_timecode_input(99, rx, TimecodeInputConfig::default())
+            .expect_err("idx 99 is out of range");
+        assert!(matches!(err, TimecodeAttachError::InvalidDeck { .. }));
+    }
+
+    #[test]
+    fn handle_attach_rejects_sr_mismatch_before_sending_command() {
+        // Bad config caught early — the handle should not push a
+        // bogus command into the channel.
+        let sr = 48_000.0_f32;
+        let block = 256_usize;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, block);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let cfg = TimecodeInputConfig {
+            input_sample_rate: 44_100.0,
+            ..TimecodeInputConfig::default()
+        };
+        let err = handle
+            .attach_timecode_input(0, rx, cfg)
+            .expect_err("44.1k vs 48k engine should be rejected");
+        assert!(matches!(
+            err,
+            TimecodeAttachError::SampleRateMismatch { .. }
+        ));
+
+        // Confirm nothing landed on the deck — render with no input
+        // produces no decoder output.
+        let mut rt = RealtimeContext::new();
+        let mut buf = vec![0.0_f32; block * 2];
+        engine.render(&mut rt, &mut buf);
+        assert!(engine.timecode_last_output(0).is_none());
+    }
+
+    #[test]
+    fn handle_attach_to_invalid_idx_does_not_leak() {
+        // Defensive belt: even if a buggy command-channel attach gets
+        // through to the audio thread with a bad idx (which can't
+        // actually happen because EngineHandle::attach_timecode_input
+        // validates), the engine-side handler must trash the box
+        // rather than drop it on the audio thread.
+        //
+        // We can't construct that bad command via the handle (it
+        // returns InvalidDeck before sending), so we drive
+        // `apply_command` directly with a synthesised command — the
+        // only test in this file that does so, justified because
+        // we're pinning the audio-side leak-safety contract, not
+        // the handle-side validation contract.
+        let sr = 48_000.0_f32;
+        let block = 64_usize;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, block);
+
+        let cfg = TimecodeInputConfig {
+            format: dub_timecode::Format::SeratoCv02,
+            input_sample_rate: sr,
+            max_block_frames: block.max(64),
+            confidence_threshold: 0.7,
+            disengage_threshold: 0.5,
+            sticky_blocks_to_disengage: 1,
+            amplitude_threshold: 0.001,
+        };
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let bogus_input = Box::new(TimecodeInput::new(rx, cfg));
+        engine.apply_command(Command::AttachTimecodeInput {
+            idx: 99,
+            input: bogus_input,
+        });
+        // Bad idx should have routed the box to the timecode trash,
+        // not dropped on the audio thread.
+        assert_eq!(handle.timecode_trash_overflow_count(), 0);
+        let n = handle.reclaim();
+        assert_eq!(n, 1, "bad-idx box must trash, not leak or panic");
+    }
+
+    // ===================================================================
+    // M7 (Thru Mode) — engine integration tests.
+    //
+    // These verify the engine-side dispatch: when a deck has a thru
+    // source attached, `render_routed` calls `ThruSource::render_into`
+    // for that deck's channel pair and SKIPS the Deck's own render path
+    // entirely (the deck's transport doesn't advance even if a track is
+    // loaded). When no thru source is attached, the deck renders
+    // normally — proving the M0-M6 Track path is untouched.
+    //
+    // Thru behaviour itself (additive passthrough, alloc-free, stride/
+    // offset correctness) is tested in `thru.rs`. Here we test the
+    // engine's *routing* of audio between Track and Thru decks,
+    // including the multi-deck case where one is Track and the other
+    // is Thru, plus the additive M5.5.2 4-channel external-mixer
+    // routing.
+    // ===================================================================
+
+    fn thru_cfg(sr: f32) -> ThruInputConfig {
+        ThruInputConfig {
+            max_block_frames: 1024,
+            input_sample_rate: sr,
+        }
+    }
+
+    /// Push `n` stereo frames of `(l, r)` into the producer. Defensive
+    /// against the ring filling up (unlikely with capacity 4096 and
+    /// n ≤ 1024, but the loop short-circuits gracefully).
+    fn push_thru_input(tx: &mut ringbuf::HeapProd<f32>, n: usize, l: f32, r: f32) {
+        for _ in 0..n {
+            if tx.try_push(l).is_err() {
+                return;
+            }
+            if tx.try_push(r).is_err() {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn thru_attach_rejects_bad_deck_idx() {
+        let mut engine = Engine::new(48_000.0, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = engine
+            .attach_thru_source(DECK_COUNT, rx, thru_cfg(48_000.0))
+            .unwrap_err();
+        assert!(
+            matches!(err, ThruAttachError::InvalidDeck { .. }),
+            "expected InvalidDeck, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn thru_attach_rejects_sr_mismatch() {
+        let mut engine = Engine::new(48_000.0, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let cfg = ThruInputConfig {
+            max_block_frames: 256,
+            input_sample_rate: 44_100.0,
+        };
+        let err = engine.attach_thru_source(0, rx, cfg).unwrap_err();
+        assert!(
+            matches!(err, ThruAttachError::SampleRateMismatch { .. }),
+            "expected SampleRateMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn thru_attached_deck_skips_track_render_path() {
+        // Setup: deck 0 has a (non-silent) Track loaded AND a Thru
+        // source attached, but no audio pushed into the Thru ring.
+        // The dispatch should hit ThruSource::render_into and skip
+        // the Deck's track-render path, so the rendered output is
+        // silence (underrun → 0.0 added to the zeroed output). The
+        // Track is not rendered — this proves "Thru wins" over
+        // Track when both are present.
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+
+        // Load a non-silent track on deck 0.
+        let track = Arc::new(Track::from_interleaved(vec![0.7; 8], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+
+        // Attach an empty Thru source.
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+
+        let mut out = vec![1.0_f32; 4 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut out);
+
+        // The render zeros the output buffer first, then the empty
+        // Thru ring adds 0.0 → all samples zero. If the Track-render
+        // path had run, we'd see ~0.7 here.
+        for (i, s) in out.iter().enumerate() {
+            assert!(s.abs() < 1e-9, "frame {i}: expected silence, got {s}");
+        }
+    }
+
+    #[test]
+    fn thru_attached_deck_passes_input_through() {
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+        let rb = HeapRb::<f32>::new(8192);
+        let (mut tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+
+        push_thru_input(&mut tx, 64, 0.3, -0.4);
+        let mut out = vec![0.0_f32; 64 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut out);
+        for i in 0..64 {
+            assert!(
+                (out[i * 2] - 0.3).abs() < 1e-5,
+                "frame {i} L = {} expected 0.3",
+                out[i * 2]
+            );
+            assert!(
+                (out[i * 2 + 1] - (-0.4)).abs() < 1e-5,
+                "frame {i} R = {} expected -0.4",
+                out[i * 2 + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn thru_render_does_not_advance_deck_transport() {
+        // A Thru deck's track-side transport must not tick — the deck
+        // has no notion of position when sourced from a real record.
+        // Load a track on deck 0, attach Thru, render some blocks,
+        // confirm the deck's position is exactly where it was at attach
+        // time (zero, since set_source resets it).
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        engine.deck_mut(0).set_source(track);
+        engine.deck_mut(0).set_playing(true);
+        engine.deck_mut(0).quiesce_declick_for_test();
+        let pos_before = engine.deck(0).position_frames();
+
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+
+        let mut out = vec![0.0_f32; 256 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut out);
+        engine.render(&mut rt, &mut out);
+        engine.render(&mut rt, &mut out);
+
+        let pos_after = engine.deck(0).position_frames();
+        assert!(
+            (pos_after - pos_before).abs() < 1e-9,
+            "deck transport advanced under thru: {pos_before} -> {pos_after}"
+        );
+    }
+
+    #[test]
+    fn track_deck_unaffected_when_other_deck_is_thru() {
+        // Two-deck setup: deck 0 in Thru (empty ring → silent), deck 1
+        // in Track (playing). The 4-channel external-mixer routing
+        // sends deck 0 → ch 0+1 and deck 1 → ch 2+3. Pin the contract:
+        // deck 1's audio is unchanged by deck 0's Thru attachment.
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+
+        // Deck 1: playing track of 0.5.
+        let track = Arc::new(Track::from_interleaved(vec![0.5; 1024], 48_000, 2).unwrap());
+        engine.deck_mut(1).set_source(track);
+        engine.deck_mut(1).set_playing(true);
+        engine.deck_mut(1).quiesce_declick_for_test();
+
+        // Deck 0: Thru attached, empty ring → silent.
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+
+        let mut out = vec![0.0_f32; 16 * 4]; // 16 frames, 4 channels.
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(0), Some(2)]);
+
+        for frame in 0..16 {
+            assert!(out[frame * 4].abs() < 1e-9, "frame {frame} ch0 nonzero");
+            assert!(out[frame * 4 + 1].abs() < 1e-9, "frame {frame} ch1 nonzero");
+            assert!(
+                (out[frame * 4 + 2] - 0.5).abs() < 1e-5,
+                "frame {frame} ch2 = {} expected 0.5",
+                out[frame * 4 + 2]
+            );
+            assert!(
+                (out[frame * 4 + 3] - 0.5).abs() < 1e-5,
+                "frame {frame} ch3 = {} expected 0.5",
+                out[frame * 4 + 3]
+            );
+        }
+    }
+
+    #[test]
+    fn thru_routing_to_4ch_lands_on_correct_pair() {
+        // Deck 0 Thru → ch 2+3 on a 4-channel buffer. Confirm the
+        // Thru audio lands on the right pair and ch 0+1 stay zero.
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+        let rb = HeapRb::<f32>::new(8192);
+        let (mut tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+
+        push_thru_input(&mut tx, 32, 0.6, 0.6);
+        let mut out = vec![0.0_f32; 32 * 4];
+        let mut rt = RealtimeContext::new();
+        engine.render_routed(&mut rt, &mut out, 4, &[Some(2), None]);
+        for frame in 0..32 {
+            assert!(out[frame * 4].abs() < 1e-9, "frame {frame} ch0");
+            assert!(out[frame * 4 + 1].abs() < 1e-9, "frame {frame} ch1");
+            assert!(
+                (out[frame * 4 + 2] - 0.6).abs() < 1e-5,
+                "frame {frame} ch2 = {}",
+                out[frame * 4 + 2]
+            );
+            assert!(
+                (out[frame * 4 + 3] - 0.6).abs() < 1e-5,
+                "frame {frame} ch3 = {}",
+                out[frame * 4 + 3]
+            );
+        }
+    }
+
+    #[test]
+    fn thru_render_respects_deck_gain() {
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+        let rb = HeapRb::<f32>::new(8192);
+        let (mut tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+        engine.deck_mut(0).set_gain(0.5);
+
+        push_thru_input(&mut tx, 32, 1.0, 1.0);
+        let mut out = vec![0.0_f32; 32 * 2];
+        let mut rt = RealtimeContext::new();
+        engine.render(&mut rt, &mut out);
+        for frame in 0..32 {
+            assert!(
+                (out[frame * 2] - 0.5).abs() < 1e-5,
+                "frame {frame}: out_l = {} expected 0.5",
+                out[frame * 2]
+            );
+        }
+    }
+
+    #[test]
+    fn thru_render_is_alloc_free() {
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+        let rb = HeapRb::<f32>::new(8192);
+        let (mut tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+        push_thru_input(&mut tx, 1024, 0.3, 0.4);
+        let mut out = vec![0.0_f32; 256 * 2];
+        let mut rt = RealtimeContext::new();
+        assert_no_alloc::assert_no_alloc(|| {
+            engine.render(&mut rt, &mut out);
+        });
+    }
+
+    #[test]
+    fn detach_thru_returns_source_for_main_thread_drop() {
+        let sr = 48_000.0;
+        let mut engine = Engine::new(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        engine.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+        assert!(engine.thru_attached(0));
+        let detached = engine.detach_thru_source(0);
+        assert!(detached.is_some(), "expected Some(ThruSource)");
+        assert!(
+            !engine.thru_attached(0),
+            "slot should be empty after detach"
+        );
+        // The returned ThruSource owns its HeapCons; dropping it here
+        // (on the test/main thread) is the correct disposal path.
+        drop(detached);
+    }
+
+    // -- Command-channel attach path ---------------------------------
+
+    /// Drive one block through the engine so any pending commands
+    /// take effect. Uses the simplest stereo path; the command-side
+    /// behaviour under test is independent of what audio comes out.
+    fn pump_one_block(engine: &mut Engine, rt: &mut RealtimeContext<'_>) {
+        let mut out = vec![0.0_f32; 256 * 2];
+        engine.render(rt, &mut out);
+    }
+
+    #[test]
+    fn handle_attach_thru_to_empty_slot_starts_dispatching() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        handle.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(engine.thru_attached(0));
+        assert!(!engine.thru_attached(1));
+    }
+
+    #[test]
+    fn handle_attach_thru_to_filled_slot_replaces_and_trashes_previous() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        handle.attach_thru_source(0, rx, thru_cfg(sr)).unwrap();
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        // Second attach: displaces the first; old box should land in
+        // the thru trash.
+        let rb2 = HeapRb::<f32>::new(4096);
+        let (_tx2, rx2) = rb2.split();
+        handle.attach_thru_source(0, rx2, thru_cfg(sr)).unwrap();
+        pump_one_block(&mut engine, &mut rt);
+        assert_eq!(handle.thru_trash_overflow_count(), 0);
+        let n = handle.reclaim();
+        assert_eq!(
+            n, 1,
+            "expected exactly one displaced ThruSource to be reclaimed"
+        );
+    }
+
+    #[test]
+    fn handle_attach_thru_rejects_invalid_deck_idx() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = handle
+            .attach_thru_source(DECK_COUNT, rx, thru_cfg(sr))
+            .unwrap_err();
+        assert!(matches!(err, ThruAttachError::InvalidDeck { .. }));
+    }
+
+    #[test]
+    fn handle_attach_thru_rejects_sr_mismatch_before_sending_command() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let bad_cfg = ThruInputConfig {
+            max_block_frames: 256,
+            input_sample_rate: 44_100.0,
+        };
+        let err = handle.attach_thru_source(0, rx, bad_cfg).unwrap_err();
+        assert!(matches!(err, ThruAttachError::SampleRateMismatch { .. }));
+        // No command should have been enqueued.
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(!engine.thru_attached(0));
+    }
+
+    // -------- M8 — BPM-tracked Thru attach --------
+
+    #[test]
+    fn handle_attach_thru_with_bpm_tracking_spawns_stream() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        let stream = handle
+            .attach_thru_source_with_bpm_tracking(
+                0,
+                rx,
+                thru_cfg(sr),
+                dub_bpm::TrackerConfig {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    analysis_period_samples: 48_000,
+                },
+            )
+            .expect("attach with bpm");
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(engine.thru_attached(0));
+        // Drop the stream explicitly — joins the analysis thread.
+        // If the analysis thread is wedged this test will hang.
+        stream.shutdown();
+    }
+
+    #[test]
+    fn handle_attach_thru_with_bpm_rejects_engine_sr_mismatch() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        // Tracker SR is 44.1k but engine is 48k → mismatch.
+        let bad_tracker = dub_bpm::TrackerConfig {
+            sample_rate: 44_100,
+            channels: 1,
+            analysis_period_samples: 44_100,
+        };
+        let err = handle
+            .attach_thru_source_with_bpm_tracking(0, rx, thru_cfg(sr), bad_tracker)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithBpmError::SampleRateMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_bpm_rejects_invalid_tracker_config() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        // analysis_period_samples = 0 is rejected by BpmTracker::new
+        // → propagates up as BadTrackerConfig.
+        let bad_tracker = dub_bpm::TrackerConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            analysis_period_samples: 0,
+        };
+        let err = handle
+            .attach_thru_source_with_bpm_tracking(0, rx, thru_cfg(sr), bad_tracker)
+            .unwrap_err();
+        assert!(matches!(err, ThruAttachWithBpmError::BadTrackerConfig(_)));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_bpm_forwards_invalid_deck_idx() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = handle
+            .attach_thru_source_with_bpm_tracking(
+                DECK_COUNT,
+                rx,
+                thru_cfg(sr),
+                dub_bpm::TrackerConfig::at(48_000),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithBpmError::Thru(ThruAttachError::InvalidDeck { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_apply_command_bad_idx_thru_attach_routes_to_trash() {
+        // Bypass `attach_thru_source`'s validation by hand-crafting a
+        // bogus AttachThruSource command directly and feeding it to
+        // the engine. The engine must not panic and must NOT drop the
+        // box on the audio thread.
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let bogus = Box::new(ThruSource::new(rx, thru_cfg(sr)));
+        engine.apply_command(Command::AttachThruSource {
+            idx: 99,
+            source: bogus,
+        });
+        assert_eq!(handle.thru_trash_overflow_count(), 0);
+        let n = handle.reclaim();
+        assert_eq!(n, 1, "bad-idx box must trash, not leak");
     }
 }

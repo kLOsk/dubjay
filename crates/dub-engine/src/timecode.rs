@@ -209,6 +209,14 @@ pub enum AttachError {
     /// (it disables the gate); any other invalid value is a bug.
     #[error("amplitude_threshold ({value}) must be ≥ 0 and finite")]
     InvalidAmplitudeThreshold { value: f32 },
+
+    /// SPSC command channel between [`crate::EngineHandle`] and the
+    /// audio thread is full (M5.4.5: only emitted by the handle's
+    /// command-channel attach path; never by the synchronous
+    /// `Engine::attach_timecode_input`). Recoverable — retry on the
+    /// next render block.
+    #[error("audio engine command channel is full")]
+    ChannelFull,
 }
 
 /// Lift / engage policy state machine, decoupled from the
