@@ -65,7 +65,7 @@ pub use confidence::{
     TENTATIVE_THRESHOLD,
 };
 pub use estimator::{BpmEstimator, BpmEstimatorError};
-pub use offline::{analyze_bpm, AnalysisError};
+pub use offline::{analyze_bpm, analyze_bpm_with_range, AnalysisError};
 pub use stream::BpmStream;
 pub use tracker::{BpmTracker, TrackerConfig, TrackerError};
 
@@ -80,15 +80,49 @@ pub(crate) const FRAME_SIZE: usize = 1024;
 /// interpolation.
 pub(crate) const HOP_SIZE: usize = 512;
 
-/// Minimum tempo we attempt to detect. Below this lies the realm of "is
-/// it a beat or a tape-stop?" and the autocorrelation peak picker isn't
-/// reliable.
-pub(crate) const MIN_BPM: f64 = 60.0;
+/// Minimum tempo of the default [`BpmRange`]. Below this lies the realm
+/// of "is it a beat or a tape-stop?" and the autocorrelation peak picker
+/// isn't reliable.
+pub const MIN_BPM: f64 = 60.0;
 
-/// Maximum tempo we attempt to detect. Above ~200 BPM most DJs feel half
-/// time anyway; for dnb/jungle (170–180) and gabber (>200) we'd want
-/// genre-specific priors, which are deferred to M8+.
-pub(crate) const MAX_BPM: f64 = 200.0;
+/// Maximum tempo of the default [`BpmRange`]. Above ~200 BPM most DJs
+/// feel half time anyway; for dnb/jungle (170–180) and gabber (>200) we'd
+/// want genre-specific priors, which are deferred to M9+.
+pub const MAX_BPM: f64 = 200.0;
+
+// ============================================================
+// M8.1 log-band ODF parameters
+// ============================================================
+//
+// The single-bin spectral flux used in M7.5/M8 produced 2× octave
+// errors on hip-hop because hi-hats (hundreds of bright high-bin
+// onsets per beat) dominated the flux sum over kicks (a handful of
+// loud low-bin onsets). The fix is to compute spectral flux per
+// log-spaced band, average within each band, and sum the per-band
+// fluxes equally into the final ODF — so a kick band carrying 1
+// onset/beat contributes the same weight as a hi-hat band carrying
+// 8 onsets/beat.
+//
+// References: Goto & Muraoka (1994); Klapuri (2006); Davies &
+// Plumbley (2007) all use multi-band flux for the same reason.
+//
+// 8 bands is the smallest count that gives ~ 1 octave per band over
+// 30 Hz – 16 kHz (the perceptually-relevant range), which keeps the
+// per-band averaging stable (each band has at least one bin even at
+// 44.1 kHz with `FRAME_SIZE = 1024`).
+
+/// Number of log-spaced frequency bands the ODF is summed over.
+/// See module-level note for rationale.
+pub(crate) const NUM_ODF_BANDS: usize = 8;
+
+/// Lower edge of the lowest ODF band, in Hz. Anything below this
+/// is sub-bass / room rumble and doesn't carry beat information.
+pub(crate) const ODF_BAND_MIN_HZ: f32 = 30.0;
+
+/// Upper edge of the highest ODF band, in Hz. Beyond ~ 16 kHz lies
+/// air / cymbal shimmer that's perceptually rich but rhythmically
+/// redundant with what the 4–10 kHz hi-hat band already carries.
+pub(crate) const ODF_BAND_MAX_HZ: f32 = 16_000.0;
 
 /// A single tempo estimate.
 ///
@@ -110,4 +144,87 @@ impl BpmEstimate {
         bpm: 0.0,
         confidence: 0.0,
     };
+}
+
+/// Inclusive BPM search window for the tempo estimator.
+///
+/// The estimator searches autocorrelation lags corresponding to the
+/// inclusive `[min, max]` BPM range and ignores periodic structure
+/// outside it. The default ([`BpmRange::DEFAULT`]) is the full
+/// `[MIN_BPM, MAX_BPM]` = 60–200 BPM that the M8.1 algorithm is
+/// calibrated for.
+///
+/// Constraining the range is the recommended escape hatch for the
+/// inherent half-tempo ambiguity in beat-tracking (dubstep at
+/// 140 BPM masquerading as 70 BPM, drum-n-bass with strong K-S
+/// backbeat masquerading as half tempo, …). The M8.1 algorithm
+/// resolves the common cases — reggae 65, hip-hop 90/100, rolling
+/// dnb 174 — out of the box without any range hint, so the range
+/// only needs to be tightened for the edge cases.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BpmRange {
+    /// Inclusive lower BPM bound. Must be `>= MIN_BPM`.
+    pub min: f64,
+    /// Inclusive upper BPM bound. Must be `<= MAX_BPM` and `> min`.
+    pub max: f64,
+}
+
+/// Errors that prevent construction of a [`BpmRange`].
+#[derive(Debug, thiserror::Error)]
+pub enum BpmRangeError {
+    /// `min` is below [`MIN_BPM`] or `max` is above [`MAX_BPM`].
+    /// The autocorrelation algorithm isn't reliable outside that
+    /// window; widening it would silently degrade accuracy.
+    #[error(
+        "BPM range [{min}, {max}] must fit within the algorithm-supported \
+         window [{MIN_BPM}, {MAX_BPM}]"
+    )]
+    OutsideSupported {
+        /// Provided lower bound.
+        min: f64,
+        /// Provided upper bound.
+        max: f64,
+    },
+
+    /// `max <= min` or non-finite values.
+    #[error("BPM range bounds must satisfy 0 < min < max (got min={min}, max={max})")]
+    Empty {
+        /// Provided lower bound.
+        min: f64,
+        /// Provided upper bound.
+        max: f64,
+    },
+}
+
+impl BpmRange {
+    /// Default range: 60–200 BPM. The widest the M8.1 algorithm is
+    /// calibrated for.
+    pub const DEFAULT: Self = Self {
+        min: MIN_BPM,
+        max: MAX_BPM,
+    };
+
+    /// Build a [`BpmRange`] from explicit bounds.
+    ///
+    /// # Errors
+    ///
+    /// * [`BpmRangeError::Empty`] if `!(0 < min < max)` or either
+    ///   bound is non-finite.
+    /// * [`BpmRangeError::OutsideSupported`] if the bounds fall
+    ///   outside `[MIN_BPM, MAX_BPM]`.
+    pub fn new(min: f64, max: f64) -> Result<Self, BpmRangeError> {
+        if !min.is_finite() || !max.is_finite() || min <= 0.0 || max <= min {
+            return Err(BpmRangeError::Empty { min, max });
+        }
+        if min < MIN_BPM || max > MAX_BPM {
+            return Err(BpmRangeError::OutsideSupported { min, max });
+        }
+        Ok(Self { min, max })
+    }
+}
+
+impl Default for BpmRange {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }

@@ -59,7 +59,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::audio_routing::{build_input_options, resolve_output_routing, RoutingArgs};
 use crate::input_cmds::{parse_input_args, InputArgs};
 use dub_audio::AudioInput;
-use dub_bpm::{BpmStream, TrackerConfig, TrackerEvent, TrackerState};
+use dub_bpm::{BpmRange, BpmStream, TrackerConfig, TrackerEvent, TrackerState};
 use dub_engine::{Engine, ThruInputConfig};
 
 /// Upper bound on input frames per render block. Same value as
@@ -98,6 +98,11 @@ struct Opts {
     /// `--no-bpm-track` flag (off by default; default is "track").
     /// When `true`, no [`BpmStream`] is spawned per Thru deck.
     no_bpm_track: bool,
+    /// `--bpm-range MIN,MAX` override (inclusive, in BPM). `None`
+    /// means "use the algorithm default 60–200". Used as the M9-
+    /// scoped escape hatch for genres the M8.1 algorithm can't
+    /// disambiguate without a prior (dubstep, K-S backbeat dnb).
+    bpm_range: Option<BpmRange>,
 }
 
 /// Entry point. Parses argv, validates, then drives the engine.
@@ -120,6 +125,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
     let mut output_channels: Option<u32> = None;
     let mut device_profile: Option<String> = None;
     let mut no_bpm_track = false;
+    let mut bpm_range: Option<BpmRange> = None;
     let mut i = 0;
     let positional: Vec<String> = Vec::new();
     while i < leftover.len() {
@@ -197,6 +203,30 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
                 no_bpm_track = true;
                 i += 1;
             }
+            "--bpm-range" => {
+                let v = leftover
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--bpm-range expects MIN,MAX"))?;
+                let parts: Vec<&str> = v.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(anyhow!(
+                        "--bpm-range expects two comma-separated values \
+                         (e.g. --bpm-range 60,200); got {v:?}"
+                    ));
+                }
+                let min: f64 = parts[0]
+                    .trim()
+                    .parse()
+                    .context("--bpm-range MIN not a number")?;
+                let max: f64 = parts[1]
+                    .trim()
+                    .parse()
+                    .context("--bpm-range MAX not a number")?;
+                let range =
+                    BpmRange::new(min, max).map_err(|e| anyhow!("--bpm-range invalid: {e}"))?;
+                bpm_range = Some(range);
+                i += 2;
+            }
             other => {
                 return Err(anyhow!("unknown flag: {other}"));
             }
@@ -233,6 +263,7 @@ fn parse_opts(args: &[String]) -> Result<Opts> {
         output_channels,
         device_profile,
         no_bpm_track,
+        bpm_range,
     })
 }
 
@@ -348,6 +379,7 @@ fn run_with_opts(opts: Opts) -> Result<()> {
         // input as mono.
         channels: 1,
         analysis_period_samples: tracker_sr,
+        bpm_range: opts.bpm_range.unwrap_or(BpmRange::DEFAULT),
     };
 
     if opts.no_bpm_track {

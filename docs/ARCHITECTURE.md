@@ -63,9 +63,10 @@ buffers, never callbacks across thread boundaries.
               ┌────────────────────┬─────────────┼─────────────┬────────────────┐
               ▼                    ▼             ▼             ▼                ▼
           dub-timecode         dub-dsp       dub-stretch   dub-io           dub-bpm
-          (Serato CV02 +      (rubato,      (Rubber Band  (symphonia       (M7.5 — pure-Rust
-           Traktor MK1/MK2,    biquads,      FFI; GPLv3   decoders, in-    FFI; LGPL
-           clean-room)         FX placeholders)            license)         RAM tracks)        boundary)
+          (Serato CV02 +      (rubato,      (Rubber Band  (symphonia       (M7.5+M8+M8.1 —
+           Traktor MK1/MK2,    biquads,      FFI; GPLv3    decoders, in-    pure-Rust log-band
+           clean-room)         FX placeholders) license)   RAM tracks)      ODF + windowed-
+                                                                            energy picker)
 
           ┌─────────────────────────────────────────────────────────────────────┐
           │ Off-RT / placeholder for v1:                                        │
@@ -1022,7 +1023,7 @@ plumbing in or out of `ThruSource` — the simplified design has
 no audibility crossfade to drive (constant audibility means no
 transition to declick).
 
-### BPM engine — M7.5 (offline DSP core) + M8 (streaming driver on Thru) — both shipped
+### BPM engine — M7.5 (offline DSP core) + M8 (streaming driver on Thru) + M8.1 (octave fix) — all shipped
 
 The BPM stack is built in two layers, both shipped. **M7.5** shipped
 the DSP core as the `dub-bpm` crate (offline `analyze_bpm` +
@@ -1085,16 +1086,43 @@ plus the end-to-end `crates/dub-bpm/src/stream.rs::click_track_streams_to_lock`)
         └──────────────────┘                  └─────────────────────────────────┘
 ```
 
-**Algorithm (M7.5 baseline, used by both paths).** Pure-Rust
-spectral-flux onset detection function (Hann-windowed FFT magnitude
-differences at `FRAME_SIZE = 1024` / `HOP_SIZE = 512`) → 3-tap-
-smoothed autocorrelation → harmonic-summed peak search at
-fractional lag resolution (step 0.25) → confidence = peak /
-acf-at-zero, refused below 0.05. See
-[`docs/SHIPPED.md#m75`](SHIPPED.md#m75) for the algorithm
-walkthrough, the four-pass bug-find history, and why aubio was
-dropped from the M7.5 critical path (3-years-stale FFI + LGPL
-dynamic-link friction for an architectural milestone).
+**Algorithm (M8.1 current, used by both paths).** Pure-Rust
+**log-band-weighted spectral-flux** onset detection function
+(Hann-windowed FFT magnitude differences at `FRAME_SIZE = 1024` /
+`HOP_SIZE = 512`, summed equally across 8 log-spaced bands from
+30 Hz to 16 kHz, Klapuri-2006 `ln(1 + λ|X|)` magnitude
+compression) → unbiased autocorrelation → **windowed local-energy
+harmonic-mean** peak picker (5-bin window sum at each integer-lag
+candidate, harmonic mean over the first 4 multiples, smaller-lag
+tiebreak inside a 1 % score tie window) → centroid sub-bin
+refinement → confidence = peak / acf-at-zero, refused below 0.05.
+The M7.5 baseline (single-band flux + harmonic-sum + smoothed-ACF
+parabolic interpolation) hit a hard regression on real hip-hop
+audio in M8 — the hi-hat-on-8ths sub-beat ostinato made the
+autocorrelation peak at lag `P/2` beat the one at `P` because the
+high-frequency bin count dominated the flux. The M8.1 rewrite
+(log-band ODF rebalances FFT bin contribution per band; windowed
+local-energy removes the parabolic-vertex shoulder-asymmetry
+bias) resolves the user's stated genre mix (reggae 65, hip-hop
+90/100, rolling dnb 174) at the correct octave out of the box.
+See [`docs/SHIPPED.md#m75`](SHIPPED.md#m75) for the M7.5 baseline
+walkthrough and [`docs/SHIPPED.md#m81`](SHIPPED.md#m81) for the
+M8.1 multi-band + windowed-energy derivation, including the
+"why not biased ACF" and "why not wider tie tolerance"
+trade-offs that landed on the chosen design.
+
+**Bpm range as escape hatch.** The M8.1 algorithm cannot in
+principle resolve genres whose autocorrelation legitimately peaks
+at a different octave than the convention (dubstep at 140 / 70,
+K-S-backbeat dnb at 174 / 87) without a tempo or genre prior. The
+[`BpmRange`](../crates/dub-bpm/src/lib.rs) value type +
+`analyze_bpm_with_range(samples, sr, channels, range)` (offline)
++ `TrackerConfig::bpm_range` (streaming) + `dub thru --bpm-range
+MIN,MAX` (CLI) plumb a user-chosen `[min, max]` BPM window
+through the whole stack. The default is the full `[60, 200]`
+window the M8.1 algorithm is calibrated for; constraining the
+range is the explicit user-driven path for the irreducibly-
+ambiguous edges.
 
 **Why the streaming side doesn't touch the audio thread for
 analysis.** The autocorrelation search is O(odf_len × max_lag) and

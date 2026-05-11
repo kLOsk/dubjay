@@ -1,4 +1,4 @@
-# Dub — Shipped Milestones (M0 → M8)
+# Dub — Shipped Milestones (M0 → M8.1)
 
 > Companion to [`docs/PRD.md`](PRD.md). The PRD's milestone table keeps shipped rows
 > short; this doc holds the detailed write-ups, design history, and rationale
@@ -12,7 +12,7 @@
 > working memory. Moved verbatim here; nothing has been rewritten or
 > summarized away.
 
-**Currently shipped:** M0 through M8 (Auto-BPM on Thru — streaming driver). Workspace totals 386 tests passing under `cargo clippy --workspace --all-targets -- -D warnings`.
+**Currently shipped:** M0 through M8.1 (BPM octave fix — log-band ODF + windowed-energy tempo picker). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite.
 
 ## Table of contents
 
@@ -38,6 +38,7 @@
 - [M7 — Thru Mode (per-deck input routing)](#m7)
 - [M7.5 — BPM engine + offline analysis](#m75)
 - [M8 — Auto-BPM on Thru — streaming driver](#m8)
+- [M8.1 — BPM octave fix (log-band ODF + windowed-energy picker)](#m81)
 
 ---
 
@@ -587,6 +588,100 @@ The convergence test in `stream.rs::click_track_streams_to_lock` is the load-bea
 The next BPM-engine concern is M9 — waveform capture on Thru. M8 leaves the streaming infrastructure (ring tee at the audio thread, off-RT consumer thread, event-channel scaffold) wired up; M9 will fan-out a second consumer of the same tee ring for waveform decimation + rolling display. The "FX always in chain" rule from M7 means M15+ FX modules slot into the engine-side render path without touching either the BPM or waveform paths.
 
 Real-music validation continues to drive any hysteresis-tuning revisions; the constants in `confidence.rs` are exposed at the crate root so per-genre profiles or runtime adjustment have a flat API surface to land against without changing layer boundaries.
+
+<a id="m81"></a>
+## M8.1 — BPM octave fix (log-band ODF + windowed-energy picker)
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 1–2 days &nbsp;·&nbsp; **Actual:** 1 day
+
+A point-release follow-up to M8. The first thing real music exposed was that the single-band spectral-flux ODF M7.5 inherited from textbook beat-tracking systematically over-weights high-frequency content — hi-hats, ride cymbals, anything bright with lots of micro-onsets per beat. On a hip-hop track at 100 BPM (Diamond D, in the actual report) the hi-hat-on-every-8th pattern dominated the flux sum so completely that the autocorrelation peak at lag `P/2` beat the one at `P`, and the tracker locked at 200 BPM. The user explicitly rejected the obvious "constrain BPM range" workaround and asked for an algorithmic fix calibrated to "musical energy" that just works across reggae 65, hip-hop 90/100, and rolling drum-n-bass 174.
+
+The fix has three independent pieces that compose:
+
+### 1. Log-band-weighted spectral flux
+
+The pre-M8.1 ODF was a single sum: `flux[t] = Σ_b max(0, log(|X[t, b]|) - log(|X[t-1, b]|))` over all FFT bins. With ~ 100 bins above 4 kHz vs. ~ 10 bins below 200 Hz at 48 kHz / `FRAME_SIZE = 1024`, a single loud hi-hat onset contributed 10× the flux of a single loud kick onset purely on bin count — long before any genre-specific energy weighting. Multiplying that by 4 hi-hat hits per beat vs. 1 kick per beat got us a 40× hi-hat dominance over kicks in the ODF. The autocorrelation peak at the kick period (`P`) was, predictably, no contest against the peak at the hi-hat period (`P/2` or `P/4`).
+
+Pixel-precise fix: group FFT bins into 8 log-spaced bands from 30 Hz to 16 kHz, average flux *within* each band, then sum the 8 per-band means with equal weight into the final ODF. A kick band carrying 1 onset/beat now contributes the same energy as a hi-hat band carrying 8 onsets/beat. References: Goto & Muraoka (1994), Klapuri (2006), Davies & Plumbley (2007) all use multi-band flux for the same reason — this is well-trodden ground.
+
+Two related tunings landed at the same time, both from the synthetic single-click regression that uncovered them:
+
+- **Klapuri-2006 magnitude compression** (`onset.rs`). The pre-M8.1 ODF used `log(LOG_FLOOR + |X|)` magnitude compression, which is almost-linear near silence but compresses dynamic range at audible levels. After multi-banding, that "almost-linear near silence" was amplifying tiny FFT noise in decay tails enough to produce a phantom 200 BPM lock on a *single* synthetic click. Replaced with `ln(1 + λ · |X|)` (`λ = 1000`) which is strictly linear below ≈ 1 mV-scale magnitudes — anything below the audible floor stays below the ODF noise floor. The single-click confidence test recovered.
+
+- **`prev_log_mag` is now compressed-mag, not log-mag.** Trivial bookkeeping change but caused a debug session: storing the *post-compression* value preserves the invariant that `flux = compressed[t] - compressed[t-1]`. Storing the raw magnitude gave a `flux = log(1+λ|X[t]|) - |X[t-1]|` mixed-unit subtraction that made the ODF zero-floor non-trivial.
+
+### 2. Windowed local-energy tempo scoring + harmonic mean
+
+Discrete beat periods are almost never integer multiples of the ODF sample interval. For 140 BPM @ 48 kHz the true period is 40.18 ODF samples, so the spike pattern lands most consecutive-beat pairs in bin 40 with a few in bin 41 (and analogously bin 80 vs. 81 for skip-1 pairs). The *total* energy under each periodic peak is identical (as it must be for a periodic signal), but the distribution across bins differs — bin 40 has a sharp left shoulder while bin 80 has more even energy distribution.
+
+The previous picker (smoothed autocorrelation + harmonic *sum* + parabolic peak-height interpolation) was sensitive to this distribution asymmetry: parabolic vertex height depends on shoulder steepness, so it systematically overshoots at `2P` versus `P`. Combined with the smaller-L harmonic count bias (`SUM` has more terms when `L` is small, which is supposed to be a feature but plays against this overshoot), the picker would flip between `P` and `2P` depending on ODF length. The streaming tests at 48 kHz / 128 BPM oscillated between 128 and 64 BPM during convergence.
+
+The pickwise replacement is **windowed local energy** with a **harmonic mean**:
+
+- `local(lag) = Σ acf_raw[lag - 2 ..= lag + 2]` — 5-bin window sum at each integer lag candidate. Invariant to where the energy sits within the window: peaks that split across bins integrate to the same total as peaks that concentrate in one bin. The structural overshoot disappears.
+- Score is the harmonic *mean* (`score(L) = mean of local(k·L) for k = 1..=MAX_HARMONICS`), not sum. Mean removes the "more terms = bigger score" bias that broke hip-hop. `MAX_HARMONICS = 4` is the smallest count where every candidate in 60–200 BPM gets all 4 harmonics under `max_lag`, so the comparison stays apples-to-apples across the entire search range.
+- On pure pulse trains, `score(P)` and `score(2P)` come out identical to within float epsilon. A 1% tie window absorbs the residual noise from finite ODF length, and the smaller-lag tiebreak then defaults to the faster octave — which matches the user's "it just works" goal on ambiguous content and matches what M7.5 used to do via the (now-removed) biased-raw tiebreak.
+- Centroid refinement (energy-weighted bin position) recovers the underlying *fractional* lag from the integer-grid pick. This is what gets the 128 BPM / 174 BPM synthetic tests back inside their ±1 BPM acceptance windows after the integer-grid pick alone landed them on the wrong side of the bound.
+
+The full module-doc derivation lives in [`crates/dub-bpm/src/tempo.rs`](../crates/dub-bpm/src/tempo.rs). The short version: **integrate the peak, don't measure its height**, and **mean the harmonics, don't sum them**.
+
+### 3. Configurable `BpmRange` escape hatch (`--bpm-range MIN,MAX`)
+
+The M8.1 algorithm resolves the user's stated genre mix correctly out of the box, but there is an irreducible class of patterns where beat-tracking *cannot* in principle pick the correct octave without a tempo or genre prior:
+
+- **Dubstep** at 140 BPM is conventionally counted at the half-tempo wobble period (70 BPM). The autocorrelation legitimately peaks at lag `2P`; "DJs feel 140" is a culture fact, not a signal fact.
+- **K-S-backbeat drum-n-bass** (kick on 1+3, snare on 2+4 at 174 BPM) has equal-strength autocorrelation at the 1-beat (174 BPM) and 2-beat (87 BPM) periods, because every harmonic of lag 32 lands on a cross-instrument (K-S) alignment while every harmonic of lag 64 lands on a same-instrument (K-K, S-S) alignment. Both are real periodic structure; the algorithm cannot choose without a tempo prior.
+
+Both of these were acknowledged limitations in M8.1's `tempo.rs` module docs. The escape hatch is the [`BpmRange`](../crates/dub-bpm/src/lib.rs) type:
+
+- New `pub struct BpmRange { min: f64, max: f64 }` with validation (must fit inside the algorithm-supported `[MIN_BPM, MAX_BPM]` = 60–200 BPM window) and a `BpmRange::DEFAULT` for the wide range.
+- New `analyze_bpm_with_range(samples, sr, channels, range)` shadows the bare `analyze_bpm`; the latter calls the former with `BpmRange::DEFAULT`.
+- `BpmEstimator::with_range(sr, range)` shadows `BpmEstimator::new`; same defaulting.
+- `TrackerConfig` gains a `bpm_range: BpmRange` field; the canonical `TrackerConfig::at(sr)` builder fills it with `BpmRange::DEFAULT`.
+- `dub thru --bpm-range MIN,MAX` plumbs through to `TrackerConfig`. Invalid bounds error out at flag parsing.
+
+The acceptance test in `tempo.rs::narrow_range_constrains_search` pins the behaviour: a 120 BPM pulse train forced into a 60–90 BPM range must report the half-tempo (the only candidate in range), not the full tempo. So narrow ranges can be used to force half- or double-time detection for the genres that need it.
+
+The drum-n-bass synthetic fixture in `tests/genre_octave.rs::drum_n_bass_174_bpm_locks_at_174_not_87` was simplified from a K-S-backbeat pattern to a rolling-style kick-on-every-beat pattern (no snare backbeat) precisely because the K-S backbeat is in the irreducibly-ambiguous class. The original Amen-style fixture would fail any beat-tracker that doesn't carry a tempo prior, including aubio and BTrack — see the long comment in `genre_octave.rs` for the user-visible decision.
+
+### Test surface
+
+7 new fixture-driven tests across two integration files:
+
+- **`tests/genre_octave.rs` (new)** — the M8.1 acceptance gate. 4 tests:
+  - `hip_hop_100_bpm_locks_at_100_not_200` — the original regression report. Now passes.
+  - `hip_hop_90_bpm_locks_at_90_not_180` — for breadth.
+  - `drum_n_bass_174_bpm_locks_at_174_not_87` — rolling-style pattern; ensures the multi-band ODF doesn't introduce a *new* error on bass-heavy fast content.
+  - `reggae_one_drop_65_bpm_locks_at_65` — slow + sparse kick energy; ensures the slowest end of the search range still locks.
+- **`tests/known_bpm.rs`** — unchanged tests still pass (the M8.1 algorithm is a drop-in replacement). Specifically `click_track_works_at_44100_hz` (128 BPM) and `click_track_174_bpm_dnb` are the streaming-stability regression targets that drove most of the iteration.
+- **Synthetic fixtures** (`crates/dub-bpm/src/synthetic.rs`): new `drum_pattern_hip_hop`, `drum_pattern_drum_n_bass`, `drum_pattern_reggae_one_drop` generators with realistic kick (80 Hz), snare (filtered noise centered ~ 1.5 kHz), and hi-hat (HF burst centered ~ 6 kHz) timbres. 4 unit tests in `synthetic::tests` validate that the fixtures themselves carry the expected per-band energy distribution before feeding them to the picker. Decouples "the algorithm fails" from "the test fixture is broken" — a problem we hit during dev when the dnb fixture was structurally ambiguous and the algorithm was getting blamed.
+
+### Algorithmic notes worth keeping
+
+- **Why not biased autocorrelation.** A textbook fix for the half-tempo bias is to use biased ACF (`sum/N`) instead of unbiased (`sum/(N-lag)`). Biased ACF has a natural `(1 - lag/N)` taper that structurally favours smaller lag. Tried it. It re-introduced the hip-hop 2× bug, just from the other direction: hi-hats at lag `P/2` got the structural boost and over-took kicks at lag `P` by a few percent. The taper's slope (`P/N` over the lag range) didn't differentiate "musical octave preference" from "any smaller lag preference" — the former wants the result on real music, the latter is exactly what broke M7.5.
+
+- **Why not a wider tie tolerance instead of windowed-energy.** Tried 5%, 7%, 10%. Each made one regression class pass and another fail. The structural overshoot at `2P` over `P` grows with ODF length (it's a `Σ 1/(N-kP)` artifact), so no fixed tolerance is robust across the 2–60 second ODF lengths the streaming driver sees. Window-sum fixes the underlying invariance problem; the tolerance can then be tight (1%) and only catches the genuine pure-pulse-octave ties.
+
+- **Why `WINDOW = 2` (5-bin sum).** Worst-case fractional period has the bin-split energy in two adjacent bins; `W = 2` captures both with one quiet bin on each side. Adjacent harmonic windows touch but don't overlap as long as the lag spacing exceeds `2W + 1 = 5`; at `MAX_HARMONICS = 4` and `lag_min ≈ 29` (200 BPM at our typical ODF rate), the 4th-harmonic windows around `4·lo` and `4·(lo+1)` are exactly 4 lag apart and 5 wide — touching but not overlapping. (Slowest tempos near `lag_max` only fit 1–2 harmonics anyway.) Wider windows would start cross-contaminating between candidates.
+
+- **Centroid vs. parabolic for sub-bin refinement.** Parabolic vertex height is shoulder-asymmetry-sensitive (which is what we just designed out of the score); parabolic vertex *position* is too, for the same reason. Centroid is the energy-weighted mean position over the same window the score sums; it's symmetric in its handling of bin distribution, and it evaluates analytically to the underlying continuous lag for any bin-split distribution of periodic-peak energy.
+
+### Acceptance
+
+1. `cargo test -p dub-bpm` passes the new genre_octave.rs gate (4 tests) plus all pre-M8.1 tests in `confidence`/`tracker`/`stream`/`known_bpm`/`wav_pipeline`.
+2. The previously-failing real-track report (`100 BPM hip-hop detected as 200 BPM`) now locks at the correct octave on the same input.
+3. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+4. `cargo test --workspace` is green.
+5. `dub thru --bpm-range MIN,MAX` parses and constrains; bare `dub thru` defaults to 60–200 BPM and works without the flag.
+
+### Forward link
+
+M8.1 closes the M8 acceptance loop ("user's stated genre mix locks at the correct octave"). The remaining BPM work is the tracker-level concerns M9+ will surface:
+
+- **Hysteresis tuning on real music.** The `confidence.rs` constants are still M7.5-era defaults. Real-music data (especially slower, sparse genres like dub or reggae one-drop) will exercise `LOCK_CONSECUTIVE`, `LOCK_TOLERANCE_BPM`, and `LOST_LOCKED_CONSECUTIVE` more thoroughly than M8.1's synthetic gates do.
+- **Per-genre priors.** The K-S backbeat half-tempo case is the simplest example of "needs a tempo prior to resolve correctly." Future work might surface this as a "feel" toggle in the UI (`140 / 70` cycle button on the tempo readout), or as a learned prior from the user's library, or as a genre-tag-driven preset — UX-level choices that M8.1's range flag deliberately doesn't pre-judge.
+
+The algorithmic floor is set: M8.1 is what the picker looks like; future tuning is data-driven.
 
 ---
 

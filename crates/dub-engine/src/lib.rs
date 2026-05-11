@@ -2287,6 +2287,7 @@ mod tests {
                     sample_rate: 48_000,
                     channels: 1,
                     analysis_period_samples: 48_000,
+                    bpm_range: dub_bpm::BpmRange::DEFAULT,
                 },
             )
             .expect("attach with bpm");
@@ -2309,6 +2310,7 @@ mod tests {
             sample_rate: 44_100,
             channels: 1,
             analysis_period_samples: 44_100,
+            bpm_range: dub_bpm::BpmRange::DEFAULT,
         };
         let err = handle
             .attach_thru_source_with_bpm_tracking(0, rx, thru_cfg(sr), bad_tracker)
@@ -2331,6 +2333,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 1,
             analysis_period_samples: 0,
+            bpm_range: dub_bpm::BpmRange::DEFAULT,
         };
         let err = handle
             .attach_thru_source_with_bpm_tracking(0, rx, thru_cfg(sr), bad_tracker)

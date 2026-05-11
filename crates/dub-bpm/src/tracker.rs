@@ -39,7 +39,7 @@
 
 use crate::confidence::{ConfidenceTracker, TrackerEvent, TrackerState};
 use crate::estimator::{BpmEstimator, BpmEstimatorError};
-use crate::BpmEstimate;
+use crate::{BpmEstimate, BpmRange};
 
 /// Construction-time configuration for [`BpmTracker`].
 ///
@@ -63,17 +63,21 @@ pub struct TrackerConfig {
     /// the hysteresis counters (which are tuned in *recompute
     /// units*). Larger values save CPU at the cost of slower lock.
     pub analysis_period_samples: u32,
+    /// Inclusive BPM range to search within. Defaults to
+    /// [`BpmRange::DEFAULT`] (60–200 BPM).
+    pub bpm_range: BpmRange,
 }
 
 impl TrackerConfig {
     /// Sensible default config at the given sample rate: stereo
-    /// input, recompute once per second.
+    /// input, recompute once per second, full 60–200 BPM range.
     #[must_use]
     pub fn at(sample_rate: u32) -> Self {
         Self {
             sample_rate,
             channels: 2,
             analysis_period_samples: sample_rate.max(1),
+            bpm_range: BpmRange::DEFAULT,
         }
     }
 }
@@ -130,7 +134,7 @@ impl BpmTracker {
         if cfg.analysis_period_samples == 0 {
             return Err(TrackerError::ZeroAnalysisPeriod);
         }
-        let estimator = BpmEstimator::new(cfg.sample_rate)?;
+        let estimator = BpmEstimator::with_range(cfg.sample_rate, cfg.bpm_range)?;
         Ok(Self {
             estimator,
             confidence: ConfidenceTracker::new(),
@@ -248,6 +252,7 @@ mod tests {
             sample_rate: sr,
             channels: 1,
             analysis_period_samples: sr,
+            bpm_range: BpmRange::DEFAULT,
         }
     }
 
@@ -277,6 +282,7 @@ mod tests {
             sample_rate: 0,
             channels: 1,
             analysis_period_samples: 1,
+            bpm_range: BpmRange::DEFAULT,
         };
         assert!(matches!(
             BpmTracker::new(bad),
@@ -356,6 +362,7 @@ mod tests {
             sample_rate: sr,
             channels: 2,
             analysis_period_samples: sr,
+            bpm_range: BpmRange::DEFAULT,
         };
         let mut t = BpmTracker::new(cfg).unwrap();
         for chunk in stereo.chunks(4096) {
@@ -429,6 +436,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 1,
             analysis_period_samples: 0,
+            bpm_range: BpmRange::DEFAULT,
         };
         assert!(matches!(
             BpmTracker::new(cfg),
@@ -446,6 +454,7 @@ mod tests {
             sample_rate: sr,
             channels: 1,
             analysis_period_samples: sr / 4,
+            bpm_range: BpmRange::DEFAULT,
         };
         let mut t = BpmTracker::new(cfg).unwrap();
         for chunk in audio.chunks(2048) {

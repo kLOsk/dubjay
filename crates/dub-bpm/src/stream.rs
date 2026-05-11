@@ -240,6 +240,7 @@ mod tests {
             sample_rate: sr,
             channels: 1,
             analysis_period_samples: sr,
+            bpm_range: crate::BpmRange::DEFAULT,
         }
     }
 
@@ -382,6 +383,7 @@ mod tests {
             sample_rate: 0,
             channels: 1,
             analysis_period_samples: 1,
+            bpm_range: crate::BpmRange::DEFAULT,
         };
         assert!(BpmStream::spawn(rx, bad).is_err());
     }

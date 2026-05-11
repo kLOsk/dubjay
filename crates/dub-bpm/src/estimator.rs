@@ -14,7 +14,7 @@
 
 use crate::onset::OnsetDetector;
 use crate::tempo::estimate_tempo;
-use crate::{BpmEstimate, HOP_SIZE};
+use crate::{BpmEstimate, BpmRange, HOP_SIZE};
 
 /// Errors that can occur while constructing a streaming estimator.
 #[derive(Debug, thiserror::Error)]
@@ -38,23 +38,37 @@ pub struct BpmEstimator {
     detector: OnsetDetector,
     odf_sample_rate: f64,
     last_estimate: Option<BpmEstimate>,
+    bpm_range: BpmRange,
 }
 
 impl BpmEstimator {
-    /// Construct a fresh estimator at the given audio sample rate.
+    /// Construct a fresh estimator at the given audio sample rate
+    /// using the default 60–200 BPM search range.
     ///
     /// # Errors
     ///
     /// Returns [`BpmEstimatorError::ZeroSampleRate`] if `sample_rate`
     /// is zero.
     pub fn new(sample_rate: u32) -> Result<Self, BpmEstimatorError> {
+        Self::with_range(sample_rate, BpmRange::DEFAULT)
+    }
+
+    /// Like [`Self::new`] but constrains the tempo search to
+    /// `bpm_range`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BpmEstimatorError::ZeroSampleRate`] if `sample_rate`
+    /// is zero.
+    pub fn with_range(sample_rate: u32, bpm_range: BpmRange) -> Result<Self, BpmEstimatorError> {
         if sample_rate == 0 {
             return Err(BpmEstimatorError::ZeroSampleRate);
         }
         Ok(Self {
-            detector: OnsetDetector::new(),
+            detector: OnsetDetector::new(sample_rate),
             odf_sample_rate: f64::from(sample_rate) / HOP_SIZE as f64,
             last_estimate: None,
+            bpm_range,
         })
     }
 
@@ -99,7 +113,8 @@ impl BpmEstimator {
     ///
     /// [`process`]: Self::process
     pub fn recompute(&mut self) {
-        if let Some(est) = estimate_tempo(self.detector.odf(), self.odf_sample_rate) {
+        if let Some(est) = estimate_tempo(self.detector.odf(), self.odf_sample_rate, self.bpm_range)
+        {
             self.last_estimate = Some(est);
         }
     }

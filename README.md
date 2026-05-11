@@ -118,6 +118,7 @@ detailed design history for everything shipped lives in [`docs/SHIPPED.md`](docs
 | **M7** | ✅ shipped | **Thru Mode** — per-deck `ThruSource` (single always-on software passthrough) integrated into `Engine::render_routed`; command-channel attach with third trash channel for `Box<ThruSource>`; new `dub thru` CLI sharing M5.5.2's routing. Constant ~2.7 ms one-way latency, independent of future FX state (Option A in-chain bypass). |
 | **M7.5** | ✅ shipped | **BPM engine + offline analysis.** New `dub-bpm` crate (pure-Rust spectral-flux + harmonic-summed autocorrelation, fractional-step search). `BpmEstimator` streaming core + `analyze_bpm` offline driver + `Track::bpm` field on `dub-io::Track`. Synthetic clicks at 60–174 BPM detected within ±1 BPM. Aubio was the original plan; pivoted to pure-Rust after recon — see [`docs/SHIPPED.md#m75`](docs/SHIPPED.md#m75). |
 | **M8** | ✅ shipped | **Auto-BPM on Thru — streaming driver.** `BpmTracker` (estimator + hysteresis state machine + throttled search) + `BpmStream` (per-deck off-RT analysis thread + lifecycle). Audio-thread mono-downmix tee on `ThruSource` (alloc-free). `EngineHandle::attach_thru_source_with_bpm_tracking` bundles tee + thread spawn. `dub thru` prints `searching → tentative → locked` transitions to stderr by default (`--no-bpm-track` to disable). See [`docs/SHIPPED.md#m8`](docs/SHIPPED.md#m8). |
+| **M8.1** | ✅ shipped | **BPM octave fix — log-band ODF + windowed-energy picker.** Replaced single-band spectral flux with 8-band log-spaced flux, harmonic-sum with harmonic-mean over 4 multiples, parabolic-vertex peak height with windowed local-energy (5-bin sum, invariant to bin-split asymmetry), and added centroid sub-bin refinement. Fixes the M8 hip-hop 2× regression (100 BPM detected as 200 BPM). Locks reggae 65 / hip-hop 90/100 / rolling dnb 174 at the correct octave out of the box. New `BpmRange` API + `dub thru --bpm-range MIN,MAX` escape hatch for irreducibly-ambiguous genres (dubstep 140 / 70). See [`docs/SHIPPED.md#m81`](docs/SHIPPED.md#m81). |
 | **M9** | ◻ planned | Live waveform capture (Thru) |
 | **M10** | ◻ planned | Waveform UI (Metal, 60 fps during scratch) |
 
@@ -137,7 +138,7 @@ dub/                                 repo root (workspace)
 │   ├── dub-io/                      symphonia-based decoders (everything in RAM)
 │   ├── dub-timecode/                Serato CV02 + Traktor MK1/MK2 decoder (clean-room)
 │   ├── dub-thru/                    Thru-mode source-detection classifier (§5.1.1, placeholder)
-│   ├── dub-bpm/                     M7.5 + M8 — BpmEstimator, BpmTracker, BpmStream (pure-Rust, shipped)
+│   ├── dub-bpm/                     M7.5 + M8 + M8.1 — BpmEstimator, BpmTracker, BpmStream, log-band ODF (pure-Rust, shipped)
 │   ├── dub-fingerprint/             Chromaprint FFI (v1.1, placeholder)
 │   ├── dub-library/                 SQLite + library imports (M11/M12, placeholder)
 │   ├── dub-controller/              HID/MIDI abstractions (v1.x+, placeholder)
