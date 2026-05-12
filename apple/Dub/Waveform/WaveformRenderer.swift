@@ -192,6 +192,17 @@ final class WaveformRenderer: NSObject {
     /// broadband chunks).
     private var lastSeenBandPeaksLen: UInt64 = 0
 
+    /// Cached `peaks_generation()` from the previous poll. When the
+    /// engine swaps a deck's `PeakSource` (Thru → File on track
+    /// load, File → File on reload) this counter bumps; the
+    /// renderer responds by wiping its ring buffer + cadence cache
+    /// before re-ingesting from chunk 0. Without this the
+    /// length-monotonicity heuristic in `ingestNewChunks` silently
+    /// no-ops the post-swap path (the new source's chunk count is
+    /// smaller than what we last observed under the previous
+    /// source) and the renderer keeps drawing stale data forever.
+    private var lastSeenPeaksGeneration: UInt64 = 0
+
     /// Cached `samples_per_peak_chunk` and `samples_per_band_chunk`
     /// values, read once on engine startup. Pinned at the M9
     /// defaults (64 / 512) for now but read through the FFI so
@@ -322,6 +333,13 @@ final class WaveformRenderer: NSObject {
         totalBandChunksAppended = 0
         lastSeenPeaksLen = 0
         lastSeenBandPeaksLen = 0
+        lastSeenPeaksGeneration = 0
+        // Force a re-snapshot of the per-source chunk-cadence on the
+        // next ingest so a Thru → File swap (different sample
+        // rates → different `samples_per_*_chunk`) doesn't keep
+        // computing time math against the previous source's cadence.
+        samplesPerPeakChunk = 64
+        samplesPerBandChunk = 512
         // Zeroing both buffers means the next frame after a restart
         // shows silence at the right edge of the viewport instead
         // of stale audio.
@@ -354,6 +372,22 @@ final class WaveformRenderer: NSObject {
 
         let releaseSemaphore: () -> Void = { [weak self] in
             self?.inflightSemaphore.signal()
+        }
+
+        // 0. Detect a `PeakSource` swap on this deck. When the
+        //    engine swaps Thru → File (drag-and-drop load) or
+        //    File → File (reload) the per-deck generation counter
+        //    bumps; we wipe the ring and re-ingest the new source
+        //    from chunk 0. Doing this BEFORE the ingest pull is
+        //    critical: the new source's chunk count is typically
+        //    smaller than what we last observed from Thru, so the
+        //    length-monotonicity check in `ingestNewChunks` would
+        //    otherwise silently no-op and the renderer would keep
+        //    drawing stale Thru capture forever.
+        let currentGeneration = engine.peaksGeneration(deckIdx: deckIdx)
+        if currentGeneration != lastSeenPeaksGeneration {
+            reset()
+            lastSeenPeaksGeneration = currentGeneration
         }
 
         // 1. Pull any newly-available chunks from the engine

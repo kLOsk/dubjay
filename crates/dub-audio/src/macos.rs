@@ -21,7 +21,7 @@ use coreaudio::audio_unit::audio_format::LinearPcmFlags;
 use coreaudio::audio_unit::macos_helpers::{
     audio_unit_from_device_id_uninitialized, get_audio_device_ids_for_scope,
     get_audio_device_supports_scope, get_default_device_id, get_device_id_from_name,
-    get_device_name, set_device_sample_rate,
+    get_device_name, get_device_transport_type, set_device_sample_rate,
 };
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::stream_format::StreamFormat;
@@ -730,6 +730,81 @@ pub fn list_input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
         });
     }
     Ok(out)
+}
+
+/// Return `true` iff at least one **external** audio interface with
+/// input streams is currently attached to the system. Used by the
+/// Apple shell's auto-detect (PRD §3.1) to decide whether to boot
+/// into Performance / Timecode mode (external interface present)
+/// or Track Preparation / output-only mode (no external interface).
+///
+/// **The whole point of this helper is to keep the app off the
+/// microphone-permission path when no external interface is
+/// plugged in.** macOS Sonoma / Sequoia will surface the mic-
+/// permission prompt at the first input-related interaction with
+/// the audio HAL when the app declares `NSMicrophoneUsageDescription`;
+/// enumerating input devices via [`list_input_devices`] (which
+/// reads device names, channel counts, etc. on every input-capable
+/// device — including the built-in mic) is exactly such an
+/// interaction. This probe queries only device-level *transport-
+/// type* metadata + input-scope availability, both of which are
+/// permission-safe, so the prompt only fires later when we
+/// actually open an input AudioUnit on an external interface.
+///
+/// "External" is defined as transport type ∈ {USB, Thunderbolt,
+/// FireWire, PCI, AVB} — the bus types Serato SL3 / NI Audio 6 /
+/// Pioneer DJM-S DVS interfaces actually use. Bluetooth, HDMI,
+/// AirPlay, and Continuity Capture are explicitly *not* external
+/// for this purpose: they're not DVS interfaces and treating them
+/// as such would still pull the user onto the mic-permission path
+/// with no benefit. Aggregate / Virtual / Unknown transport types
+/// are skipped for the same reason — they're never used as DVS
+/// inputs.
+///
+/// Returns `false` on any HAL enumeration error (logged via
+/// `eprintln!`); the conservative fallback is "no external
+/// interface", which routes the app into Prep mode and avoids the
+/// permission prompt.
+#[must_use]
+pub fn has_external_audio_interface() -> bool {
+    let ids = match get_audio_device_ids_for_scope(Scope::Global) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("dub-audio: has_external_audio_interface: enumerate failed: {e}");
+            return false;
+        }
+    };
+    for id in ids {
+        if !get_audio_device_supports_scope(id, Scope::Input).unwrap_or(false) {
+            continue;
+        }
+        let Ok(transport) = get_device_transport_type(id) else {
+            continue;
+        };
+        if is_external_transport(transport) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` for transport-type constants that identify an
+/// external DJ-grade audio interface bus. See
+/// [`has_external_audio_interface`] for rationale.
+fn is_external_transport(transport: u32) -> bool {
+    use objc2_core_audio::{
+        kAudioDeviceTransportTypeAVB, kAudioDeviceTransportTypeFireWire,
+        kAudioDeviceTransportTypePCI, kAudioDeviceTransportTypeThunderbolt,
+        kAudioDeviceTransportTypeUSB,
+    };
+    matches!(
+        transport,
+        t if t == kAudioDeviceTransportTypeUSB
+            || t == kAudioDeviceTransportTypeThunderbolt
+            || t == kAudioDeviceTransportTypeFireWire
+            || t == kAudioDeviceTransportTypePCI
+            || t == kAudioDeviceTransportTypeAVB
+    )
 }
 
 /// Query the system's current default *input* device (System Settings

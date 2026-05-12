@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
@@ -63,7 +64,19 @@ uniffi::setup_scaffolding!();
 ///      `track_info`. `peaks_extend` / `peaks_len` / etc. now read
 ///      from either the Thru analysis thread or the offline-decoded
 ///      peak buffer transparently via the per-deck `PeakSource` enum.
-pub const FFI_VERSION: u32 = 5;
+/// `6`: M10.5b added [`DubEngine::peaks_generation`] so the renderer
+///      can detect per-deck `PeakSource` swaps (Thru → File on load,
+///      File → File on reload) and reset its ring buffer + cadence
+///      cache. Without this, the renderer's length-monotonicity
+///      heuristic gets stuck rendering stale Thru chunks after a
+///      drag-and-drop load in Timecode mode.
+/// `7`: M10.5b polish: added [`DubEngine::has_external_audio_interface`]
+///      so the Apple shell's auto-detect can decide Timecode-vs-Prep
+///      mode at launch *without* enumerating input devices (which
+///      would trip macOS's microphone-permission prompt on the
+///      built-in mic). Probes transport-type metadata only — no AU
+///      instantiation, no input-property reads.
+pub const FFI_VERSION: u32 = 7;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -157,6 +170,18 @@ pub enum EngineError {
 #[derive(uniffi::Object)]
 pub struct DubEngine {
     state: Mutex<EngineState>,
+    /// Per-deck monotonic generation counter for the `PeakSource`
+    /// slot. Bumps every time the slot is *assigned* a new source
+    /// (Thru session start, `load_track` swap, etc.). Lives on
+    /// `DubEngine` (not `RunningState`) so the value survives
+    /// stop/start cycles — a Thru→Prep restart must trigger a
+    /// renderer reset, but `RunningState` is dropped on stop so a
+    /// counter inside it would reset to 0 and the renderer might
+    /// miss the transition.
+    ///
+    /// The Swift renderer reads this via `peaks_generation(deck)`
+    /// and `reset()`s its ring + cadence cache on every change.
+    peak_generation_seq: [AtomicU64; 2],
 }
 
 /// Internal state machine for the engine.
@@ -326,6 +351,25 @@ struct RunningState {
     sample_rate: u32,
 }
 
+impl DubEngine {
+    /// Bump `peak_generation_seq[deck_idx]` by one with `Release`
+    /// ordering. Internal helper called at every `PeakSource`
+    /// assignment site so the Swift renderer can detect source
+    /// swaps in a single shared signal regardless of which mutator
+    /// (Thru start, two-deck Thru start, `load_track`) ran.
+    ///
+    /// Out-of-range indices are silently ignored — there are only
+    /// ever two slots, and the caller has already validated the
+    /// index via `deck_idx_to_usize` (or knows it statically). The
+    /// silent no-op keeps every call site free of `unwrap`s on
+    /// what is structurally a never-fail lookup.
+    fn bump_peak_generation(&self, deck_idx: usize) {
+        if let Some(a) = self.peak_generation_seq.get(deck_idx) {
+            a.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 #[uniffi::export]
 impl DubEngine {
     /// Construct a fresh engine handle. The audio system is not
@@ -335,6 +379,7 @@ impl DubEngine {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(EngineState::Stopped),
+            peak_generation_seq: [AtomicU64::new(0), AtomicU64::new(0)],
         })
     }
 
@@ -356,6 +401,29 @@ impl DubEngine {
                 Vec::new()
             }
         }
+    }
+
+    /// Return `true` iff at least one external audio interface
+    /// with input streams is currently attached to the system.
+    ///
+    /// Used by the Apple shell's auto-detect on launch (PRD §3.1)
+    /// to decide between Performance / Timecode mode (external
+    /// interface present) and Track Preparation / output-only
+    /// mode (none present). Critically, this probe does **not**
+    /// trip macOS's microphone-permission prompt: it queries
+    /// transport-type metadata and input-scope availability only,
+    /// without ever touching device names, channel counts, or AU
+    /// instantiation. The mic prompt only fires later when (and
+    /// if) the user actually starts a Timecode session against an
+    /// external interface.
+    ///
+    /// See [`dub_audio::has_external_audio_interface`] for the
+    /// exhaustive definition of "external" (USB / Thunderbolt /
+    /// FireWire / PCI / AVB; Bluetooth / HDMI / AirPlay /
+    /// Continuity Capture are not external for this purpose).
+    #[must_use]
+    pub fn has_external_audio_interface(&self) -> bool {
+        dub_audio::has_external_audio_interface()
     }
 
     /// Begin a Thru session: open the input device by name on the
@@ -388,6 +456,7 @@ impl DubEngine {
 
         let running = start_thru_inner(&device_name, &channels, None)?;
         *state = EngineState::Running(Box::new(running));
+        self.bump_peak_generation(0);
         Ok(())
     }
 
@@ -434,6 +503,8 @@ impl DubEngine {
 
         let running = start_thru_inner(&device_name, &channels_a, Some(&channels_b))?;
         *state = EngineState::Running(Box::new(running));
+        self.bump_peak_generation(0);
+        self.bump_peak_generation(1);
         Ok(())
     }
 
@@ -565,6 +636,7 @@ impl DubEngine {
                 .unwrap_or(u32::MAX),
             samples_per_band_chunk: u32::try_from(samples_per_band_chunk).unwrap_or(u32::MAX),
         }));
+        self.bump_peak_generation(idx);
 
         Ok(())
     }
@@ -719,6 +791,34 @@ impl DubEngine {
             channels: u32::from(track.channels()),
             bpm: track.bpm(),
         })
+    }
+
+    /// Monotonic generation counter for the deck's [`PeakSource`].
+    /// Bumps every time the slot is *assigned* (Thru session start,
+    /// `load_track` swap, engine restart, etc.). Survives stop/
+    /// start cycles — the counter lives on `DubEngine` itself, not
+    /// inside `RunningState`. Returns the last observed value (or
+    /// `0` if the engine has never been started) when `deck_idx`
+    /// is out of range.
+    ///
+    /// The Swift renderer compares this against its cached value
+    /// each frame; a mismatch means the source was replaced, and the
+    /// renderer must `reset()` its ring buffer + cadence caches
+    /// before re-ingesting from `start_idx = 0`. Without this signal
+    /// the renderer keeps rendering stale chunks from the previous
+    /// source after a Thru → File swap, because `peaks_len` may
+    /// regress (a 3-minute MP3's broadband peak count is smaller
+    /// than the Thru ring's running length after a few minutes of
+    /// capture) and the length-monotonicity heuristic silently no-
+    /// ops the ingest path forever.
+    #[must_use]
+    pub fn peaks_generation(&self, deck_idx: u64) -> u64 {
+        let Ok(idx) = deck_idx_to_usize(deck_idx) else {
+            return 0;
+        };
+        self.peak_generation_seq
+            .get(idx)
+            .map_or(0, |a| a.load(Ordering::Acquire))
     }
 
     /// Number of broadband [`PeakChunk`]s captured so far on `deck_idx`.
@@ -1176,12 +1276,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffi_version_is_five_after_m105_file_playback() {
+    fn ffi_version_is_seven_after_external_interface_probe() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
         // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
         // (start_engine, load_track, play, pause, seek, position,
-        // track_info, PositionInfo + TrackInfo records).
-        assert_eq!(FFI_VERSION, 5);
+        // track_info, PositionInfo + TrackInfo records),
+        // M10.5b 5→6 (peaks_generation),
+        // M10.5b polish 6→7 (has_external_audio_interface).
+        assert_eq!(FFI_VERSION, 7);
+    }
+
+    #[test]
+    fn peak_generation_starts_at_zero_when_stopped() {
+        let engine = DubEngine::new();
+        assert_eq!(engine.peaks_generation(0), 0);
+        assert_eq!(engine.peaks_generation(1), 0);
+        assert_eq!(engine.peaks_generation(99), 0);
     }
 
     #[test]

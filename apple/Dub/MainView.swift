@@ -179,8 +179,15 @@ final class WaveformAppModel: ObservableObject {
 
     init() {
         self.engine = DubEngine()
-        refreshDevices()
         applyAutoDetect()
+        // Only enumerate input devices when we actually need them
+        // (Timecode mode). Prep mode never touches the input HAL,
+        // which is the whole point of the auto-detect — the user
+        // never sees a microphone-permission prompt on a Mac with
+        // no external interface plugged in.
+        if engineMode == .timecode {
+            refreshDevices()
+        }
     }
 
     deinit {
@@ -196,38 +203,56 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    /// Pick a default `engineMode` based on what's plugged in. M10.5b
-    /// heuristic: if the system reports *any* input device beyond the
-    /// built-in mic (commonly named "MacBook Pro Microphone",
-    /// "External Microphone", or "Built-in Microphone"), assume
-    /// Timecode mode; otherwise default to Prep mode (file-only).
+    /// Pick a default `engineMode` based on what's plugged in.
     ///
-    /// This is intentionally crude — properly enumerating input
-    /// channel counts requires an FFI extension we defer to M10.5b's
-    /// follow-up. The user can override in Preferences either way.
+    /// **Permission-safe.** Uses [`DubEngine.hasExternalAudioInterface`]
+    /// which queries CoreAudio transport-type metadata only — no
+    /// AudioUnit instantiation, no device-name reads on input-
+    /// capable devices, nothing that would tickle macOS's
+    /// microphone-permission TCC layer. PRD §3.1: external
+    /// interface present → Performance / Timecode; none present →
+    /// Track Preparation / output-only (no input touched at all).
+    ///
+    /// "External" here is defined by transport type — USB,
+    /// Thunderbolt, FireWire, PCI, AVB — i.e. the bus types DVS
+    /// interfaces actually use. The previous heuristic (string-
+    /// match device names against built-in-mic patterns) called
+    /// `listInputDevices` which itself triggered the TCC prompt on
+    /// macOS 14+; that was the regression the user reported in
+    /// M10.5b shakedown.
     private func applyAutoDetect() {
-        let nonBuiltin = availableDevices.filter { !isLikelyBuiltinMic($0) }
-        engineMode = nonBuiltin.isEmpty ? .prep : .timecode
-    }
-
-    private func isLikelyBuiltinMic(_ name: String) -> Bool {
-        let lower = name.lowercased()
-        return lower.contains("built-in") || lower.contains("internal")
-            || lower.contains("macbook") || lower.contains("imac")
-            || lower.contains("mac mini") || lower.contains("mac studio")
+        engineMode = engine.hasExternalAudioInterface() ? .timecode : .prep
     }
 
     // MARK: Engine lifecycle
 
-    /// Reapply the current configuration to the engine. Used when
-    /// the user changes mode in Preferences — we stop the running
-    /// session, then start a fresh one in the new mode. Stays a
-    /// no-op when the engine is stopped (so a mode toggle in
-    /// Preferences before the first Start doesn't surprise the
-    /// user by spinning the engine up on its own).
-    func restartIfRunning() {
-        guard isRunning else { return }
-        stop()
+    /// Apply the current Preferences config to the engine — start
+    /// it if stopped, restart it if running. This is the single
+    /// engine-lifecycle entry point used everywhere in M10.5b:
+    /// `MainView.onAppear` calls it for the cold-boot auto-start,
+    /// and every Preferences `onChange` (mode / device / channels)
+    /// calls it so the new config takes effect with zero clicks.
+    ///
+    /// Use `stop()` for the explicit user-stop path. Don't call
+    /// `start()` directly anymore — `applyConfig` is the only
+    /// caller that knows whether a restart-vs-fresh-start is needed.
+    func applyConfig() {
+        // Just-in-time device enumeration. The auto-detect at init
+        // *intentionally* skipped `refreshDevices()` when Prep mode
+        // was picked, so the user never saw the mic-permission prompt
+        // on a Mac with no external interface. The moment the user
+        // (or some onChange handler) selects Timecode mode, we need
+        // a device list — call `refreshDevices()` here so the
+        // Preferences picker has something to show. This is the
+        // explicit-user-action point where macOS's TCC prompt may
+        // fire, and that's the right time for it.
+        if engineMode == .timecode && availableDevices.isEmpty {
+            refreshDevices()
+        }
+        let wasRunning = isRunning
+        if wasRunning {
+            stop()
+        }
         start()
     }
 
@@ -359,6 +384,15 @@ final class WaveformAppModel: ObservableObject {
     // MARK: Master deck (PRD §6.4)
 
     private func recomputeMaster() {
+        // Single-deck modes (Prep, single-channel Timecode) only
+        // ever have deck A. Pinning master to .a keeps the MASTER
+        // chip stable and stops the non-master Space-load logic
+        // from ever picking the non-existent deck B.
+        guard twoDeckMode else {
+            if masterDeck != .a { masterDeck = .a }
+            stickyMaster = .a
+            return
+        }
         let aPlaying = deckA.isPlaying
         let bPlaying = deckB.isPlaying
         let newMaster: DeckSide
@@ -424,15 +458,26 @@ final class WaveformAppModel: ObservableObject {
         }
     }
 
-    /// Load the FS-browser selection into the non-master, stopped
+    /// Load the FS-browser selection into the appropriate target
     /// deck. PRD §5.5 — bound to `Space` in `MainView`.
-    func loadBrowserSelectionIntoNonMaster() {
-        guard isRunning else { return }
+    ///
+    /// Target deck selection:
+    /// * Two-deck (Timecode + non-empty deck-B channels) → the
+    ///   non-master deck.
+    /// * Single-deck (Timecode single-channel **or** Prep) → deck
+    ///   A. Prep mode by definition has no deck B, and single-
+    ///   channel Timecode never spins one up, so "non-master" isn't
+    ///   meaningful and Space loads onto the only deck that exists.
+    func loadBrowserSelectionIntoTargetDeck() {
+        guard isRunning else {
+            surfaceError("Engine not running.")
+            return
+        }
         guard let url = browserSelection else {
             surfaceError("Select a file in the browser first.")
             return
         }
-        let candidate = nonMasterSide()
+        let candidate = spaceLoadTarget()
         let target = state(for: candidate)
         if target.isPlaying {
             flashLoadError(side: candidate)
@@ -441,11 +486,10 @@ final class WaveformAppModel: ObservableObject {
         _ = loadTrack(side: candidate, url: url)
     }
 
-    /// Returns the deck that is *not* the master — Space-load
-    /// targets this one (PRD §6.4). When `masterDeck == nil` (e.g.
-    /// just after launch, before Start), fall back to `stickyMaster`
-    /// so the load still picks a sane deck.
-    private func nonMasterSide() -> DeckSide {
+    /// The deck Space-load targets in the current engine config.
+    /// See `loadBrowserSelectionIntoTargetDeck` for the rules.
+    private func spaceLoadTarget() -> DeckSide {
+        guard twoDeckMode else { return .a }
         let m = masterDeck ?? stickyMaster
         return m == .a ? .b : .a
     }
@@ -593,16 +637,27 @@ struct MainView: View {
                     showingPreferences: $showingPreferences,
                     model: model)
             )
+            // M10.5b "no Apply button" UX: every Preferences-driven
+            // config change auto-applies. `applyConfig()` starts the
+            // engine when stopped and restarts it when running, so
+            // the user only ever needs to *change* a setting; the
+            // engine catches up on its own.
             .onChange(of: model.engineMode) { _ in
-                // Mode toggles in Preferences should apply
-                // immediately — no Stop-then-Start dance. If the
-                // engine isn't running, this is a no-op; the user's
-                // next Start uses the new mode.
-                model.restartIfRunning()
+                model.applyConfig()
+            }
+            .onChange(of: model.selectedDevice) { _ in
+                model.applyConfig()
             }
             .onAppear {
+                // Cold-boot auto-start: if a valid config exists for
+                // the auto-detected mode (Prep always works; Timecode
+                // works as long as `selectedDevice` is set), spin up
+                // the engine. If start fails (no device + Timecode
+                // selected), `surfaceError` will display the reason
+                // in the status strip and the user can open
+                // Preferences from the gear icon to fix it.
                 if !model.isRunning {
-                    showingPreferences = true
+                    model.applyConfig()
                 }
             }
     }
@@ -631,7 +686,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         context.coordinator.install(
             onSpace: {
                 Task { @MainActor in
-                    model.loadBrowserSelectionIntoNonMaster()
+                    model.loadBrowserSelectionIntoTargetDeck()
                 }
                 return true
             },

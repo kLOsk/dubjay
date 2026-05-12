@@ -142,52 +142,53 @@ struct FileBrowserView: View {
     @ViewBuilder
     private func row(for entry: BrowserEntry) -> some View {
         let isSelected = (model.browserSelection == entry.url) && !entry.isDirectory
-        Button {
-            if entry.isDirectory {
-                currentDirectory = entry.url
-                reload()
-            } else {
-                model.browserSelection = entry.url
+        // M10.5b: do NOT wrap the row in a `Button`. `Button` claims
+        // the primary press gesture before `.draggable` can install
+        // its drag recogniser, which is why drag-out from this
+        // browser was silently failing while Finder drag-in (no
+        // Button in the chain) worked. Tapping is handled by
+        // `.onTapGesture` *after* `.draggable`, so SwiftUI tries
+        // drag first and falls through to tap when the pointer
+        // hasn't moved.
+        HStack(spacing: DubSpacing.md) {
+            Image(systemName: entry.isDirectory ? "folder" : "waveform")
+                .foregroundStyle(
+                    entry.isDirectory
+                        ? DubColor.textSecondary
+                        : DubColor.textPrimary
+                )
+            Text(entry.displayName)
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+            if !entry.isDirectory {
+                Text(entry.ext)
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
             }
-        } label: {
-            HStack(spacing: DubSpacing.md) {
-                Image(systemName: entry.isDirectory ? "folder" : "waveform")
-                    .foregroundStyle(
-                        entry.isDirectory
-                            ? DubColor.textSecondary
-                            : DubColor.textPrimary
-                    )
-                Text(entry.displayName)
-                    .font(DubFont.body)
-                    .foregroundStyle(DubColor.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-                if !entry.isDirectory {
-                    Text(entry.ext)
-                        .font(DubFont.micro)
-                        .foregroundStyle(DubColor.textTertiary)
-                }
-            }
-            .padding(.horizontal, DubSpacing.lg)
-            .padding(.vertical, DubSpacing.xs)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                isSelected ? DubColor.surface2 : Color.clear
-            )
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, DubSpacing.lg)
+        .padding(.vertical, DubSpacing.xs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? DubColor.surface2 : Color.clear)
+        .contentShape(Rectangle())
         .if(!entry.isDirectory) { view in
-            // Make audio rows Finder-draggable so the user can drop
-            // them onto a deck pane. Drag carries the file URL on
-            // the pasteboard via the system promise.
             view.draggable(entry.url) {
                 Text(entry.displayName)
                     .font(DubFont.body)
                     .padding(DubSpacing.sm)
                     .background(DubColor.surface2)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+        }
+        .onTapGesture {
+            if entry.isDirectory {
+                currentDirectory = entry.url
+                reload()
+            } else {
+                model.browserSelection = entry.url
             }
         }
     }

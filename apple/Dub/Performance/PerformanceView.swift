@@ -124,26 +124,50 @@ struct PerformanceView: View {
         }
     }
 
+    /// Column width the playing waveform strip is rendered at.
+    /// Serato Scratch Live's playing waveform is ≈ 110–140 px tall
+    /// in its horizontal orientation; translated into our vertical
+    /// bottom-→-top scroll that maps to a ≈ 160 px-wide strip
+    /// (`DubLayout.deckColumnWidth`). Prep mode gets a wider strip
+    /// (`deckColumnWidthPrep`) because the single-deck surface has
+    /// more horizontal real estate to spend; M10.5c will rotate
+    /// that strip 90° into a true horizontal layout.
+    private var waveformColumnWidth: CGFloat {
+        model.engineMode == .prep
+            ? DubLayout.deckColumnWidthPrep
+            : DubLayout.deckColumnWidth
+    }
+
     /// One deck's pane — Metal waveform when the deck has any
-    /// source, idle placeholder otherwise. The pane is the drop
-    /// target for Finder-drag file loads (PRD §5.5) and surfaces
-    /// the 200 ms red flash when a load fails because the target
-    /// deck is currently playing.
+    /// source, idle placeholder otherwise. The pane (drop target,
+    /// background, error-flash zone) spans the full half-window
+    /// width, but the waveform *strip* itself is width-capped and
+    /// centred. The remaining horizontal space is reserved for the
+    /// M10.5c Track-Overview waveform and per-deck info chips.
+    /// PRD §5.5: the pane is the drop target for Finder-drag file
+    /// loads; PRD §6.4: the pane surfaces the 200 ms red flash when
+    /// a load fails because the target deck is currently playing.
     @ViewBuilder
     private func deckPane(side: DeckSide, deckIdx: UInt64, enabled: Bool) -> some View {
         let deckState = (side == .a) ? model.deckA : model.deckB
         let hasSource = enabled && (deckState.hasTrack
                                     || (model.engineMode == .timecode && model.isRunning))
         ZStack {
-            if hasSource {
-                WaveformView(
-                    engine: model.engine, deckIdx: deckIdx,
-                    palette: model.palette, side: side)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(DubColor.surface0)
-            } else {
-                idlePane(side: side)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                Group {
+                    if hasSource {
+                        WaveformView(
+                            engine: model.engine, deckIdx: deckIdx,
+                            palette: model.palette, side: side)
+                            .background(DubColor.surface0)
+                    } else {
+                        idlePane(side: side)
+                    }
+                }
+                .frame(width: waveformColumnWidth)
+                .frame(maxHeight: .infinity)
+                Spacer(minLength: 0)
             }
             loadErrorOverlay(side: side, deckState: deckState)
         }

@@ -2,19 +2,15 @@
 //  PreferencesSheet.swift
 //  Dub
 //
-//  M10.3 Preferences sheet. Houses the old M10-B / M10.2 dev
-//  toolbar — input device picker, deck A/B channel fields, palette
-//  picker, Start/Stop — *off* the performance surface so the
-//  performance view stays clean and so a stage-mode DJ can never
-//  hit a "Start/Stop" button by accident.
+//  M10.3 Preferences sheet. Houses the dev toolbar — input device
+//  picker, deck A/B channel fields, palette picker — *off* the
+//  performance surface so the performance view stays clean.
 //
-//  Opened via `⌘,` (the macOS standard "open Preferences" shortcut)
-//  from `MainView`. Until M18 the sheet is the *only* way to start
-//  or stop the engine; the performance surface is read-only.
-//
-//  We deliberately keep this sheet a one-pane affair rather than a
-//  tabbed `Settings` scene — that pattern arrives with M18 polish
-//  when there's more than one config domain to organise.
+//  Opened via `⌘,` or the status-strip gear icon. M10.5b removed
+//  the Start / Stop / Apply buttons: every config change auto-
+//  applies via `model.applyConfig()` and the footer carries a
+//  single Close button. Channel fields commit on Enter / focus-
+//  blur so we don't restart the engine on every keystroke.
 //
 
 import SwiftUI
@@ -56,7 +52,6 @@ struct PreferencesSheet: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .disabled(model.isRunning)
                 Text(model.engineMode == .timecode
                     ? "Two-deck timecode capture via a multi-channel audio interface."
                     : "Output-only file playback — no input device needed.")
@@ -152,45 +147,15 @@ struct PreferencesSheet: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 0)
-            if model.isRunning {
-                Button("Stop", role: .destructive) {
-                    model.stop()
-                }
-                Button("Apply") {
-                    model.stop()
-                    model.start()
-                    if model.lastError == nil {
-                        dismiss()
-                    }
-                }
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(applyDisabled)
-            } else {
-                Button("Start") {
-                    model.start()
-                    if model.lastError == nil {
-                        dismiss()
-                    }
-                }
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(startDisabled)
-            }
+            // M10.5b: single Close button. Every config change in
+            // this sheet (mode picker, device picker, channel fields)
+            // auto-applies via `model.applyConfig()`, so there's
+            // never anything for the user to manually commit.
             Button("Close") { dismiss() }
                 .keyboardShortcut(.cancelAction)
+                .keyboardShortcut(.defaultAction)
         }
     }
-
-    /// Start is unavailable when the chosen mode lacks the inputs
-    /// it needs. Timecode needs an input device; Prep mode needs
-    /// nothing beyond the system audio output.
-    private var startDisabled: Bool {
-        switch model.engineMode {
-        case .timecode: return model.selectedDevice == nil
-        case .prep:     return false
-        }
-    }
-
-    private var applyDisabled: Bool { startDisabled }
 
     // MARK: - Helpers
 
@@ -220,7 +185,14 @@ struct PreferencesSheet: View {
             TextField(hint, text: text)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 240)
-                .disabled(model.isRunning)
+                // Channel fields commit on Enter / focus-blur. Doing
+                // it onChange would attempt a restart on every
+                // keystroke ("1" → "1," → "1,2" each spawning a
+                // startThru call, which is racy and noisy with
+                // CoreAudio).
+                .onSubmit {
+                    model.applyConfig()
+                }
         }
     }
 

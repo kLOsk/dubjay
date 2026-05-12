@@ -197,6 +197,28 @@ enum DubLayout {
     static let fxBarHeight: CGFloat = 100
     static let libraryMinHeight: CGFloat = 200
     static let waveformMinHeight: CGFloat = 280
+
+    /// Width of the vertical playing-waveform column in Performance
+    /// (Timecode) mode. Sized to match Serato Scratch Live's
+    /// playing-waveform height (≈ 110–140 px in its horizontal
+    /// layout) — translated into our bottom-→-top vertical
+    /// orientation, the *width* of each deck's strip is the Serato-
+    /// equivalent dimension. The remaining horizontal space inside
+    /// the deck pane is reserved for the deck header (already
+    /// rendered above the strip), the M10.5c per-deck Track-
+    /// Overview waveform, and future per-deck info chips (track
+    /// time, RPM, key-lock, beatgrid offset).
+    static let deckColumnWidth: CGFloat = 160
+
+    /// Width of the horizontal playing-waveform in Prep mode (M10.5c).
+    /// Prep mode rotates the strip 90° — it's a single horizontal
+    /// band across the top of the single-deck surface, sized
+    /// generously so a track-prep DJ can read beat-grids and place
+    /// hot cues comfortably, but bounded so the surrounding region
+    /// has room for the (forthcoming) horizontal overview + cue
+    /// strip + waveform-zoom controls. Read as **height** in Prep
+    /// mode, since the strip runs left-to-right there.
+    static let deckColumnWidthPrep: CGFloat = 280
 }
 
 // MARK: - Color hex initialiser
