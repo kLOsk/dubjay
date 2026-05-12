@@ -94,12 +94,14 @@
 mod band_decimator;
 mod buffer;
 mod decimator;
+mod offline;
 mod stream;
 pub mod synthetic;
 
 pub use band_decimator::BandDecimator;
 pub use buffer::{BandPeakSnapshot, PeakBuffer, PeakSnapshot};
 pub use decimator::Decimator;
+pub use offline::{compute_offline_peaks, OfflinePeaks};
 pub use stream::{PeakStream, PeakStreamConfig, PeakStreamError};
 
 /// Number of frequency bands carried by each [`BandPeakChunk`].

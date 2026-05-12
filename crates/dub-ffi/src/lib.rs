@@ -35,7 +35,10 @@ use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
 use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
-use dub_peaks::{BandPeakChunk, PeakChunk, PeakStream, PeakStreamConfig};
+use dub_io::Track;
+use dub_peaks::{
+    compute_offline_peaks, BandPeakChunk, OfflinePeaks, PeakChunk, PeakStream, PeakStreamConfig,
+};
 
 // UniFFI scaffolding. Emits the C ABI symbols (component contract,
 // metadata symbol, RustBuffer alloc/free) that the generated Swift
@@ -55,7 +58,12 @@ uniffi::setup_scaffolding!();
 /// `3`: M10.1 added [`DubEngine::sample_rate`].
 /// `4`: M10.2 added [`DubEngine::start_thru_two_deck`] for deck B
 ///      wiring.
-pub const FFI_VERSION: u32 = 4;
+/// `5`: M10.5 added File-mode playback: `start_engine` (output-only
+///      lifecycle), `load_track`, `play`, `pause`, `seek`, `position`,
+///      `track_info`. `peaks_extend` / `peaks_len` / etc. now read
+///      from either the Thru analysis thread or the offline-decoded
+///      peak buffer transparently via the per-deck `PeakSource` enum.
+pub const FFI_VERSION: u32 = 5;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -111,6 +119,22 @@ pub enum EngineError {
 
     #[error("invalid deck index {0} (valid: 0..{count})", count = dub_engine::DECK_COUNT)]
     InvalidDeckIndex(u64),
+
+    /// File decoding failed (unsupported codec, corrupt file, IO error,
+    /// or unsupported channel layout). M10.5.
+    #[error("track decode failed: {0}")]
+    TrackDecodeFailed(String),
+
+    /// Sending a deck command to the audio thread failed because the
+    /// SPSC command channel was full (audio thread not draining fast
+    /// enough). M10.5.
+    #[error("command channel full; retry")]
+    CommandChannelFull,
+
+    /// `load_track`/`play`/etc. called before `start_engine` /
+    /// `start_thru` succeeded. M10.5.
+    #[error("engine is not running; call start_engine first")]
+    EngineNotRunning,
 }
 
 /// The Apple-side handle to the Dub audio engine.
@@ -145,34 +169,161 @@ enum EngineState {
     Running(Box<RunningState>),
 }
 
+/// Per-deck source of waveform peak data the renderer consumes.
+///
+/// Two variants for two playback modes:
+///
+/// * [`PeakSource::Live`] — Thru mode (M9): peaks are streamed off
+///   the live audio-thread tap by a [`PeakStream`] analysis thread.
+///   The data grows over time as the platter spins.
+/// * [`PeakSource::File`] — File mode (M10.5): peaks were computed
+///   synchronously off the fully-decoded [`Track`] at load time
+///   ([`compute_offline_peaks`]). The data is fixed at the moment
+///   of load — `peaks_len` reports `broadband.len()` and never
+///   grows again.
+///
+/// The renderer's FFI methods ([`DubEngine::peaks_extend`],
+/// [`DubEngine::peaks_len`], etc.) delegate through this enum so
+/// Swift doesn't branch on mode — it just polls
+/// `peaks_extend(deck, start_idx)` once per frame and gets the
+/// authoritative chunks for whichever mode the deck is in.
+enum PeakSource {
+    /// Live Thru-mode capture. The `PeakStream`'s analysis thread
+    /// reads from an audio-thread `ringbuf` tap and writes new
+    /// chunks to a shared `PeakBuffer`.
+    ///
+    /// The `sample_rate` field is the analysis-side rate (= engine
+    /// SR for Thru mode). Stored alongside the stream because
+    /// `PeakStream` itself doesn't carry SR.
+    Live {
+        stream: PeakStream,
+        sample_rate: u32,
+    },
+    /// Pre-computed File-mode peaks. The whole track's broadband +
+    /// band peaks were decimated once during `load_track`.
+    File(FilePeaks),
+}
+
+/// Offline-decoded peak buffer for a File-mode deck.
+///
+/// Mirrors the *exposed* surface of [`PeakStream`] (chunks, lengths,
+/// per-chunk sample counts, sample rate) so the FFI accessors can
+/// treat both variants uniformly. The underlying storage is just a
+/// pair of `Vec`s — no analysis thread, no SPSC ring, no Drop work
+/// at shutdown.
+struct FilePeaks {
+    broadband: Vec<PeakChunk>,
+    bands: Vec<BandPeakChunk>,
+    /// Decoded-track sample rate. May differ from the engine SR
+    /// (e.g. a 44.1 kHz MP3 played on a 48 kHz output). The renderer
+    /// uses this to compute `chunk_duration_secs` (the time-axis
+    /// scale factor), so a per-source rate is correct.
+    sample_rate: u32,
+    samples_per_broadband_chunk: u32,
+    samples_per_band_chunk: u32,
+}
+
+impl PeakSource {
+    fn broadband_len(&self) -> usize {
+        match self {
+            PeakSource::Live { stream, .. } => stream.len(),
+            PeakSource::File(f) => f.broadband.len(),
+        }
+    }
+
+    fn band_len(&self) -> usize {
+        match self {
+            PeakSource::Live { stream, .. } => stream.band_len(),
+            PeakSource::File(f) => f.bands.len(),
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            PeakSource::Live { sample_rate, .. } => *sample_rate,
+            PeakSource::File(f) => f.sample_rate,
+        }
+    }
+
+    fn samples_per_broadband_chunk(&self) -> u32 {
+        match self {
+            PeakSource::Live { stream, .. } => {
+                u32::try_from(stream.samples_per_chunk()).unwrap_or(u32::MAX)
+            }
+            PeakSource::File(f) => f.samples_per_broadband_chunk,
+        }
+    }
+
+    fn samples_per_band_chunk(&self) -> Option<u32> {
+        match self {
+            PeakSource::Live { stream, .. } => stream
+                .samples_per_band_chunk()
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            PeakSource::File(f) => Some(f.samples_per_band_chunk),
+        }
+    }
+
+    fn extend_broadband_from(&self, start: usize, out: &mut Vec<PeakChunk>) {
+        match self {
+            PeakSource::Live { stream, .. } => {
+                let _new_end = stream.buffer().extend_chunks(start, out);
+            }
+            PeakSource::File(f) => {
+                if start < f.broadband.len() {
+                    out.extend_from_slice(&f.broadband[start..]);
+                }
+            }
+        }
+    }
+
+    fn extend_band_from(&self, start: usize, out: &mut Vec<BandPeakChunk>) {
+        match self {
+            PeakSource::Live { stream, .. } => {
+                let _new_end = stream.buffer().extend_band_chunks(start, out);
+            }
+            PeakSource::File(f) => {
+                if start < f.bands.len() {
+                    out.extend_from_slice(&f.bands[start..]);
+                }
+            }
+        }
+    }
+}
+
 /// Active audio session. Field order matters for `Drop`:
 ///
-/// 1. `peaks` is dropped first → each `PeakStream` joins its
-///    decimator thread cleanly.
+/// 1. `peaks` is dropped first → each `PeakSource::Live` joins its
+///    decimator thread cleanly. `PeakSource::File` drops `Vec`s, no
+///    threading.
 /// 2. `handle` is dropped second → the engine's main-thread proxy
 ///    releases its trash channels.
 /// 3. `output` is dropped third → `AudioOutput::drop` stops the
 ///    CoreAudio output AudioUnit and reclaims the `Engine` it
 ///    owned.
-/// 4. `input` is dropped last → no more samples flow.
+/// 4. `input` is dropped last (when present) → no more samples flow.
 struct RunningState {
-    peaks: [Option<PeakStream>; 2],
+    peaks: [Option<PeakSource>; 2],
+    /// Per-deck loaded track (File mode). Held so [`DubEngine::track_info`]
+    /// can read metadata after load. The engine's deck also holds a
+    /// clone of this `Arc<Track>` — the audio thread reads samples
+    /// through its own reference.
+    file_tracks: [Option<Arc<Track>>; 2],
     /// Live engine command channel. Held purely so its `Drop` runs
-    /// at the right point in the shutdown sequence — we never call
-    /// methods on it after the initial attach.
-    #[allow(dead_code)]
+    /// at the right point in the shutdown sequence.
     handle: EngineHandle,
     /// Live CoreAudio output AudioUnit. Held for `Drop`; renderer
     /// never touches it.
     #[allow(dead_code)]
     output: AudioOutput,
-    /// Live CoreAudio input AudioUnit. Held for `Drop`; renderer
-    /// never touches it.
+    /// Live CoreAudio input AudioUnit. `Some` in Thru mode (M9),
+    /// `None` in output-only / File-only mode (M10.5).
     #[allow(dead_code)]
-    input: AudioInput,
+    input: Option<AudioInput>,
+    /// Engine sample rate (= output device SR). May differ from a
+    /// File-mode track's source SR — the engine resamples on render
+    /// (PRD §4.4). File-mode peaks carry their own SR so the
+    /// renderer's time-axis math is correct per-deck.
     sample_rate: u32,
-    samples_per_chunk: u32,
-    samples_per_band_chunk: Option<u32>,
 }
 
 #[uniffi::export]
@@ -297,6 +448,279 @@ impl DubEngine {
         drop(prev);
     }
 
+    /// Alias of [`Self::stop_thru`] for parity with the M10.5
+    /// `start_engine` naming. Same idempotent semantics: tears the
+    /// session down regardless of whether it was started in Thru,
+    /// two-deck-Thru, or output-only mode.
+    pub fn stop_engine(&self) {
+        self.stop_thru();
+    }
+
+    /// Start an **output-only** engine session (M10.5).
+    ///
+    /// No input device is opened — the engine renders whatever the
+    /// decks output (File mode) and nothing else. Use this when a
+    /// timecode interface is not available and the DJ wants to
+    /// drag-and-drop tracks onto decks for casual playback / track
+    /// preparation (PRD §6.1.3).
+    ///
+    /// `output_channels` is the number of physical output channels
+    /// to open the AU with. Pass `2` for stereo (built-in speakers,
+    /// headphones); pass `4` to mirror the canonical SL3 layout
+    /// (deck A → ch 1+2, deck B → ch 3+4) so a follow-up
+    /// `start_thru_two_deck` call from the same UI gives consistent
+    /// physical routing. Output device is the system default; choose
+    /// via Audio MIDI Setup (PRD §10).
+    ///
+    /// After success, the deck count is `dub_engine::DECK_COUNT` (= 2);
+    /// each deck starts empty (no peaks, no track). Call
+    /// [`Self::load_track`] to populate.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::AlreadyRunning`] if a session is already
+    ///   active.
+    /// * [`EngineError::InvalidChannels`] if `output_channels < 2`.
+    /// * [`EngineError::AudioStartFailed`] for any CoreAudio
+    ///   open/start failure.
+    pub fn start_engine(&self, output_channels: u32) -> Result<(), EngineError> {
+        let mut state = lock_state(&self.state);
+        if matches!(*state, EngineState::Running(_)) {
+            return Err(EngineError::AlreadyRunning);
+        }
+        if output_channels < 2 {
+            return Err(EngineError::InvalidChannels(vec![output_channels]));
+        }
+
+        let running = start_engine_inner(output_channels)?;
+        *state = EngineState::Running(Box::new(running));
+        Ok(())
+    }
+
+    /// Load a track on the given deck (M10.5).
+    ///
+    /// Synchronously decodes the file at `path` via
+    /// [`dub_io::Track::load_from_path`], computes the whole-track
+    /// peaks via [`compute_offline_peaks`], stores them in the
+    /// per-deck [`PeakSource::File`], and sends
+    /// `Command::DeckLoad` to the audio thread. Position is reset
+    /// to `0.0` and the deck starts in the paused state — the
+    /// caller is expected to follow up with [`Self::play`].
+    ///
+    /// Off-RT: decoding a typical 4-minute MP3 takes ~50 ms on
+    /// Apple silicon; offline peaks are another ~20 ms. Both are
+    /// done on the calling thread (UniFFI marshals the call from
+    /// Swift's main actor), which is fine because the audio thread
+    /// is not blocked — it continues rendering silence on the deck
+    /// until the `Command::DeckLoad` is dequeued.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::EngineNotRunning`] if `start_engine` /
+    ///   `start_thru` hasn't been called.
+    /// * [`EngineError::InvalidDeckIndex`] if `deck_idx >=
+    ///   DECK_COUNT`.
+    /// * [`EngineError::TrackDecodeFailed`] for any IO / codec /
+    ///   layout / empty-decode failure.
+    /// * [`EngineError::CommandChannelFull`] if the audio thread is
+    ///   not draining commands (implausible in normal operation —
+    ///   the channel is sized for hundreds of pending commands).
+    pub fn load_track(&self, deck_idx: u64, path: String) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+
+        let track = Track::load_from_path(&path)
+            .map_err(|e| EngineError::TrackDecodeFailed(format!("{path}: {e}")))?;
+        let track = Arc::new(track);
+
+        let OfflinePeaks {
+            broadband,
+            bands,
+            sample_rate,
+            samples_per_broadband_chunk,
+            samples_per_band_chunk,
+        } = compute_offline_peaks(track.samples(), track.sample_rate(), track.channels())
+            .map_err(|e| EngineError::TrackDecodeFailed(format!("peaks: {e}")))?;
+
+        running
+            .handle
+            .deck(idx)
+            .load(track.clone())
+            .map_err(|(e, _arc)| match e {
+                dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
+                dub_engine::CommandError::InvalidDeck { idx, .. } => {
+                    EngineError::InvalidDeckIndex(u64::from(idx))
+                }
+            })?;
+
+        running.file_tracks[idx] = Some(track);
+        running.peaks[idx] = Some(PeakSource::File(FilePeaks {
+            broadband,
+            bands,
+            sample_rate,
+            samples_per_broadband_chunk: u32::try_from(samples_per_broadband_chunk)
+                .unwrap_or(u32::MAX),
+            samples_per_band_chunk: u32::try_from(samples_per_band_chunk).unwrap_or(u32::MAX),
+        }));
+
+        Ok(())
+    }
+
+    /// Start playback on the given deck (M10.5).
+    ///
+    /// In File mode, advances the playhead at unity rate from its
+    /// current position. In Thru mode, this is a no-op at the engine
+    /// level (the timecode carrier drives the rate) but sent
+    /// anyway so the deck's `is_playing` flag is consistent with the
+    /// UI. Idempotent: playing an already-playing deck is harmless.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::load_track`] for the error model; same variants
+    /// apply.
+    pub fn play(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running.handle.deck(idx).play().map_err(map_command_error)
+    }
+
+    /// Pause playback on the given deck (M10.5).
+    ///
+    /// File mode freezes the playhead at its current position.
+    /// Position can be resumed with [`Self::play`] or jumped with
+    /// [`Self::seek`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::play`].
+    pub fn pause(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running.handle.deck(idx).pause().map_err(map_command_error)
+    }
+
+    /// Seek to the given time position on the deck (M10.5).
+    ///
+    /// `position_secs` is the wall-clock offset from track start.
+    /// Negative values and values past the end are allowed — the
+    /// engine renders silence and keeps advancing, mirroring a real
+    /// record being lifted off the platter. The actual frame
+    /// position is `position_secs × track.sample_rate()`; rounding
+    /// is to the nearest frame.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::play`].
+    pub fn seek(&self, deck_idx: u64, position_secs: f64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+
+        // Convert seconds → track frames using the loaded track's
+        // SR (not the engine SR). If no track is loaded, we still
+        // send the command (engine treats it as out-of-range silence)
+        // so the UI doesn't have to special-case empty decks.
+        let position_frames = match running.file_tracks[idx].as_ref() {
+            #[allow(clippy::cast_precision_loss)]
+            Some(track) => position_secs * f64::from(track.sample_rate()),
+            None => position_secs,
+        };
+
+        running
+            .handle
+            .deck(idx)
+            .seek(position_frames)
+            .map_err(map_command_error)
+    }
+
+    /// Read the current playhead position on the deck (M10.5).
+    ///
+    /// Returns a [`PositionInfo`] with elapsed seconds, remaining
+    /// seconds, total duration, and the deck's transport state.
+    /// All fields are zero when the engine is stopped or the deck
+    /// is empty.
+    ///
+    /// Cheap: a few `Relaxed` atomic loads. Safe to call from a
+    /// 30 Hz / 60 Hz UI loop without rate-limiting.
+    #[must_use]
+    pub fn position(&self, deck_idx: u64) -> PositionInfo {
+        let idx = match deck_idx_to_usize(deck_idx) {
+            Ok(idx) => idx,
+            Err(_) => return PositionInfo::EMPTY,
+        };
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return PositionInfo::EMPTY;
+        };
+        let Some(snap) = running.handle.deck_state(idx) else {
+            return PositionInfo::EMPTY;
+        };
+        let Some(track) = running.file_tracks[idx].as_ref() else {
+            return PositionInfo {
+                has_track: false,
+                is_playing: snap.is_playing,
+                ..PositionInfo::EMPTY
+            };
+        };
+        let sr = f64::from(track.sample_rate());
+        let duration_secs = if sr > 0.0 {
+            #[allow(clippy::cast_precision_loss)]
+            let total_frames = track.frames() as f64;
+            total_frames / sr
+        } else {
+            0.0
+        };
+        let elapsed_secs = if sr > 0.0 {
+            (snap.position_frames / sr).max(0.0).min(duration_secs)
+        } else {
+            0.0
+        };
+        let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
+        PositionInfo {
+            elapsed_secs,
+            remaining_secs,
+            duration_secs,
+            is_playing: snap.is_playing,
+            at_end: snap.at_end,
+            has_track: true,
+        }
+    }
+
+    /// Read metadata for the currently-loaded File-mode track on the
+    /// deck (M10.5).
+    ///
+    /// Returns `None` if no track is loaded or the engine is stopped.
+    ///
+    /// Title / artist are best-effort placeholders today (the file
+    /// stem) — M11 library import will populate them from
+    /// Serato/Traktor/rekordbox tags or symphonia metadata.
+    #[must_use]
+    pub fn track_info(&self, deck_idx: u64) -> Option<TrackInfo> {
+        let idx = deck_idx_to_usize(deck_idx).ok()?;
+        let state = lock_state(&self.state);
+        let running = state.as_running()?;
+        let track = running.file_tracks[idx].as_ref()?;
+        Some(TrackInfo {
+            title: String::new(),
+            artist: String::new(),
+            duration_secs: track.duration_seconds(),
+            sample_rate: track.sample_rate(),
+            channels: u32::from(track.channels()),
+            bpm: track.bpm(),
+        })
+    }
+
     /// Number of broadband [`PeakChunk`]s captured so far on `deck_idx`.
     ///
     /// Returns `0` if the engine is stopped or the deck has no
@@ -308,10 +732,10 @@ impl DubEngine {
         let Some(running) = state.as_running() else {
             return 0;
         };
-        let Some(stream) = peaks_stream_for(running, deck_idx) else {
+        let Some(source) = peak_source_for(running, deck_idx) else {
             return 0;
         };
-        stream.len() as u64
+        source.broadband_len() as u64
     }
 
     /// Wall-clock duration of one [`PeakChunk`] on `deck_idx`, in
@@ -319,16 +743,25 @@ impl DubEngine {
     /// when stopped / unknown deck — Swift uses the result as a
     /// time-axis scale factor, and a zero scale produces a sane
     /// empty waveform rather than NaN.
+    ///
+    /// Mode-aware: in Thru mode the rate is the engine SR (= input
+    /// device SR); in File mode the rate is the loaded track's SR
+    /// (may differ from output device SR — the engine resamples on
+    /// render, but peaks are at source-rate cadence).
     #[must_use]
     pub fn peaks_chunk_duration_secs(&self, deck_idx: u64) -> f64 {
         let state = lock_state(&self.state);
         let Some(running) = state.as_running() else {
             return 0.0;
         };
-        if peaks_stream_for(running, deck_idx).is_none() {
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return 0.0;
+        };
+        let sr = source.sample_rate();
+        if sr == 0 {
             return 0.0;
         }
-        f64::from(running.samples_per_chunk) / f64::from(running.sample_rate)
+        f64::from(source.samples_per_broadband_chunk()) / f64::from(sr)
     }
 
     /// Fetch new [`PeakChunk`]s captured since `start_idx`,
@@ -342,19 +775,18 @@ impl DubEngine {
     /// `[start_idx, peaks_len)`.
     ///
     /// Returns an empty `Vec` when the engine is stopped, the deck
-    /// has no peaks stream, or `start_idx >= len()`.
+    /// has no peaks source, or `start_idx >= len()`.
     #[must_use]
     pub fn peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8> {
         let state = lock_state(&self.state);
         let Some(running) = state.as_running() else {
             return Vec::new();
         };
-        let Some(stream) = peaks_stream_for(running, deck_idx) else {
+        let Some(source) = peak_source_for(running, deck_idx) else {
             return Vec::new();
         };
-        let buffer = stream.buffer();
         let mut chunks: Vec<PeakChunk> = Vec::new();
-        let _new_end = buffer.extend_chunks(usize_from_u64(start_idx), &mut chunks);
+        source.extend_broadband_from(usize_from_u64(start_idx), &mut chunks);
         peak_chunks_to_bytes(&chunks)
     }
 
@@ -367,10 +799,10 @@ impl DubEngine {
         let Some(running) = state.as_running() else {
             return 0;
         };
-        let Some(stream) = peaks_stream_for(running, deck_idx) else {
+        let Some(source) = peak_source_for(running, deck_idx) else {
             return 0;
         };
-        stream.band_len() as u64
+        source.band_len() as u64
     }
 
     /// Wall-clock duration of one [`BandPeakChunk`] on `deck_idx`,
@@ -383,13 +815,17 @@ impl DubEngine {
         let Some(running) = state.as_running() else {
             return 0.0;
         };
-        let Some(spbc) = running.samples_per_band_chunk else {
+        let Some(source) = peak_source_for(running, deck_idx) else {
             return 0.0;
         };
-        if peaks_stream_for(running, deck_idx).is_none() {
+        let Some(spbc) = source.samples_per_band_chunk() else {
+            return 0.0;
+        };
+        let sr = source.sample_rate();
+        if sr == 0 {
             return 0.0;
         }
-        f64::from(spbc) / f64::from(running.sample_rate)
+        f64::from(spbc) / f64::from(sr)
     }
 
     /// Current audio sample rate the engine is running at, in Hz.
@@ -417,12 +853,11 @@ impl DubEngine {
         let Some(running) = state.as_running() else {
             return Vec::new();
         };
-        let Some(stream) = peaks_stream_for(running, deck_idx) else {
+        let Some(source) = peak_source_for(running, deck_idx) else {
             return Vec::new();
         };
-        let buffer = stream.buffer();
         let mut chunks: Vec<BandPeakChunk> = Vec::new();
-        let _new_end = buffer.extend_band_chunks(usize_from_u64(start_idx), &mut chunks);
+        source.extend_band_from(usize_from_u64(start_idx), &mut chunks);
         band_peak_chunks_to_bytes(&chunks)
     }
 }
@@ -434,6 +869,66 @@ impl EngineState {
             EngineState::Stopped => None,
         }
     }
+}
+
+/// Snapshot of a deck's playhead state in wall-clock seconds.
+///
+/// All fields are zero for an empty / stopped deck (`has_track =
+/// false`). Returned by [`DubEngine::position`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PositionInfo {
+    /// Wall-clock seconds elapsed from track start (≥ 0, ≤ duration).
+    pub elapsed_secs: f64,
+    /// Wall-clock seconds remaining until track end (≥ 0).
+    pub remaining_secs: f64,
+    /// Wall-clock total track duration (= `track.frames /
+    /// track.sample_rate`).
+    pub duration_secs: f64,
+    /// Whether the deck is currently advancing the playhead.
+    pub is_playing: bool,
+    /// Whether the playhead is past the end of the track. UI uses
+    /// this to clear a "now playing" badge.
+    pub at_end: bool,
+    /// `true` if a File-mode track is loaded on this deck. `false`
+    /// for empty decks and Thru-mode-only decks (where the
+    /// "position" concept doesn't apply because the timecode
+    /// drives the rate).
+    pub has_track: bool,
+}
+
+impl PositionInfo {
+    const EMPTY: Self = Self {
+        elapsed_secs: 0.0,
+        remaining_secs: 0.0,
+        duration_secs: 0.0,
+        is_playing: false,
+        at_end: false,
+        has_track: false,
+    };
+}
+
+/// Metadata for a File-mode loaded track (M10.5).
+///
+/// Returned by [`DubEngine::track_info`]. Title / artist are
+/// best-effort and may be empty in M10.5 (M11 will plumb them from
+/// library metadata or codec tags).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrackInfo {
+    /// Track title. Empty in M10.5 (M11 plumbs this from library /
+    /// codec metadata).
+    pub title: String,
+    /// Artist. Empty in M10.5; same plumbing target as `title`.
+    pub artist: String,
+    /// Total duration in seconds.
+    pub duration_secs: f64,
+    /// Source sample rate (may differ from engine SR).
+    pub sample_rate: u32,
+    /// 1 (mono) or 2 (stereo).
+    pub channels: u32,
+    /// BPM annotation, if BPM analysis has been run on the track.
+    /// `None` in M10.5 (M11 / M11.5 will run analysis at load time
+    /// or pull from the library).
+    pub bpm: Option<f64>,
 }
 
 /// Helper: lock the engine-state mutex, recovering from a poisoned
@@ -448,9 +943,19 @@ fn lock_state(state: &Mutex<EngineState>) -> std::sync::MutexGuard<'_, EngineSta
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn peaks_stream_for(running: &RunningState, deck_idx: u64) -> Option<&PeakStream> {
+fn peak_source_for(running: &RunningState, deck_idx: u64) -> Option<&PeakSource> {
     let idx: usize = deck_idx.try_into().ok()?;
     running.peaks.get(idx).and_then(|s| s.as_ref())
+}
+
+fn deck_idx_to_usize(deck_idx: u64) -> Result<usize, EngineError> {
+    let idx: usize = deck_idx
+        .try_into()
+        .map_err(|_| EngineError::InvalidDeckIndex(deck_idx))?;
+    if idx >= dub_engine::DECK_COUNT {
+        return Err(EngineError::InvalidDeckIndex(deck_idx));
+    }
+    Ok(idx)
 }
 
 /// Saturating conversion from u64 (UniFFI-friendly) to usize. On
@@ -540,40 +1045,35 @@ fn start_thru_inner(
         max_block_frames: THRU_MAX_BLOCK_FRAMES,
         input_sample_rate: input_sr_f32,
     };
-    let mut peaks: [Option<PeakStream>; 2] = [None, None];
+    let mut peaks: [Option<PeakSource>; 2] = [None, None];
 
     let peaks_cfg_a = PeakStreamConfig::at(input_sr);
-    let bands_enabled = peaks_cfg_a.bands_enabled;
     let peaks_stream_a = handle
         .attach_thru_source_with_peaks_tracking(0, consumer_a, thru_cfg, peaks_cfg_a)
         .map_err(|e| EngineError::AudioStartFailed(format!("attaching thru on deck 0: {e}")))?;
-
-    let samples_per_chunk = u32::try_from(peaks_stream_a.samples_per_chunk()).unwrap_or(u32::MAX);
-    let samples_per_band_chunk = if bands_enabled {
-        peaks_stream_a
-            .samples_per_band_chunk()
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-    } else {
-        None
-    };
-    peaks[0] = Some(peaks_stream_a);
+    peaks[0] = Some(PeakSource::Live {
+        stream: peaks_stream_a,
+        sample_rate: input_sr,
+    });
 
     if let Some(consumer_b) = consumer_b {
         let peaks_cfg_b = PeakStreamConfig::at(input_sr);
         let peaks_stream_b = handle
             .attach_thru_source_with_peaks_tracking(1, consumer_b, thru_cfg, peaks_cfg_b)
             .map_err(|e| EngineError::AudioStartFailed(format!("attaching thru on deck 1: {e}")))?;
-        peaks[1] = Some(peaks_stream_b);
+        peaks[1] = Some(PeakSource::Live {
+            stream: peaks_stream_b,
+            sample_rate: input_sr,
+        });
     }
 
     Ok(RunningState {
         peaks,
+        file_tracks: [None, None],
         handle,
         output,
-        input,
+        input: Some(input),
         sample_rate: input_sr,
-        samples_per_chunk,
-        samples_per_band_chunk,
     })
 }
 
@@ -589,6 +1089,55 @@ fn classify_audio_error(err: dub_audio::AudioError, device_name: &str) -> Engine
         EngineError::DeviceNotFound(device_name.to_string())
     } else {
         EngineError::AudioStartFailed(msg)
+    }
+}
+
+/// Open an output AU only — no input, no Thru. Used by
+/// [`DubEngine::start_engine`] for the M10.5 File-mode-only path.
+fn start_engine_inner(output_channels: u32) -> Result<RunningState, EngineError> {
+    // We don't know the output device's SR ahead of time. The
+    // existing `start_thru_inner` flow uses the *input* device's SR
+    // as the engine SR; for output-only we follow the same
+    // convention but read the *output* device's SR instead. Open
+    // the AU first with the engine constructed at the system default
+    // SR, then read back the actual rate.
+    //
+    // Simpler approach: build the engine at a placeholder SR
+    // (48 kHz, the macOS factory default for built-in output) and
+    // let `AudioOutput::start_with_options` align the device to it.
+    // If the device refuses, we surface AudioStartFailed.
+    const DEFAULT_OUTPUT_SR: f32 = 48_000.0;
+    let (engine, handle) = Engine::new_with_handle(DEFAULT_OUTPUT_SR, ENGINE_BLOCK_FRAMES);
+
+    let output_opts = OutputOptions {
+        channels: output_channels,
+        ..OutputOptions::default()
+    };
+    let output = AudioOutput::start_with_options(engine, &output_opts, INTERNAL_MIXER_ROUTING)
+        .map_err(|e| EngineError::AudioStartFailed(format!("starting output: {e}")))?;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let sample_rate = output.sample_rate() as u32;
+
+    Ok(RunningState {
+        peaks: [None, None],
+        file_tracks: [None, None],
+        handle,
+        output,
+        input: None,
+        sample_rate,
+    })
+}
+
+/// Translate `dub_engine::CommandError` (audio-thread feedback
+/// channel saturated, bad deck index) into the FFI-surface
+/// equivalent. Pulled out to keep the per-method bodies tidy.
+fn map_command_error(e: dub_engine::CommandError) -> EngineError {
+    match e {
+        dub_engine::CommandError::ChannelFull => EngineError::CommandChannelFull,
+        dub_engine::CommandError::InvalidDeck { idx, .. } => {
+            EngineError::InvalidDeckIndex(u64::from(idx))
+        }
     }
 }
 
@@ -627,10 +1176,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffi_version_is_four_after_m102_deck_b() {
+    fn ffi_version_is_five_after_m105_file_playback() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
-        // (sample_rate), M10.2 3→4 (start_thru_two_deck).
-        assert_eq!(FFI_VERSION, 4);
+        // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
+        // (start_engine, load_track, play, pause, seek, position,
+        // track_info, PositionInfo + TrackInfo records).
+        assert_eq!(FFI_VERSION, 5);
+    }
+
+    #[test]
+    fn load_track_on_stopped_engine_returns_not_running() {
+        let engine = DubEngine::new();
+        let err = engine
+            .load_track(0, "/nonexistent.wav".to_string())
+            .unwrap_err();
+        assert!(matches!(err, EngineError::EngineNotRunning), "got {err:?}");
+    }
+
+    #[test]
+    fn play_pause_seek_on_stopped_engine_return_not_running() {
+        let engine = DubEngine::new();
+        for f in [engine.play(0), engine.pause(0), engine.seek(0, 30.0)] {
+            assert!(matches!(f.unwrap_err(), EngineError::EngineNotRunning));
+        }
+    }
+
+    #[test]
+    fn load_track_with_invalid_deck_index_returns_invalid_deck() {
+        let engine = DubEngine::new();
+        // Stopped engine: EngineNotRunning is checked first only after
+        // the deck index validates. We check `deck_idx_to_usize` happens
+        // first so a clearly-bad deck idx surfaces as InvalidDeckIndex.
+        let err = engine.load_track(99, "/tmp/x.wav".to_string()).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidDeckIndex(99)));
+    }
+
+    #[test]
+    fn position_on_stopped_engine_returns_empty() {
+        let engine = DubEngine::new();
+        let p = engine.position(0);
+        assert_eq!(p.elapsed_secs, 0.0);
+        assert_eq!(p.duration_secs, 0.0);
+        assert_eq!(p.remaining_secs, 0.0);
+        assert!(!p.is_playing);
+        assert!(!p.has_track);
+    }
+
+    #[test]
+    fn track_info_on_stopped_engine_returns_none() {
+        let engine = DubEngine::new();
+        assert!(engine.track_info(0).is_none());
+        assert!(engine.track_info(1).is_none());
+    }
+
+    #[test]
+    fn start_engine_rejects_zero_one_output_channels() {
+        let engine = DubEngine::new();
+        let err = engine.start_engine(0).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidChannels(_)));
+        let err = engine.start_engine(1).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidChannels(_)));
     }
 
     #[test]

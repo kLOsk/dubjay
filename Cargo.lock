@@ -617,6 +617,7 @@ version = "0.0.1"
 dependencies = [
  "dub-audio",
  "dub-engine",
+ "dub-io",
  "dub-peaks",
  "thiserror 1.0.69",
  "uniffi",

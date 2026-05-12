@@ -37,6 +37,7 @@ uniffi-cli = ["uniffi/cli"]
 [dependencies]
 dub-engine = { workspace = true }
 dub-audio = { workspace = true }
+dub-io = { workspace = true }
 dub-peaks = { workspace = true }
 uniffi = { workspace = true }
 thiserror = { workspace = true }
