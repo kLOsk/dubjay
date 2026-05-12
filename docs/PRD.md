@@ -497,7 +497,7 @@ The auto-detect path handles 33⅓ and 45 RPM transparently in 99 % of cases. Ed
 
 #### 5.4.2 Repeat (timecode run-out)
 
-When the needle reaches the end of the timecode-encoded area of the control record, the LFSR signal disappears and Stickiness (§5.4) ordinarily engages, holding the playhead at the last known position. **Repeat** is the user-controlled alternative: when enabled (keyboard toggle, per-deck), the engine instead continues playing the audio track forward at the last-known velocity, decoupling track playback from the (now-absent) timecode entirely. Useful when the audio track is longer than the timecode record's playable area.
+When the needle reaches the end of the timecode-encoded area of the control record, the LFSR signal disappears and Stickiness (§5.4) ordinarily engages, holding the playhead at the last known position. **Repeat** is the user-controlled alternative: when enabled (per-deck toggle; trigger surface TBD — see §5.5), the engine instead continues playing the audio track forward at the last-known velocity, decoupling track playback from the (now-absent) timecode entirely. Useful when the audio track is longer than the timecode record's playable area.
 
 Engine-side this is the same state as Panic Play (§6.1.2): "decouple audio from timecode, run forward at last-known rate, re-engage on signal return." Repeat is the *auto-triggered* form (triggered by run-out), Panic Play the *user-triggered* form (button press). One state, two entry points; both exit on clean signal return.
 
@@ -510,33 +510,22 @@ A keyboard-only command (no UI button on the performance surface) that **swaps d
 
 Implementation: the M5.4.5 late-binding-decks + per-deck input attach work already supports this; the command is a single re-attach pair on the trash channel. **Audio is never re-routed** — only the *control* (timecode → virtual deck) flips. Deck A still plays out of Out 1/2, Deck B still plays out of Out 3/4. This is critical: if we swapped audio routing too, the external mixer's channel assignments would become wrong mid-set.
 
-Default keybinding: `⌥⇧S` (Option + Shift + S). Visual feedback: a brief "INPUT SWAPPED" toast in the Status Strip (PRD §9). No persistent indicator — the swap is the new default state until reversed.
+Trigger surface TBD (see §5.5). Visual feedback: a brief "INPUT SWAPPED" toast in the Status Strip (PRD §9). No persistent indicator — the swap is the new default state until reversed.
 
 ### 5.5 Keyboard input
 
-First-class keyboard mapping. v1 default bindings (configurable):
+Keyboard is first-class for **non-performance** tasks (load, navigate, settings). Performance gestures — pitch, scratch, crossfade, EQ, gain, cue — live on the turntable and the user's external mixer, per the §1 mouse rule extended to the keyboard (the keyboard is not a substitute for a turntable).
 
-| Key | Action |
-|---|---|
-| `Q W E R` | Quick Scratch slots 1–4 (toggle, see §7.2) |
-| `A S D F` | Sampler slots 1–4 (one-shot trigger) |
-| `Z X` | Loop In / Loop Out (Deck A) |
-| `, .` | Loop In / Loop Out (Deck B) |
-| `1 2 3 4` | Loop length 1/2/4/8 beats |
-| `Tab` | Switch keyboard focus deck A↔B |
-| `Space` | Play / Pause focused deck — see §6.1.2 (Panic Play) and §6.1.3 (Casual Play). In Timecode mode `Space` engages Panic Play / cancels Panic Play; in File mode it's normal transport. |
-| `⇧Space` | Restart focused deck from track start (File / Casual mode) |
-| `[ ]` | Echo-Out tap (focused deck) |
-| `\` | Dub Siren toggle |
-| `R` (when in Timecode mode) | Toggle Repeat (§5.4.2) for focused deck |
-| `⌥⇧S` | Reverse Input Control (§5.4.3) — swap deck A / deck B timecode input pairs |
-| `←→ ↑↓` | Library navigation |
-| `Enter` | Load track to focused deck |
-| `⌘,` | Open Preferences |
-| `F5` / `F10` | Key Lock toggle, deck A / deck B (Serato parity) |
-| `+` / `-` | Zoom main waveform in / out (focused deck) |
+v1.0 ships an **intentionally minimal** keymap. Performance keys (Quick Scratch, Sampler, Loops, Key Lock, Echo-Out, Zoom, etc.) get bindings *with* their feature milestone (PRD §12) — speculating an exhaustive keymap up front churns more than it helps.
 
-The keyboard is also the **discovery surface** for the Performance / Casual / Panic distinction (§6.1). `Space` does the right thing in every mode without the user needing to know which mode they're in.
+**v1.0 confirmed bindings:**
+
+| Key | Action | Milestone |
+|---|---|---|
+| `⌘,` | Open Preferences | M10.3 |
+| `Space` | Load the **library selection** (highlighted row in the file browser, §9.7) into the **stopped, non-master deck**. If the non-master deck is currently playing, the deck pane flashes red with a "deck is playing — lift the needle" overlay; the user lifts the needle (or stops Casual Play) and tries again. See §6.4 Master deck. | M10.5 |
+
+Every other key — performance and otherwise — is **TBD** and will be added to this table as its feature ships. The PRD does not commit to a binding before the feature exists, because we've learned that DJ keyboard muscle memory is heavily anchored to Serato / Traktor conventions and we want to choose deliberately, not preemptively.
 
 User can rebind any action. Key binding profiles saved per-user.
 
@@ -573,12 +562,12 @@ Includes: per-deck play/pause/scrub-bar, master gain, channel gain, primitive cr
 
 The most common stage failure for a Timecode-mode DJ is needle contamination — dust, a tiny scratch, accidental thumb on the cartridge — which interrupts the LFSR signal mid-song. Stickiness (§5.4) holds the playhead for 250 ms, but that's not enough time to clean a needle.
 
-**Panic Play** is the user-driven extension. While a Timecode deck is mid-track, the DJ hits `Space` (or clicks the deck header Play glyph). The engine instantly transitions from timecode-driven to **last-known-velocity** playback: it ignores the timecode input entirely, runs the audio track forward at whatever rate the turntable was running just before (read from the most recent confident `LiftPolicy` velocity sample), and stays in that state indefinitely. The deck header source pill flips to `TC · HOLD` with an amber dot.
+**Panic Play** is the user-driven extension. While a Timecode deck is mid-track, the DJ triggers Panic Play (trigger surface TBD — keyboard binding and/or deck-header Play glyph; see §5.5). The engine instantly transitions from timecode-driven to **last-known-velocity** playback: it ignores the timecode input entirely, runs the audio track forward at whatever rate the turntable was running just before (read from the most recent confident `LiftPolicy` velocity sample), and stays in that state indefinitely. The deck header source pill flips to `TC · HOLD` with an amber dot.
 
 The DJ now cleans the needle, recalibrates if needed, and drops it back. Two ways out:
 
 1. **Auto-resume.** When the engine sees a clean LFSR lock returning, it transitions back to timecode-driven mode automatically — the held playhead position is the new "zero" reference for the LFSR's relative motion (§5.4). The audience hears no interruption beyond a tiny `LiftPolicy` crossfade.
-2. **Manual cancel.** The DJ hits `Space` again — engine pauses on the held position; they can then drop the needle and Timecode mode re-engages from there as normal.
+2. **Manual cancel.** The DJ re-triggers Panic Play to cancel — engine pauses on the held position; they can then drop the needle and Timecode mode re-engages from there as normal.
 
 Panic Play is the **single most important reliability feature** in v1 from a "career night" perspective. PRD §2 reliability commitment is fulfilled here.
 
@@ -586,11 +575,27 @@ Panic Play is the **single most important reliability feature** in v1 from a "ca
 
 Before the actual set starts — sound-check, soundcrew dinner, opening DJ playing — the DJ may want to play music through the rig without engaging timecode at all. Maybe they want to hear how their gear sounds in the room; maybe they want to play a curated mixtape so the venue isn't silent.
 
-**Casual Play** is the file-mode transport: drag a file onto a deck (or load from the library), hit `Space`, the track plays from the start at 1.0× rate. `⇧Space` restarts. The deck header source pill shows `FILE`. **No pitch fader is exposed** — the user explicitly accepted "no mouse-driven pitch" in §1, and pitch in File mode is not a performance gesture. The deck plays at 1.0× the entire time; if the DJ wants pitch control they need to engage timecode.
+**Casual Play** is the file-mode transport: drag a file onto a deck (or load via `Space` from the library, §6.4), trigger play on the deck (transport surface TBD — see §5.5), the track plays from the start at 1.0× rate. The deck header source pill shows `FILE`. **No pitch fader is exposed** — the user explicitly accepted "no mouse-driven pitch" in §1, and pitch in File mode is not a performance gesture. The deck plays at 1.0× the entire time; if the DJ wants pitch control they need to engage timecode.
 
 Casual Play is **not** sync-mixable from the keyboard — there is no "load and beat-match" workflow, no auto-crossfade, no countdown. A real mix requires the turntables. This mode exists for the *pre-set* use case only, and is intentionally limited so it doesn't grow into a controller-DJ surface.
 
 When a Casual-Play track ends, the deck simply stops. No autoplay, no next-track logic — keeping the surface area small.
+
+#### 6.1.4 Master deck (single-master semantics)
+
+At any moment exactly one deck is the **master**. The master is the deck whose movement is currently authoritative for the rest of the surface — keyboard-load (§5.5) targets the *non*-master, the Phase-Drift Trail (§9.4) is colour-anchored to the master, the Status Strip shows the master's BPM, and future sync/quantise logic (v1.x) snaps to the master's beat phase.
+
+**Derivation (engine, not user-controlled):**
+
+1. If exactly one deck is playing, that deck is the master.
+2. If both decks are playing, the master is the deck whose **transport last advanced** in the most recent UI frame. In Timecode mode "advanced" means the needle moved at a non-zero rate; in File mode (Casual Play) advancement is constant while the deck is playing, so a re-`play()` or `seek()` re-promotes that deck to master. The intent matches Traktor's deck-focus convention: whichever deck the DJ just touched is the one their next keyboard action targets.
+3. If neither deck is playing, master is **sticky** — whichever was master last remains master. A freshly-launched session has no master until the first play.
+
+The master is **not** chosen by mouse or by a focus ring. There is no `Tab` to cycle, no "click deck pane to focus." The platter (or in Casual Play, the deck's own play state) is the only authoring surface. This is a deliberate continuation of the §1 mouse rule — the deck the DJ is currently performing on tells the app what's the master; the DJ shouldn't have to tell the app twice.
+
+**UI surface**: a single small **MASTER** chip in the master deck's header (top-right of the deck header), with the deck's BPM next to it. The non-master deck shows its BPM without the chip. No flashing, no animation — just presence vs absence.
+
+**Load-into-non-master rule (M10.5):** pressing `Space` with a library row selected loads that file into the **non-master, stopped** deck. If the non-master deck is currently playing (rare, but possible if both decks were just playing and the DJ touched the other), the deck pane flashes red for 200 ms with a "deck is playing — lift the needle" overlay. The user lifts the needle (or pauses Casual Play), and the next `Space` succeeds. We do not auto-stop the deck — silently dropping a track on a deck that's mid-air is the kind of bug-prone helpfulness §2 rejects.
 
 #### 6.1.1 Key Lock with scratch-aware auto-bypass
 
@@ -1159,8 +1164,8 @@ Each milestone has a **demo criterion** — a single sentence describing what th
 | **M10.2 remainder** | **Waveform polish — independently shippable extensions** | Onset glow + beat-aware saturation (needs `dub-bpm` confidence-trail FFI accessor), constant-Q bass split (9-band `dub-spectral` refactor; bumps `NUM_BANDS` to 9), mip pyramids for zoom-out (pre-decimated levels in `dub-peaks`). Each is independently shippable; ordering picked by the user. | 3–5 days |
 | **M10.3** | **Performance shell** | Launching `Dub.app` shows the real Performance View (per §9.2): a thin status strip, two two-row deck headers, the Metal waveform in the wide centre region, and correctly-sized placeholders for the FX bar (lit by M15 / M16) and library (lit by M11). The dev toolbar (device picker / channels / palette) moves behind a `⌘,` Preferences sheet so the performance surface stays mouse-free at rest. `apple/Dub/DesignSystem/Tokens.swift` becomes the single source of truth for colour / type / spacing; the Figma file documented in §9 reverts to a reference artefact (it does not gate any future UI work). Deck-header BPM / pitch / key / FX columns render as `—` placeholders until their FFI accessors land — surfacing the M8 BPM tracker over UniFFI is a trivial follow-up, pitch / key / FX wait on M13 / M14 / M15. Snapshot tests (`swift-snapshot-testing`) deferred to M18 polish; the M10.3 demo is visual eyes-on. | 3 days |
 | **M10.4** | **Vertical waveform + symmetric two-pane layout** | Two bugs in the M10.3 build, fixed together. **(a)** the Metal renderer is rotated from horizontal to **vertical** per §9.1 (forward play = waveform marches upward through the playhead at 25 % from the top; reverse play = marches downward; direction follows engine rate sign with no inference). Touches `Shaders.metal` (vertex shader emits Y-instanced quads), `WaveformRenderer.swift` (buffer layout + view projection), `WaveformView.swift` (frame sizing tall not wide), and `PerformanceView.swift` (waveform region becomes `HSplitView` of two tall columns). **(b)** Symmetric layout invariant: both deck waveform panes are always rendered side-by-side. In single-deck mode (deck B chB empty in Preferences) deck B's pane shows an idle placeholder matching the deck B header's `OFF` state instead of vanishing. Status strip gains live battery + wall-clock per §9.3 (`IOPSCopyPowerSourcesInfo`-driven battery, system clock for wall time). **Demo criterion:** every screenshot from M10.4 forward is in the canonical orientation. | 1–2 days |
-| **M10.5** | **File playback dev loop** | The dev-loop unblocker — Dub becomes testable without an SL3. New FFI surface on `DubEngine`: `loadTrack(deck, url)` (decodes via `dub-io`, sends `Command::DeckLoad`), `play(deck)`, `pause(deck)`, `seek(deck, secs)`, `trackInfo(deck) -> TrackInfo?` (title, artist, duration, sample rate, format), `position(deck) -> (elapsed_secs, remaining_secs)`. UI: drag-and-drop a file from Finder onto either deck pane, deck header switches its source pill to `FILE` and populates title / artist / format chip / track-time. Offline-rendered peaks (whole-track decode produces a static `Vec<PeakChunk>` at load time) feed the existing Metal renderer through the same `peaks_extend` contract. A slim filesystem browser replaces the `LIBRARY — M11` placeholder so the user can navigate to a folder, double-click a file → loads to the focused deck. **No library DB, no metadata indexing, no crates** — this is intentionally below M11. `FFI_VERSION` bumps to 5. | 4–5 days |
-| **M10.6** | **Mouse transport + position navigation + Repeat** | The mouse-allowed transport surfaces from §6.1.2 / §6.1.3 / §5.4.2. **Panic Play** (§6.1.2): `Space` (or click the deck-header Play glyph) on a Timecode deck transitions to last-known-velocity playback, ignoring timecode input; clean LFSR return auto-resumes, another `Space` cancels. New FFI: `panicPlay(deck)`, `cancelPanicPlay(deck)`. **Casual Play** (§6.1.3): in File mode `Space` is normal transport, `⇧Space` restarts; deck header source pill shows `FILE`. **Overview click-jump** (§6.1): click anywhere on the deck's overview column → playhead seeks to that absolute position. Allowed in File mode always; in Timecode mode only when Panic Play is engaged. **Zoomed click-scrub** (§6.1): click anywhere on the zoomed column → fine-scrub position. File mode only; disabled in Timecode regardless of Panic Play. **Repeat** (§5.4.2): keyboard `R` toggles per-deck; auto-engages when the timecode record runs out — same engine state as Panic Play, different trigger. Tracking-quality indicator (§5.4) wired into the deck-header source pill dot colour (green / amber / red). `FFI_VERSION` bumps to 6. | 4–5 days |
+| **M10.5** | **File playback dev loop** | The dev-loop unblocker — Dub becomes testable without an SL3. Splits into M10.5a (Rust + FFI) and M10.5b (Apple shell). **M10.5a — shipped:** new `DubEngine` surface (`start_engine` for output-only sessions, `load_track`, `play`, `pause`, `seek`, `position` → `PositionInfo`, `track_info` → `TrackInfo`); `dub-peaks` gains `compute_offline_peaks` so whole-track peaks compute synchronously at load time; the FFI's per-deck `PeakSource` enum routes `peaks_extend` through either the live Thru stream (M9) or the offline File buffer (M10.5a) transparently; `FFI_VERSION` 4→5. **M10.5b — Apple shell:** auto-detect lifecycle (multi-channel input → Timecode mode via `start_thru_two_deck`; built-in only → Prep mode shell via `start_engine`); single-pass renderer refactor (`chunksAbovePlayhead` uniform, vertex shader linear y-map across full NDC, M10.4 behaviour preserved when no future peaks are present); drag-and-drop a file from Finder onto either deck pane → loads + deck header switches source pill to `FILE` and populates title / duration / track-time; 30 Hz position polling drives the deck-header time row; slim FS browser replaces the `LIBRARY — M11` placeholder (folder picker + single-click selection, **no double-click load**); `Space` loads the FS-browser-selected file into the non-master, stopped deck per §6.4 — if the non-master is playing, the pane flashes red for 200 ms with a "deck is playing — lift the needle" overlay; **master-deck tracking** wires up per §6.4 with a `MASTER` chip in the master deck's header. **No library DB, no metadata indexing, no crates, no other keyboard transport** — those are M11 / per-feature future milestones. | 4–5 days |
+| **M10.6** | **Mouse transport + position navigation + Repeat** | The mouse-allowed transport surfaces from §6.1.2 / §6.1.3 / §5.4.2. **Panic Play** (§6.1.2): click the deck-header Play glyph on a Timecode deck → last-known-velocity playback, ignoring timecode input; clean LFSR return auto-resumes, click cancels. New FFI: `panicPlay(deck)`, `cancelPanicPlay(deck)`. **Casual Play** (§6.1.3): in File mode click Play / Pause / Restart glyphs in the deck header (deck pill shows `FILE`). **Overview click-jump** (§6.1): click anywhere on the deck's overview column → playhead seeks to that absolute position. Allowed in File mode always; in Timecode mode only when Panic Play is engaged. **Zoomed click-scrub** (§6.1): click anywhere on the zoomed column → fine-scrub position. File mode only; disabled in Timecode regardless of Panic Play. **Repeat** (§5.4.2): UI toggle per-deck in the deck header; auto-engages when the timecode record runs out — same engine state as Panic Play, different trigger. Tracking-quality indicator (§5.4) wired into the deck-header source pill dot colour (green / amber / red). Keyboard bindings for any of the above land in M10.6 only if the M10.5b shakedown surfaces a clear need; otherwise mouse-only for this milestone (DJs lift the needle to use the mouse, which is fine for these recovery / casual paths). `FFI_VERSION` bumps to 6. | 4–5 days |
 | **M10.7** | **Phase-Drift Trail** | Dub's headline beat-matching aid (§9.4). New `dub-match` crate (sibling of `dub-bpm` / `dub-peaks` / `dub-spectral`): a `MatchStream` analysis thread consumes both decks' `dub-bpm` ODFs off-RT, computes a rolling cross-correlation over ≈ 2 bars with a ±1-beat lag window (~40 lag candidates × 200 frames per update), emits `MatchSample { phase_ms, confidence, timestamp }` at 30 Hz to an SPSC ring. Audio-thread cost: **zero** (ODFs already running). FFI: `matchExtend(start_idx) -> Vec<u8>` mirroring `peaks_extend`. UI: `apple/Dub/Performance/PhaseDriftView.swift` — Metal-rendered vertical strip ≈ 80 px wide in the centre gutter, time **bottom→top** matching the waveform direction discipline (§9.1 / §9.4), dot brightness = confidence, dot colour blended from deck tints; numeric overlays `Δ BPM = +0.3` (top, slope-derived) and `Δ ms = +12` (bottom, instantaneous). Grid-agnostic by construction; degrades gracefully (dim dots) when ODFs are weak. `FFI_VERSION` bumps to 7. **Single mode only — no Preferences toggle for "numeric-only" variant in v1.** | 5 days |
 | **M10.8** | **Track Preparation Mode shell** | Auto-detection of available audio interface at launch (§3.1). If no multi-channel interface present, the app boots into Track Preparation Mode — alternate root view (`apple/Dub/Prep/PrepView.swift`) hosting a single-deck **horizontal** waveform full-width, the library prominent below. Manual override in Preferences (`Mode: Auto / Performance / Preparation`). **Shell only:** the mode renders the chrome and supports load + play / pause; **no** beatgrid editor, **no** hot-cue prep, **no** track gain tweaking yet (those are v1.x per §3 — they'd substantially expand v1 scope and the user explicitly chose option (a) shell-only in the M10.3 planning round). The mode's *purpose* is visible from M10.8; its *tooling* arrives in v1.x. | 2 days |
 | **M11** | **Library import: Serato** | Import Serato library, browse it, load tracks, beatgrids appear. | 1 week |

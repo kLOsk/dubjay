@@ -23,7 +23,7 @@
 //  default M10.1 palette; M10.2 will surface palette presets via
 //  a SwiftUI sub-view.
 //
-//  Layout / sizing (M10.4 — vertical orientation):
+//  Layout / sizing (M10.4 vertical + M10.5b single-pass past+future):
 //
 //  Each chunk is rendered as a **horizontal** bar at a fixed vertical
 //  position. The deck column is a *tall* MTKView; chunks stack
@@ -32,27 +32,50 @@
 //
 //  Vertical NDC ranges (NDC y goes from -1 = bottom to +1 = top):
 //      • Past region:   y ∈ [+0.5, +1.0]  (top 25 % of viewport)
-//        Chunks already played live here.
-//      • Playhead line: y =  +0.5         (25 % from the top)
+//      • Playhead line: y =  +0.5         (25 % from the top; rendered
+//                                          as an overlay by `WaveformView`)
 //      • Future region: y ∈ [-1.0, +0.5)  (bottom 75 % of viewport)
-//        Reserved for File-mode pre-decoded peaks (M10.5+); empty in
-//        Thru-only mode where there is no future audio.
 //
-//  We only render past chunks here. The `chunksVisible` uniform
-//  counts *only* the chunks that fit in the top 25 % strip (one chunk
-//  per output pixel, configurable). iid 0 is the oldest visible
-//  chunk (top of screen); iid chunksVisible-1 is the newest (just
-//  above the playhead).
+//  The renderer dispatches a single draw with `chunksVisible` total
+//  instances. The first `chunksAbovePlayhead` instances land in the
+//  past region (top 25 %); the remaining `chunksVisible -
+//  chunksAbovePlayhead` instances land in the future region (bottom
+//  75 %). The shader does the piecewise NDC mapping below.
+//
+//  iid 0                       → oldest visible past chunk (top of
+//                                viewport, y → +1.0)
+//  iid chunksAbovePlayhead - 1 → newest past chunk (just above the
+//                                playhead, y → +0.5)
+//  iid chunksAbovePlayhead     → first future chunk (just below the
+//                                playhead, y → +0.5⁻)
+//  iid chunksVisible - 1       → last future chunk (bottom of
+//                                viewport, y → -1.0)
+//
+//  This single-pass scheme works regardless of mode:
+//    • Thru mode: `chunksAbovePlayhead == chunksVisible` (no future
+//      data), the shader's past branch fires for every instance, the
+//      future region renders empty — identical to M10.4 behaviour.
+//    • File mode: `chunksAbovePlayhead > 0` AND `chunksAbovePlayhead
+//      < chunksVisible`, both branches fire.
+//    • Track-just-started: `chunksAbovePlayhead == 0`, only future
+//      branch fires; the past region is empty (no audio has played
+//      yet), which is correct.
 //
 //  Per-instance NDC math:
-//      fy       = (iid + 0.5) / chunksVisible   in [0, 1]
-//      yCenter  = +1.0 - fy * 0.5               in [+1.0, +0.5]
-//      dy       = 0.25 / chunksVisible          (half the chunk's
-//                                                vertical thickness;
-//                                                full strip is 0.5
-//                                                NDC tall split among
-//                                                chunksVisible bars)
-//      x        = sample amplitude * yScale     in [-yScale, +yScale]
+//      Let n_above = max(1, chunksAbovePlayhead)
+//          n_below = max(1, chunksVisible - chunksAbovePlayhead)
+//
+//      If iid < chunksAbovePlayhead:           // past
+//          fy      = (iid + 0.5) / n_above     in [0, 1]
+//          yCenter = +1.0 - fy * 0.5           in [+1.0, +0.5]
+//          dy      = 0.25 / n_above
+//      Else:                                   // future
+//          j       = iid - chunksAbovePlayhead
+//          fy      = (j + 0.5) / n_below       in [0, 1]
+//          yCenter = +0.5 - fy * 1.5           in [+0.5, -1.0]
+//          dy      = 0.75 / n_below
+//
+//      x = sample amplitude * yScale  in [-yScale, +yScale]
 //
 //  Band chunk lookup:
 //
@@ -91,9 +114,15 @@ struct BandPeakChunk {
 struct Uniforms {
     // First broadband chunk to render (ring index).
     uint  chunkOffset;
-    // Total chunks visible in the past region (top 25 % strip).
+    // Total chunks visible across both past and future regions.
     // `instance_id` ranges over [0, chunksVisible).
     uint  chunksVisible;
+    // Number of `chunksVisible` instances assigned to the past region
+    // (top 25 % strip). The remaining `chunksVisible -
+    // chunksAbovePlayhead` instances render in the future region
+    // (bottom 75 %). 0 = no past (track just started); == chunksVisible
+    // = no future (Thru mode behaviour). See file-level layout doc.
+    uint  chunksAbovePlayhead;
     // Horizontal amplitude scale applied to min/max before NDC.
     // 0.95 keeps the bars off the very edge of the viewport
     // horizontally (name kept as `yScale` for ABI continuity — the
@@ -164,17 +193,25 @@ vertex VertexOut waveformVertex(
         hi =  1e-4;
     }
 
-    // M10.4 vertical layout:
-    //   • iid 0           → oldest visible chunk → top of viewport (y=+1)
-    //   • iid lastVisible → newest visible chunk → just above the
-    //                       playhead (y → +0.5)
-    //   • Below the playhead (y < +0.5) is the reserved future
-    //     region; this shader draws nothing there (the renderer
-    //     issues only `chunksVisible` instances, which all live in
-    //     the top 25 % strip).
-    float fy = (float(iid) + 0.5) / float(max(1u, u.chunksVisible));
-    float ndcY = 1.0 - fy * 0.5;
-    float dy   = 0.25 / float(max(1u, u.chunksVisible));
+    // M10.5b piecewise NDC mapping. iid < chunksAbovePlayhead lands
+    // in the past region (top 25 %); iid >= chunksAbovePlayhead in
+    // the future region (bottom 75 %). See file-level doc for the
+    // full layout math.
+    float ndcY;
+    float dy;
+    if (iid < u.chunksAbovePlayhead) {
+        float n_above = float(max(1u, u.chunksAbovePlayhead));
+        float fy = (float(iid) + 0.5) / n_above;
+        ndcY = 1.0 - fy * 0.5;
+        dy   = 0.25 / n_above;
+    } else {
+        uint chunksBelow = u.chunksVisible - u.chunksAbovePlayhead;
+        float n_below = float(max(1u, chunksBelow));
+        uint j = iid - u.chunksAbovePlayhead;
+        float fy = (float(j) + 0.5) / n_below;
+        ndcY = 0.5 - fy * 1.5;
+        dy   = 0.75 / n_below;
+    }
 
     // Quad corners (triangle strip vertex order, post-rotation):
     //   0: bottom-left, 1: bottom-right, 2: top-left, 3: top-right

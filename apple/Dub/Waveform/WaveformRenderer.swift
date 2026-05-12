@@ -33,11 +33,18 @@ import DubCore
 /// order, type, and padding match exactly so we can `memcpy` it into
 /// the uniforms buffer without any per-frame allocation.
 ///
-/// Eight 4-byte fields = 32 bytes total. Matches Metal's natural
-/// alignment for a `constant Uniforms&`.
+/// Nine 4-byte fields = 36 bytes total. Padded out to 40 bytes by
+/// Metal's natural alignment for a `constant Uniforms&`.
 private struct WaveformUniforms {
     var chunkOffset: UInt32
     var chunksVisible: UInt32
+    /// M10.5b: number of `chunksVisible` instances assigned to the
+    /// past region (top 25 %). When `chunksAbovePlayhead ==
+    /// chunksVisible` the renderer behaves as in M10.4 (past only,
+    /// no future). When `chunksAbovePlayhead < chunksVisible` the
+    /// remaining instances render in the future region (bottom 75 %).
+    /// See Shaders.metal layout doc.
+    var chunksAbovePlayhead: UInt32
     var yScale: Float
     var samplesPerPeakChunk: UInt32
     var bandChunkOffset: UInt32
@@ -86,20 +93,24 @@ final class WaveformRenderer: NSObject {
     // MARK: Configuration
 
     /// Power-of-two number of broadband chunks the GPU ring buffer
-    /// can hold. 2^17 = 131 072 chunks ≈ 175 s of audio at 48 kHz /
-    /// 64 sample chunks; comfortably more than the longest visible
-    /// window `chunksVisible` would ever request. Sized as a const
-    /// so the modulo math compiles to a bit-mask.
-    static let chunkCapacity: Int = 131_072
+    /// can hold. 2^20 = 1 048 576 chunks ≈ 1 400 s of audio at 48 kHz /
+    /// 64-sample chunks (~23 min). Sized so the entire offline-decoded
+    /// peak set of any realistically-long DJ track (M10.5 File mode)
+    /// fits in the ring without head-wrap collisions during a seek
+    /// back to the start of a long track. The Thru-mode case never
+    /// needed more than ~175 s, but oversizing here costs only ~12 MB
+    /// per deck of unified memory on Apple Silicon. Power-of-two so
+    /// the modulo math compiles to a bit-mask.
+    static let chunkCapacity: Int = 1_048_576
 
     /// Power-of-two number of band chunks the GPU ring buffer can
     /// hold. Band chunks occur once per `BAND_SAMPLES_PER_CHUNK`
     /// audio samples (= 512), broadband chunks once per 64 — so
-    /// per second of audio we get 8× fewer band chunks. 2^14 = 16
-    /// 384 band chunks → ~175 s at 48 kHz, matching the broadband
-    /// ring's coverage. Power-of-two so the shader's `(idx %
-    /// bandCapacity)` compiles to a mask.
-    static let bandChunkCapacity: Int = 16_384
+    /// per second of audio we get 8× fewer band chunks. 2^17 =
+    /// 131 072 band chunks → ~1 400 s at 48 kHz, matching the
+    /// broadband ring's coverage. Power-of-two so the shader's
+    /// `(idx % bandCapacity)` compiles to a mask.
+    static let bandChunkCapacity: Int = 131_072
 
     /// Maximum number of frames the CPU is allowed to queue ahead
     /// of the GPU. The standard "three frames in flight" Metal
@@ -352,43 +363,90 @@ final class WaveformRenderer: NSObject {
 
         // 2. Compute the visible window.
         //
-        // M10.4 vertical layout: the time axis is the deck pane's
-        // height; we render only chunks that fit in the top 25 %
-        // (past region) per `pastRegionFraction` and PRD §9.1.
+        // M10.5b piecewise vertical layout: the time axis is the
+        // deck pane's height. The playhead lives at 25 % from the
+        // top (PRD §9.1) and we render BOTH a past region above it
+        // (top 25 %) and a future region below it (bottom 75 %).
+        //
+        //   Past pixels   ≈ height * 0.25  → chunksAbovePlayhead
+        //                                    instances rendered with
+        //                                    NDC y ∈ [+0.5, +1.0]
+        //   Future pixels ≈ height * 0.75  → chunksBelowPlayhead
+        //                                    instances rendered with
+        //                                    NDC y ∈ [-1.0, +0.5]
+        //
+        // Thru mode (no future data): `chunksBelowPlayhead = 0`, so
+        // only the past branch fires — identical to M10.4 behaviour.
         let drawableSize = view.drawableSize
         let pixelHeight = max(1, Int(drawableSize.height))
         let pastPixels =
             max(1, Int((Double(pixelHeight) * WaveformRenderer.pastRegionFraction).rounded()))
-        let chunksFromPixels = Int((Double(pastPixels) * WaveformRenderer.chunksPerPixel).rounded())
-        let chunksAvailable = min(Int(totalChunksAppended), WaveformRenderer.chunkCapacity)
-        let chunksVisible = max(1, min(chunksFromPixels, chunksAvailable))
+        let futurePixels =
+            max(0, Int((Double(pixelHeight)
+                * (1.0 - WaveformRenderer.pastRegionFraction)).rounded()))
+        let chunksAbovePixels =
+            Int((Double(pastPixels) * WaveformRenderer.chunksPerPixel).rounded())
+        let chunksBelowPixels =
+            Int((Double(futurePixels) * WaveformRenderer.chunksPerPixel).rounded())
 
-        // First chunk to render = "oldest visible chunk".
-        // We display the newest `chunksVisible` chunks, so the
-        // oldest visible global index = totalChunksAppended -
-        // chunksVisible.
-        let oldestGlobal = totalChunksAppended &- UInt64(chunksVisible)
-        let oldestRingOffset = Int(oldestGlobal % UInt64(WaveformRenderer.chunkCapacity))
+        // Figure out the playhead chunk + how many chunks we have
+        // past it. The renderer asks the engine for the position; a
+        // `has_track` deck (File mode) drives the playhead from
+        // `elapsed_secs`. Otherwise (Thru mode, empty deck) the
+        // playhead = newest chunk just appended.
+        let pos = engine.position(deckIdx: deckIdx)
+        let peaksLenGlobal = totalChunksAppended
+        let hasFuture = pos.hasTrack
+        let playheadChunk: UInt64
+        if hasFuture {
+            // File mode. Map elapsed seconds → chunk index using the
+            // captured cadence.
+            let sr = Double(engine.sampleRate())
+            let spc = Double(samplesPerPeakChunk)
+            if sr > 0, spc > 0 {
+                let elapsedSamples = pos.elapsedSecs * sr
+                let chunkF = (elapsedSamples / spc).rounded(.down)
+                let chunkClamped = max(0.0, min(chunkF, Double(peaksLenGlobal &- 1)))
+                playheadChunk = UInt64(chunkClamped)
+            } else {
+                playheadChunk = peaksLenGlobal == 0 ? 0 : peaksLenGlobal &- 1
+            }
+        } else {
+            // Thru mode (or empty deck). The newest chunk is the
+            // playhead. peaksLenGlobal == 0 ⇒ nothing yet.
+            playheadChunk = peaksLenGlobal == 0 ? 0 : peaksLenGlobal &- 1
+        }
 
-        // Compute the band ring offset that corresponds to the
-        // *audio-time* start of the visible window. Band chunks
-        // cover `samplesPerBandChunk` audio samples each; the
-        // oldest visible audio sample is `oldestGlobal *
-        // samplesPerPeakChunk`, so the matching band index is
-        // (that / samplesPerBandChunk) modulo the band ring.
-        //
-        // The shader does the *per-instance* lookup relative to
-        // this base; we only need to land on the right *starting*
-        // point.
-        let bandPerSample = max(UInt64(samplesPerBandChunk), 1)
-        let oldestSample = oldestGlobal &* UInt64(samplesPerPeakChunk)
-        let oldestBandGlobal = oldestSample / bandPerSample
-        let oldestBandRingOffset =
-            Int(oldestBandGlobal % UInt64(WaveformRenderer.bandChunkCapacity))
+        // How many ring slots are valid behind / ahead of the
+        // playhead? Past region includes the playhead chunk itself
+        // (i.e. "the chunk just played" is the bottom of the past
+        // region, sitting just above the y=+0.5 NDC playhead line —
+        // this matches M10.4 behaviour). Future region starts at
+        // `playheadChunk + 1`.
+        let chunksAvailableBehind: Int
+        let chunksAvailableAhead: Int
+        if peaksLenGlobal == 0 {
+            chunksAvailableBehind = 0
+            chunksAvailableAhead = 0
+        } else {
+            chunksAvailableBehind = min(Int(playheadChunk) + 1, WaveformRenderer.chunkCapacity)
+            if hasFuture {
+                chunksAvailableAhead = min(
+                    Int(peaksLenGlobal &- 1 &- playheadChunk),
+                    WaveformRenderer.chunkCapacity)
+            } else {
+                chunksAvailableAhead = 0
+            }
+        }
+
+        let chunksAbove = max(0, min(chunksAbovePixels, chunksAvailableBehind))
+        let chunksBelow = max(0, min(chunksBelowPixels, chunksAvailableAhead))
+        let chunksVisible = chunksAbove + chunksBelow
 
         // Bail out early if there's nothing visible yet (just
         // present a clear background).
-        guard chunksAvailable > 0,
+        guard peaksLenGlobal > 0,
+              chunksVisible > 0,
               let drawable = view.currentDrawable,
               let passDescriptor = view.currentRenderPassDescriptor
         else {
@@ -396,10 +454,31 @@ final class WaveformRenderer: NSObject {
             return
         }
 
+        // First instance (iid = 0) is the oldest visible past chunk.
+        // The past region renders chunks [playheadChunk - chunksAbove
+        // + 1, playheadChunk]; the future region renders chunks
+        // [playheadChunk + 1, playheadChunk + chunksBelow]. Combined
+        // ring window starts at `playheadChunk + 1 - chunksAbove`.
+        // When chunksAbove == 0 (future-only), this lands one past
+        // the playhead — also correct.
+        let oldestGlobal = (playheadChunk &+ 1) &- UInt64(chunksAbove)
+        let oldestRingOffset = Int(oldestGlobal % UInt64(WaveformRenderer.chunkCapacity))
+
+        // Band ring offset matching the *audio-time* start of the
+        // visible window. Band chunks cover `samplesPerBandChunk`
+        // audio samples each; oldest visible audio sample =
+        // `oldestGlobal * samplesPerPeakChunk`. Modulo bandCapacity.
+        let bandPerSample = max(UInt64(samplesPerBandChunk), 1)
+        let oldestSample = oldestGlobal &* UInt64(samplesPerPeakChunk)
+        let oldestBandGlobal = oldestSample / bandPerSample
+        let oldestBandRingOffset =
+            Int(oldestBandGlobal % UInt64(WaveformRenderer.bandChunkCapacity))
+
         // 3. Fill the current uniform buffer.
         let uniforms = WaveformUniforms(
             chunkOffset: UInt32(oldestRingOffset),
             chunksVisible: UInt32(chunksVisible),
+            chunksAbovePlayhead: UInt32(chunksAbove),
             yScale: WaveformRenderer.yScale,
             samplesPerPeakChunk: samplesPerPeakChunk,
             bandChunkOffset: UInt32(oldestBandRingOffset),
