@@ -1,4 +1,4 @@
-# Dub — Shipped Milestones (M0 → M8.1)
+# Dub — Shipped Milestones (M0 → M10.2)
 
 > Companion to [`docs/PRD.md`](PRD.md). The PRD's milestone table keeps shipped rows
 > short; this doc holds the detailed write-ups, design history, and rationale
@@ -12,11 +12,12 @@
 > working memory. Moved verbatim here; nothing has been rewritten or
 > summarized away.
 
-**Currently shipped:** M0 through M8.1 (BPM octave fix — log-band ODF + windowed-energy tempo picker). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite.
+**Currently shipped:** M0 through M9 (live waveform-peak capture on Thru), M0.5 (Apple shell + smoke screen), M9.5 (dub-spectral extraction + 8-band band-peak capture), M10 — split into M10-A (UniFFI `DubEngine` surface) and M10-B (Metal-rendered broadband waveform live on screen), M10.1 (multi-colour fragment shader mixing 8 bands into RGB with broadband-RMS luminance), and M10.2 (partial — deck B wired up, palette presets, honest silence/clipping; onset glow / beat-aware saturation / constant-Q bass split / mip pyramids each remain independently shippable polish bullets per the plan). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite. The Apple project builds end-to-end via `./scripts/bootstrap.sh && xcodebuild build -scheme Dub`.
 
 ## Table of contents
 
 - [M0 — Scaffold + CI + test discipline](#m0)
+- [M0.5 — Apple shell + smoke screen](#m05)
 - [M1 — First Sound](#m1)
 - [M2 — Transport (lock-free command channel)](#m2)
 - [M2.1 — RT discipline + soak harness](#m21)
@@ -39,6 +40,12 @@
 - [M7.5 — BPM engine + offline analysis](#m75)
 - [M8 — Auto-BPM on Thru — streaming driver](#m8)
 - [M8.1 — BPM octave fix (log-band ODF + windowed-energy picker)](#m81)
+- [M9 — Live waveform capture (Thru)](#m9)
+- [M9.5 — dub-spectral extraction + 8-band peak capture](#m95)
+- [M10-A — `dub-ffi` `DubEngine` UniFFI surface](#m10a)
+- [M10-B — Metal renderer + first live broadband waveform](#m10b)
+- [M10.1 — Multi-colour fragment shader](#m101)
+- [M10.2 — Polish: deck B, palette presets, honest silence/clipping](#m102)
 
 ---
 
@@ -685,4 +692,578 @@ The algorithmic floor is set: M8.1 is what the picker looks like; future tuning 
 
 ---
 
-*End of shipped milestone history. Forward-looking milestones (M9 onward) live in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+---
+
+<a id="m9"></a>
+## M9 — Live waveform capture (Thru)
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 4–6 days &nbsp;·&nbsp; **Actual:** 1 day
+
+The data layer underneath the M10 waveform UI. Same architectural shape as M8 (off-RT thread consuming a `ringbuf` tap from `ThruSource`, exposing a thread-safe handle to the UI side), but producing a growing append-only sequence of `PeakChunk { min, max, rms }` envelope records instead of BPM events. Shipped as `dub-peaks`, a sibling of `dub-bpm`.
+
+### Why a new crate
+
+Same boundary justification as `dub-bpm`: the engine stays hot (only the audio-thread tap and the off-RT spawn entry-point touch the engine), and the analysis logic lives outside it. The PRD §4.1 layering already pre-committed to this — `dub-peaks` is the concretization of the "live waveform engine" bullet, mirroring `dub-bpm`. No FFI yet; the M10 renderer pulls peaks via direct library import in-process.
+
+### Audio thread side — one mono-downmix, two taps
+
+`ThruSource` was M7-era single-tap (audio out only) and M8 grew an optional mono-downmix BPM tee. M9 didn't need a *new* downmix — the BPM and peaks consumers both want the same mono samples, so the right refactor was to **share the mono-downmix scratch and dispatch to whichever taps are enabled**:
+
+```text
+       L,R input (interleaved)
+            │
+            ▼
+  stereo render → routed output  (always)
+            │
+            ▼
+  mono-downmix scratch (computed once if any tap enabled)
+            ├─ → bpm_tx.push_slice  (M8, optional)
+            └─ → peaks_tx.push_slice (M9, optional)
+```
+
+Cost when both taps are enabled: one extra `push_slice` (a memcpy into an SPSC ring). Verified alloc-free by `both_taps_render_is_alloc_free`. The pre-allocated `mono_scratch` is `max_block_frames * 4` bytes (4 KB at the default 1024-frame block) and lives in `ThruSource` regardless of whether any tap is attached — irrelevant memory, dead-simple lifecycle.
+
+The renamed buffer (`bpm_scratch` → `mono_scratch`) and the `with_peaks_tap(peaks_tx)` builder are the only audio-thread surface changes. `with_bpm_tee` keeps its M8 signature for source compatibility; the `max_block_frames` parameter is now `debug_assert!`ed to match the constructor's value but no longer used for sizing.
+
+### `dub-peaks` internals — three files, no surprises
+
+The crate decomposes the same way `dub-bpm` does, so reading the two side-by-side surfaces an obvious shared pattern (analysis layer + reader layer + thread driver):
+
+- **`decimator.rs`** — `Decimator::new(samples_per_chunk)` + `feed(samples, |chunk| ...)`. Pure online aggregator over fixed-size windows. Holds a `(min, max, sumsq, count)` rolling state across `feed` calls so block-boundary alignment is transparent. RMS is `sqrt(sumsq / N)` with `sumsq` accumulated in `f64` (one extra int-add per sample, completely negligible) so 4096-sample mip-2 chunks stay numerically stable. `flush` emits a partial-chunk on shutdown.
+
+- **`buffer.rs`** — `PeakBuffer` (cloneable handle to `Arc<Inner>`) with the standard "lock-free count + RwLock-protected Vec" sharing pattern:
+  - `len()` is a single `AtomicUsize` Acquire-load — the renderer's "anything new?" check at 60 fps never touches the lock.
+  - `push_chunks(slice)` and `snapshot()` / `extend_chunks(start_idx, dst)` briefly take the RwLock. The decimator pushes one batch per 20 ms drain loop; the renderer takes a read lock once per frame.
+  - `extend_chunks` is the renderer fast path: O(new chunks), not O(total). The caller passes its last-seen `start_idx`, and the function appends only the new chunks into the caller's local Vec mirror. Returns the new total length for the next call.
+
+- **`stream.rs`** — `PeakStream::spawn(audio_rx, cfg)` → joinable thread, mirrors `BpmStream`. The analysis loop drains the audio ring into a 4096-sample scratch, runs the `Decimator`, collects emitted chunks into a pre-allocated `chunk_scratch` Vec, and pushes them to the buffer. 20 ms poll cadence when the ring is empty. `Drop` always shuts down and joins; `shutdown()` is the explicit form for surfacing join panics.
+
+### Bytes-on-the-wire format
+
+`PeakChunk` is `#[repr(C)]`, 12 bytes (3 × `f32`). Deliberately exposed as the M10 consumer contract — a `&[PeakChunk]` from `PeakBuffer::extend_chunks` can go directly into a Metal vertex buffer with no further packing. The crate-level module docs spell out the contract: cache `start_idx` per stream, call `extend_chunks` each frame, treat the slice as wire-format.
+
+`min`/`max`/`rms` rather than `peak`/`rms` or `peak` alone is the standard envelope-display tuple used by Audacity, Mixxx, and Serato. Properly mastered drums are asymmetric (a kick's positive peak meaningfully differs from its negative one), and the RMS gives perceived-loudness shading for free without a second pass.
+
+### Engine integration — three attach methods, one ThruSource
+
+`EngineHandle` gained two new convenience methods alongside the existing M8 wrapper:
+
+- `attach_thru_source_with_peaks_tracking(idx, rx, thru_cfg, peaks_cfg)` — M9 only, no BPM.
+- `attach_thru_source_with_telemetry(idx, rx, thru_cfg, tracker_cfg, peaks_cfg)` — both M8 and M9. **Strictly cheaper** than calling the BPM- and peaks-only attach methods in sequence: there's only one `ThruSource` with both taps, the mono-downmix runs once, and both analysis threads spawn from the same call.
+- `attach_thru_source_with_bpm_tracking` (M8) — unchanged.
+
+Plus the bare `attach_thru_source` (M7), giving 4 attach variants total. The CLI picks the right one based on the `(--no-bpm-track?, --no-peaks-track?)` flag combination — see below.
+
+Each method validates the new SR before attaching; M8 and M9 ringbuf capacities both default to 1 s of mono at the engine SR (the `BPM_TEE_RING_CAPACITY_SECS` and `PEAKS_TAP_RING_CAPACITY_SECS` constants).
+
+Error surface: three new error enums (`ThruAttachWithPeaksError`, `ThruAttachWithTelemetryError`, plus the existing `ThruAttachWithBpmError`), each carrying `Thru(ThruAttachError)`, sample-rate mismatch, and the relevant subsystem config error. Separating them keeps each call's documented failure set focused; the `telemetry` enum's two `*SampleRateMismatch` variants name which subsystem mismatched so the user knows which `_sr` to fix.
+
+### CLI — peaks default on, opt out + debug dump
+
+`dub thru` gained two flags:
+
+- `--no-peaks-track` — analogous to the M8 `--no-bpm-track`. Defaults off; every attached Thru deck spawns a `PeakStream` decimator. The periodic stats line gains a `peaks=[A=N B=M]` field with the per-deck captured-chunk count, so the operator can sanity-check capture is alive without M10 UI.
+
+- `--dump-peaks PATH` — on shutdown, write every captured chunk to `PATH` as CSV (`deck,chunk_idx,min,max,rms`). One row per chunk, header included. Useful for `gnuplot`/`awk`/`matplotlib` to validate the envelope shape before the Metal renderer exists, and for CI-style smoke tests that check "did capture produce reasonable peaks for this fixture."
+
+`--dump-peaks` + `--no-peaks-track` is rejected at parse time (the user would otherwise get a confusing empty-file). `--no-bpm-track` + `--no-peaks-track` together cleanly falls back to the bare `attach_thru_source` — no telemetry threads at all, M7's behaviour exactly.
+
+The attach dispatch is a small `match (no_bpm_track, no_peaks_track)` per deck that picks the right `EngineHandle` method. The four-arm match is the cleanest expression of the four feature combinations; trying to compose it into one builder API was worse than the explicit handful of attach methods.
+
+### Test surface
+
+The `dub-peaks` crate ships with **41 tests** (38 unit + 3 integration). The engine and CLI gained another **9 tests** between them. Coverage:
+
+- **Decimator (15 tests)** — chunk-boundary correctness (partial tails carry over across `feed` calls, block size doesn't change output, ramp produces strictly-increasing maxes), value correctness (RMS of constant, alternating ±1, silence-is-zero, min/max match extremes), reset/flush semantics, large-input invariants. The `block_size_does_not_change_output` test is the load-bearing one: feeding the same 256-sample buffer in 1-sample, 7-sample, and whole-buffer increments must produce *byte-identical* chunk sequences. If anything in the decimator depends on block alignment, this test catches it.
+
+- **Buffer (10 tests)** — empty buffer is empty, push increments len, snapshot captures all pushed chunks in order, `extend_chunks` appends only new (the renderer fast path) including the noop cases (caught-up start, start past len), cloned buffers share storage (Arc semantics), and a **concurrent producer/consumer stress test** that spawns a writer pushing 1000 chunks while the test thread polls `extend_chunks` — final mirror must equal full output and chunks must remain in producer order. This pins the lock-free `len()` + briefly-locked Vec pattern as correct under contention.
+
+- **Stream (10 tests)** — config validation (zero SR / zero chunk size rejected), end-to-end (samples push → chunks in buffer with correct min/max/rms), incremental reader streams chunks, lifecycle (dropping producer terminates thread, explicit shutdown joins promptly within 500 ms), silence pushes zero chunks through, **buffer handle outlives explicit shutdown** (Arc semantics — the renderer can keep a reference past stream teardown).
+
+- **End-to-end integration (3 tests, `tests/end_to_end.rs`)** — full spawn → push → drain → assert against closed-form expectations: constant signal yields uniform chunks, burst pattern alternates loud/silent chunks at the expected boundaries, and the incremental extend mirrors the full stream byte-identically across both an in-flight stream and a post-completion snapshot.
+
+- **ThruSource peaks tap (8 new tests)** — fresh source has no peaks tap, `with_peaks_tap` attaches, peaks tap receives mono downmix (`L=0.4, R=-0.2 → 0.1`), unaffected by gain (envelope reflects pre-gain input), silently drops on full ring, alloc-free render with peaks tap attached, underrun pushes zeros, and the crucial `bpm_and_peaks_tap_both_receive_same_mono_downmix` (both taps see identical samples after one downmix pass) plus `both_taps_render_is_alloc_free` (combining both taps is still RT-safe).
+
+- **EngineHandle attach (8 new tests)** — spawn-stream variants for peaks-only and combined-telemetry, SR mismatch / invalid chunk size / invalid deck idx rejection for both peaks-only and combined-telemetry attach. The capstone is `handle_attach_thru_with_peaks_captures_envelope_e2e`: feeds 512 stereo frames of constant 0.5 through the actual engine via `pump_one_block`, waits for the decimator to drain, and asserts the first 8 captured chunks are all `min == max == rms == 0.5` to 1e-5 tolerance.
+
+- **CLI flag tests (4 new)** — peaks-track defaults on, `--no-peaks-track` opts out, `--dump-peaks PATH` captures the path, `--dump-peaks` + `--no-peaks-track` is rejected at parse time. Plus a `dump_peaks_csv_writes_header_and_rows` unit test that injects chunks into a `PeakStream` directly (bypassing the audio thread) and verifies the CSV layout byte-for-byte against expected lines.
+
+### Sequencing notes worth keeping
+
+- **Engine drains commands then renders, in that order.** The first `pump_one_block` after `attach_thru_source_with_peaks_tracking` will process the attach command at the top of `render_routed` and *then* immediately render — pulling whatever happened to be in the input ring at that exact moment. The e2e test sets this up explicitly: push input frames *before* the first pump so the first captured chunk reflects the operator's input, not a block of underrun zeros from a momentary empty ring. Real-world this happens naturally (the operator drops a needle before pumping audio), but tests need the deterministic ordering.
+
+- **`PEAKS_TAP_RING_CAPACITY_SECS = 1`.** Mirrors `BPM_TEE_RING_CAPACITY_SECS`. The decimator polls every 20 ms; one second of slack absorbs any scheduling jitter on a healthy system. 192 KB per deck — meaningless on M-series hardware, far below the threshold where ring capacity becomes a memory concern.
+
+- **Buffer initial capacity defaults to 10 minutes.** `DEFAULT_BUFFER_CAPACITY_SECS = 600` × 48 kHz / 64 spc ≈ 450k chunks × 12 bytes ≈ 5.4 MB. Common-case mix-track length doesn't hit a single realloc; longer records (90 min vinyl side) reallocate once or twice off-RT. The audio thread never reallocates.
+
+### Forward link — what M10 needs from this
+
+The M10 waveform UI pulls peaks via `PeakStream::buffer()` (returns an `Arc`-clone of `PeakBuffer`), caches `start_idx`, and calls `extend_chunks` each render frame. The renderer's local Vec is the source of truth for what's on screen; the crate intentionally does NOT maintain mip pyramids — the renderer knows how many pixels it has and can downsample further on demand. Overview rendering (90 min on a 4K screen ≈ 67k samples/pixel) needs a second pass that averages every ~1000 chunks into one screen pixel; scratch rendering (5 s on 4K ≈ 62 samples/pixel) renders one chunk per pixel directly.
+
+Nothing in M9 commits to a mip schema. M10 will likely add a `MipLevel` enum or `with_decimation` config — the data layer is small and easy to expand.
+
+### Acceptance
+
+1. `cargo test --workspace` is green (53 new tests across `dub-peaks`, `dub-engine`, `dub-cli`; all pre-existing tests still pass).
+2. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+3. `dub thru` defaults to peaks-tracking on; stats line shows captured chunk counts per deck; `--dump-peaks PATH` writes a valid CSV on shutdown.
+4. The combined-telemetry attach is strictly cheaper than two separate attaches: one `ThruSource`, one mono-downmix, two taps, two analysis threads. Verified by the `both_taps_render_is_alloc_free` and `bpm_and_peaks_tap_both_receive_same_mono_downmix` ThruSource tests.
+
+---
+
+<a id="m05"></a>
+## M0.5 — Apple shell + smoke screen
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 3 days (delivered)
+
+### What it is
+
+The Apple-side counterpart of M0. M0 shipped the Rust workspace, CI, and RT-audit harness; M0.5 closes the cross-language toolchain loop so a developer with `xcodegen` + Xcode 15 on PATH can go from a clean checkout to a launched `Dub.app` window in one script invocation. The window itself is a deliberate smoke screen — `"Dub engine OK · v0.0.1"` pulled live from the Rust `dub-engine` crate via UniFFI — because the *toolchain* is what we're proving here, not any audio feature.
+
+Why this slot in the schedule. The original M0 PRD had M0.5 as a placeholder because generating an Xcode project purely from text was deemed brittle. The pivot here is XcodeGen: the `.xcodeproj` is regenerated from a YAML manifest at every bootstrap, so it stays diffable in PRs and reproducible in CI — same property we get from `Cargo.toml`.
+
+### Toolchain plumbing
+
+| Layer | What lives where |
+|---|---|
+| Rust core | `crates/dub-engine` (unchanged) |
+| FFI surface | `crates/dub-ffi` upgraded to UniFFI 0.28 proc-macros + `crate-type = ["lib", "staticlib", "cdylib"]` + a `uniffi-bindgen` binary (`required-features = ["uniffi-cli"]`) for library-mode binding generation |
+| Build script | `scripts/build-xcframework.sh` — `cargo build --target aarch64-apple-darwin --profile release` + `--target x86_64-apple-darwin`, `lipo -create` for the fat `libdub_ffi.a`, `cargo run --bin uniffi-bindgen --features uniffi-cli -- generate --library …` for the Swift bindings, `xcodebuild -create-xcframework` to bundle the universal `.a` + the C header into `apple/DubCore.xcframework/` |
+| Project gen | `apple/project.yml` → `apple/Dub.xcodeproj` via `xcodegen generate` |
+| One-shot | `scripts/bootstrap.sh` runs `build-xcframework.sh` then `xcodegen generate`, guarded by `command -v` checks for `xcodebuild`, `xcodegen`, `cargo` |
+| Swift package | `apple/DubShared/` — `Package.swift` declares a `binaryTarget` pointing at `../DubCore.xcframework` and a `DubCore` library target containing the generated bindings |
+| Apple app | `apple/Dub/` — `DubAppDelegate.swift` (`@main` `NSApplicationDelegate`), `MainWindowController.swift` (`NSWindow` + `NSHostingController`), `SmokeScreenView.swift` (SwiftUI `Text(greeting())` + version line), `Info.plist`/`Dub.entitlements` |
+
+### Why UniFFI proc-macros, not UDL
+
+UniFFI offers two surfaces: a `.udl` file (Mozilla's original IDL-style declaration) or `#[uniffi::export]` proc-macros directly on Rust items. We chose proc-macros for three reasons:
+
+1. **Single source of truth.** With UDL there's a constant risk of the `.udl` file drifting from `lib.rs`. With proc-macros, the Rust signature *is* the exposed surface.
+2. **No `build.rs` required.** Library-mode bindgen reads metadata embedded in the compiled `cdylib`, so the build pipeline is just `cargo build` → `uniffi-bindgen generate --library`. The `build.rs` UDL parsing step is gone.
+3. **Cleaner growth path.** M10-A adds the `DubEngine` interface as more `#[uniffi::export]` items + a `#[derive(uniffi::Object)]` struct, with no schema-file edits.
+
+The tradeoff is that some advanced UDL features (custom external types, callback interfaces with non-trivial ABI) are slightly less ergonomic in proc-macro mode. None of them apply to the M0.5 / M10 / M10.1 surface.
+
+### Why hybrid AppKit + SwiftUI
+
+The `@main` entry point is an `NSApplicationDelegate` (`DubAppDelegate`) holding a `MainWindowController`. The window's `contentViewController` is an `NSHostingController<SmokeScreenView>` — SwiftUI for the *contents* of the window, AppKit for the lifecycle and the window itself. This is the same split Apple recommends for apps that have both real-time content (M10's Metal waveform, scratch-pad gestures) and ordinary forms (settings, library browser). AppKit owns the audio HUD path; SwiftUI owns everything else.
+
+The cheap-to-write `SmokeScreenView` is the M0.5 deliverable. It will become a debug overlay in M10, when the window's primary content becomes the `WaveformView` + the input-device picker.
+
+### Why local-only signing
+
+The user does not have an Apple Developer account, and v1 doesn't need one to run locally during development. The XcodeGen manifest sets `CODE_SIGN_STYLE: Automatic` + `CODE_SIGN_IDENTITY: "-"`, which is Xcode's "Sign to Run Locally" path. Sandbox stays *off* in `Dub.entitlements` for two reasons:
+
+1. M10's CoreAudio device picker needs to talk to arbitrary input devices without entitlement gymnastics.
+2. Sandbox + hardened runtime are a *distribution* concern, not a *development* concern. Re-enabling them lands with the post-M10.2 distribution milestone, alongside a `scripts/codesign.sh` and notarisation.
+
+### File-level changes
+
+* [`Cargo.toml`](../Cargo.toml) — `uniffi = "0.28"` workspace-dep.
+* [`crates/dub-ffi/Cargo.toml`](../crates/dub-ffi/Cargo.toml) — `crate-type = ["lib", "staticlib", "cdylib"]`, `[[bin]] uniffi-bindgen`, `[features] uniffi-cli`, `uniffi = { workspace = true }`.
+* [`crates/dub-ffi/src/lib.rs`](../crates/dub-ffi/src/lib.rs) — `uniffi::setup_scaffolding!()` + `#[uniffi::export]` on `greeting()` and `engine_version()`. Both functions now return `String` instead of `&'static str` (UniFFI's String marshalling requires an owned value). Existing Rust tests updated.
+* [`crates/dub-ffi/src/bin/uniffi-bindgen.rs`](../crates/dub-ffi/src/bin/uniffi-bindgen.rs) — three-line wrapper around `uniffi::uniffi_bindgen_main()`.
+* [`apple/project.yml`](../apple/project.yml) — XcodeGen manifest (single `Dub` macOS target, `DubShared` swift-package dependency, sandbox-off entitlements).
+* [`apple/Dub/`](../apple/Dub/) — `DubAppDelegate.swift`, `MainWindowController.swift`, `SmokeScreenView.swift`, `Info.plist`, `Dub.entitlements`.
+* [`apple/DubShared/Package.swift`](../apple/DubShared/Package.swift) — Swift Package declaring `DubCoreFFI` binary target + `DubCore` Swift target.
+* [`apple/README.md`](../apple/README.md) — rewritten from placeholder to the M0.5-shipped layout + bootstrap instructions.
+* [`scripts/build-xcframework.sh`](../scripts/build-xcframework.sh), [`scripts/bootstrap.sh`](../scripts/bootstrap.sh) — new, both executable.
+* [`.gitignore`](../.gitignore) — `apple/*.xcodeproj/`, `apple/DubCore.xcframework/`, `apple/DubShared/Sources/DubCore/Generated/`, `apple/DubShared/.build/`, `apple/DubShared/.swiftpm/`, `apple/DubShared/Package.resolved`.
+
+### Acceptance
+
+1. `cargo build -p dub-ffi` succeeds. Adds `~1 min` to first-time compile due to UniFFI scaffolding crates; no impact on incremental builds.
+2. `cargo test -p dub-ffi` passes — `greeting()`, `engine_version()`, `FFI_VERSION` invariants all green.
+3. `cargo clippy -p dub-ffi --all-targets --features uniffi-cli -- -D warnings` is clean.
+4. `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` remain green — no regressions in pre-existing crates.
+5. On a Mac with `xcodegen` + Xcode 15: `./scripts/bootstrap.sh && open apple/Dub.xcodeproj` then ⌘R produces a window displaying `"Dub engine OK · v0.0.1"`.
+
+### What it does not ship
+
+* No audio I/O across FFI. `start_thru`, `peaks_extend`, device-picker lands with **M10-A**.
+* No `DubEngine` interface in the UDL surface — just two free functions. That's deliberate; M10-A introduces the engine handle.
+* No code signing beyond local "Sign to Run Locally". Notarisation is a separate post-M10.2 milestone.
+* No CI build target for the Apple side. The `make apple` target proposed in the plan is deferred until a macOS CI runner is wired (currently CI is Linux-only).
+
+---
+
+<a id="m95"></a>
+## M9.5 — `dub-spectral` extraction + 8-band peak capture
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 4 days (delivered)
+
+### What it is
+
+Two coordinated changes shipped as one milestone:
+
+* **M9.5a** — Pure refactor. The FFT + window + log-band + Klapuri-style magnitude-compression pipeline that lived inside `crates/dub-bpm/src/onset.rs` moves out to a new `crates/dub-spectral/` crate. `OnsetDetector` becomes a thin shell over `dub_spectral::SpectralFrameStream`. No behaviour change — the M8.1 hip-hop / dnb / reggae octave fixtures all pass byte-identical ODF values.
+* **M9.5b** — Data-layer extension. A new `dub_peaks::BandDecimator` runs alongside the existing broadband `Decimator` on the same mono-downmix tap; it emits a new `BandPeakChunk { rms_per_band: [f32; 8] }` once per FFT hop (~94 Hz at 48 kHz). The `PeakBuffer` gains parallel band storage that's opt-in at construction; `PeakStream` config gains `bands_enabled` (default `true`). `dub thru` gains `--no-band-peaks` and `--dump-band-peaks PATH`. This is the data layer M10.1 needs for multi-colour rendering — by landing it ahead of the renderer, M10 can be a Rust-side-already-stable affair.
+
+### Why extract first
+
+Two crates need the same FFT pipeline (BPM onset detection, M10.1 colour rendering). Three more will need it before v1 (key detection, transient FX, M21 fingerprint correlation). Owning the pipeline once means a fix to `λ` or the band layout automatically applies everywhere — versus discovering halfway through M10.1 that a colour-side magnitude compression decision contradicted a BPM-side one. The plan flagged the extraction as deferred-until-M11, then a re-prioritisation moved it here: the cost of dragging the FFT through M10 *unshared* (duplicated implementation, duplicated tests, divergent magnitude curves) outweighed the cost of one clean refactor up front.
+
+### Public API of `dub-spectral`
+
+```rust
+pub const FRAME_SIZE: usize = 1024;
+pub const HOP_SIZE: usize = 512;
+pub const NUM_BANDS: usize = 8;
+pub const BAND_MIN_HZ: f32 = 30.0;
+pub const BAND_MAX_HZ: f32 = 16_000.0;
+pub const LAMBDA: f32 = 1000.0;
+
+pub struct SpectralFrameStream { /* … */ }
+impl SpectralFrameStream {
+    pub fn new(sample_rate: u32) -> Self;
+    pub fn frame_size(&self) -> usize;
+    pub fn hop_size(&self) -> usize;
+    pub fn half_spectrum_size(&self) -> usize;
+    pub fn bands(&self) -> &[(usize, usize); NUM_BANDS];
+    pub fn process<F: FnMut(&[f32], &[(usize, usize); NUM_BANDS])>(
+        &mut self, block: &[f32], on_frame: F,
+    );
+    pub fn reset(&mut self);
+}
+pub fn compute_band_bins(sample_rate: u32, n_bins: usize) -> [(usize, usize); NUM_BANDS];
+```
+
+`SpectralFrameStream::process` is alloc-free after construction — verified by `process_is_alloc_free_after_construction` (input-buffer capacity stable across 16 iterations).
+
+### Data layer in `dub-peaks` (M9.5b)
+
+```rust
+pub const NUM_BANDS: usize = dub_spectral::NUM_BANDS;            // = 8
+pub const BAND_SAMPLES_PER_CHUNK: usize = dub_spectral::HOP_SIZE; // = 512
+
+#[repr(C)]
+pub struct BandPeakChunk {
+    pub rms_per_band: [f32; NUM_BANDS],   // 8 × f32 = 32 bytes
+}
+
+pub struct BandDecimator { /* wraps SpectralFrameStream */ }
+impl BandDecimator {
+    pub fn new(sample_rate: u32) -> Self;
+    pub fn samples_per_chunk(&self) -> usize;
+    pub fn feed<F: FnMut(BandPeakChunk)>(&mut self, samples: &[f32], emit: F);
+    pub fn reset(&mut self);
+}
+```
+
+`BandPeakChunk::rms_per_band[k]` is `sqrt(mean(compressed[b]² for b in bands[k]))` — RMS over `dub-spectral`'s per-bin **compressed** magnitudes, not raw FFT magnitudes. The compressed form is already perceptual (μ-law-ish via `ln(1 + λ |X|)`), so RMS over it yields a stable colour-friendly loudness metric. Documented as such in the struct doc so M10.1 doesn't try to reinterpret it as physical RMS.
+
+### Audio-thread cost is zero
+
+The M9 `ThruSource` mono-downmix already produces one shared mono stream consumed by the BPM tap and the peaks tap. **M9.5b adds no new tap.** The same SPSC ring feeds both `Decimator` (broadband, 64-sample cadence) *and* `BandDecimator` (band, 512-sample cadence) inside the same off-RT worker thread — verified by extending the existing `ThruSource` alloc-free tests + the new `bands_on_keeps_broadband_capture_intact` in `dub-peaks` (broadband chunks remain pixel-identical whether bands are on or off).
+
+### Buffer / stream wiring
+
+* `PeakBuffer` is a sum of (always-on broadband Vec + optional band Vec). `with_capacity` is the broadband-only constructor (back-compat for non-band users); `with_capacity_with_bands` is the M9.5b path.
+* `band_len()` is a separate `AtomicUsize`, so the renderer's "anything new in the colour channel?" check is lock-free and independent of the broadband side.
+* `extend_band_chunks(start_idx, &mut Vec<BandPeakChunk>) -> usize` is the M10.1 fast path; same semantics as the M9 `extend_chunks` for broadband.
+* `PeakStreamConfig::bands_enabled: bool` (default `true`). `PeakStream::samples_per_band_chunk() -> Option<usize>` exposes the cadence so renderers can map `peak_idx → band_idx` via integer division.
+
+### CLI surface
+
+* `dub thru --no-band-peaks` opts out of band capture (~ no measurable difference on M1 Air; band data costs ~ 500 µs CPU per second of audio per deck off-RT).
+* `dub thru --dump-band-peaks PATH` writes per-band envelopes to a CSV at shutdown. Header: `deck,chunk_idx,b0,b1,...,b7`. Conflicts with `--no-peaks-track` and `--no-band-peaks` are caught at parse time.
+
+### Tests
+
+`cargo test --workspace`: 587 passing. New coverage:
+
+| Crate | Tests | Notes |
+|---|---|---|
+| `dub-spectral` | 10 unit | Band layout at 44.1k/48k/96k; alloc-free `process`; reset invariants; block-size invariance one-shot vs. streamed |
+| `dub-peaks/band_decimator` | 8 unit | Cadence, silence, pure-tone-excites-expected-band (60 Hz / 10 kHz), block-size invariance, reset |
+| `dub-peaks/buffer` | 4 unit | Band storage off vs. on, independent push semantics |
+| `dub-peaks/stream` | 3 unit | Default ON, ON produces band chunks, ON keeps broadband intact |
+| `dub-cli/thru` | 5 unit | Default ON, `--no-band-peaks`, `--dump-band-peaks` path capture + two conflict guards, dump CSV header + row contents |
+| `dub-bpm` | -2 unit | `band_bins_*` tests migrated to `dub-spectral` — net 2 fewer in this crate. M8.1 fixture suite (`genre_octave`) unchanged. |
+
+### Acceptance
+
+1. `cargo test --workspace` passes — every M8.1 genre fixture (reggae 65, hip-hop 90 / 100, dnb 174) holds byte-equivalent ODF values.
+2. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+3. `dub thru --dump-band-peaks /tmp/bands.csv` writes a valid CSV; opening it shows expected band activity (low bands prominent on kick, high bands on hi-hat).
+4. Combined-telemetry attach is alloc-free end-to-end — verified by the existing `bpm_and_peaks_tap_both_receive_same_mono_downmix` + the `process_is_alloc_free_after_construction` invariants on the underlying `SpectralFrameStream`.
+
+### What it does not ship
+
+* No FFI surface. `BandPeakChunk` lives in Rust-land until M10.1 wires `band_peaks_extend` through UniFFI.
+* No renderer. The data is here; M10.1 implements the multi-colour Metal shader.
+* No constant-Q bass split (9-band variant). Deferred to M10.2.
+
+---
+
+<a id="m10a"></a>
+## M10-A — `dub-ffi` `DubEngine` UniFFI surface
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 2 days (delivered)
+
+### What it is
+
+`crates/dub-ffi` grew from the M0.5 "two free functions" surface (`greeting`, `engine_version`) into a real engine handle the Apple shell can hold for the lifetime of a Thru session. Single UniFFI object, single error type, eight methods.
+
+```rust
+#[derive(uniffi::Object)]
+pub struct DubEngine { /* Mutex<EngineState> */ }
+
+#[uniffi::export]
+impl DubEngine {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self>;
+
+    pub fn list_input_devices(&self) -> Vec<String>;
+    pub fn start_thru(&self, device_name: String, channels: Vec<u32>)
+        -> Result<(), EngineError>;
+    pub fn stop_thru(&self);
+
+    pub fn peaks_len(&self, deck_idx: u64) -> u64;
+    pub fn peaks_chunk_duration_secs(&self, deck_idx: u64) -> f64;
+    pub fn peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8>;
+
+    pub fn band_peaks_len(&self, deck_idx: u64) -> u64;
+    pub fn band_peaks_chunk_duration_secs(&self, deck_idx: u64) -> f64;
+    pub fn band_peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8>;
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum EngineError {
+    DeviceNotFound(String),
+    InvalidChannels(Vec<u32>),
+    AudioStartFailed(String),
+    AlreadyRunning,
+    NotRunning,
+    InvalidDeckIndex(u64),
+}
+```
+
+### Design choices
+
+* **Proc-macro UniFFI, no UDL.** All `#[uniffi::export]` lives next to the Rust code. The `uniffi-bindgen` workspace binary reads metadata directly from `libdub_ffi.dylib` in library mode — no separate UDL source to keep in sync. `setup_scaffolding!()` emits the C ABI at crate boundary.
+* **`#[uniffi(flat_error)]` for `EngineError`.** Swift gets a plain enum with `Display`-derived messages; data-bearing variants embed device names / channel lists into the string. Cleaner Swift ergonomics than a discriminated union for the three error sites that ever inspect specifics.
+* **Bytes-not-objects for the hot path.** `peaks_extend` / `band_peaks_extend` return `Vec<u8>` (UniFFI `bytes`). Swift sees `Data`; the renderer reinterprets the bytes as `[PeakChunk]` via `withUnsafeBytes` — zero per-frame allocation and no object-graph traversal across the FFI. Little-endian on both ARM64 and x86_64 macOS keeps the cast safe.
+* **`Mutex<EngineState>` not `Arc<Mutex<...>>` at FFI boundary.** UniFFI wraps `DubEngine` in `Arc<DubEngine>` automatically for `#[derive(uniffi::Object)]` types; the internal mutex serialises mutating calls only.
+* **Audio-thread non-affecting.** Every method ultimately reads `PeakBuffer` atomics or runs once at `start_thru` to open CoreAudio devices. No method is called from the render thread — Swift never reaches into the IO proc. PRD §10 cross-cutting and `.cursor/rules/ffi.mdc` are satisfied by construction.
+* **`Drop` ordering matters.** `RunningState` lists `peaks` first, then `handle`, then `output`, then `input`. The drop sequence stops the decimator thread → flushes the engine command queue → stops the output AU (which reclaims the engine) → stops the input AU (last, so the SPSC ring has no producer-after-consumer race). `stop_thru` is idempotent.
+
+### Tooling deltas
+
+* **`scripts/build-xcframework.sh`**: the embedded modulemap now declares `module dub_ffiFFI { ... }` (was `DubCoreFFI`). The generated bindings include `#if canImport(dub_ffiFFI) import dub_ffiFFI #endif`; matching the C module to the generator's expected name lets `swift build` (and the Apple shell) resolve the C symbols without a post-generation patch.
+* **`apple/project.yml`**: adds explicit `CoreAudio.framework`, `AudioToolbox.framework`, `AudioUnit.framework`, `CoreFoundation.framework`, `Metal.framework`, `MetalKit.framework` SDK dependencies. Cargo emits the `cargo:rustc-link-lib=framework=...` directives for `coreaudio-rs`, but those propagate only when Cargo drives the link; Xcode drives the link for the app, so the frameworks have to be surfaced explicitly. Also pins `PRODUCT_NAME` / `PRODUCT_MODULE_NAME` / `ALWAYS_SEARCH_USER_PATHS` since `settingPresets: none` (the M0.5 choice for explicit configuration) drops Xcode's auto-derived defaults.
+
+### Tests
+
+`cargo test -p dub-ffi`: 9 unit tests covering: `greeting`, `engine_version`, FFI version tripwire, fresh-engine peaks defaults, `stop_thru` idempotency, channels validation (empty / wrong-arity / zero-index), and round-trip serialisation of broadband + band chunks. UniFFI binding generation verified end-to-end by `scripts/build-xcframework.sh` (which produces the universal `DubCore.xcframework` + Swift bindings).
+
+### Acceptance
+
+1. `cargo test --workspace` passes.
+2. `cargo clippy --workspace --all-targets -- -D warnings` passes.
+3. `./scripts/build-xcframework.sh` produces `apple/DubCore.xcframework/` and Swift bindings under `apple/DubShared/Sources/DubCore/Generated/`. `swift build` from `apple/DubShared/` typechecks.
+4. The generated Swift surface exposes `DubEngine`, `EngineError`, `greeting()`, `engineVersion()` — verified by inspecting `dub_ffi.swift`.
+
+### What it does not ship
+
+* No render-thread state exposed (`xrun_count`, `process_time_ns`, BPM). That's all consumable today through the CLI; UniFFI surface only grows when the macOS UI actually needs it. Adding the BPM telemetry is one extra method when M10.2 wires saturation.
+* No background queue or async I/O at the FFI boundary. `start_thru` blocks until CoreAudio comes up — typical 50-200 ms on first open. Swift wraps the call in a `Task { ... }` if it cares about UI responsiveness; nothing in the FFI surface requires it.
+
+---
+
+<a id="m10b"></a>
+## M10-B — Metal renderer + first live broadband waveform
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 3 days (delivered)
+
+### What it is
+
+The Apple shell now shows a live, scrolling broadband waveform of input audio. Pick an input device, pick channels, hit Start — the M10-A engine fires up, the M9 peak buffer accumulates `PeakChunk`s, and a Metal-backed `MTKView` renders the most recent ~5 seconds of audio at 60 fps.
+
+### File layout
+
+* `apple/Dub/Waveform/Shaders.metal` — vertex + fragment shaders. Vertex stage emits 4 vertices per instance (a triangle strip per `PeakChunk`) sized from `min`/`max`; fragment stage outputs an RMS-modulated greyscale for M10-B. M10.1 swaps in the multi-colour fragment shader against the same vertex pipeline.
+* `apple/Dub/Waveform/WaveformRenderer.swift` (~280 lines) — `@MainActor` Metal renderer. Owns `MTLDevice`, `MTLCommandQueue`, render pipeline state, **two** triple-buffered uniform `MTLBuffer`s (one per inflight frame, bounded by `DispatchSemaphore(value: 3)`), and **one** ring-buffer `MTLBuffer` for chunks (`chunkCapacity = 2^17 ≈ 175 s` at 48 kHz / 64 samples).
+* `apple/Dub/Waveform/WaveformView.swift` — `NSViewRepresentable` wrapping `MTKView`. The view's `Coordinator` is the `MTKViewDelegate`; both `drawableSizeWillChange(_:)` and `draw(in:)` hop to `@MainActor` via `MainActor.assumeIsolated` since the Metal renderer is main-actor isolated.
+* `apple/Dub/MainView.swift` — top-level SwiftUI view. Hosts the device `Picker`, channels `TextField`, Start/Stop button, the waveform, and a one-line debug overlay showing `greeting() · v<engine_version>` (the M0.5 smoke text, now demoted to a debug line). Owns a `WaveformAppModel: ObservableObject` that wraps the shared `DubEngine` and exposes `availableDevices`, `selectedDevice`, `isRunning`, `lastError`. `EngineError` is mapped to user-readable strings in `describe(_:)`.
+
+### Rendering pipeline
+
+* **One quad per chunk, instanced.** `drawPrimitives(.triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: chunksVisible)`. The vertex shader reads `chunks[chunkOffset + instance_id]` from the ring buffer and emits a bar from `(x − dx, min*yScale)` to `(x + dx, max*yScale)`. Vertex-ID bit layout: bit 1 → right edge, bit 0 → top edge. `yScale = 0.95` keeps the bars off the viewport edges.
+* **Bar amplitude.** Empty chunks (no samples) clamp to a ±1e-4 hairline so the leading edge renders as a thin centred line instead of a hidden zero-thickness triangle. Doesn't affect any chunk with real audio.
+* **Window size.** `chunksVisible = pixel_width × 4` — about 4 ms per pixel at 48 kHz / 64-sample chunks, ~5.4 seconds on a 1280-pixel-wide window. Configurable via `chunksPerPixel`.
+* **Ring buffer ingest.** Each `draw(in:)` calls `engine.peaksLen` → if it grew, `engine.peaksExtend(..)` with the cached cursor. The returned `Data` is `memcpy`'d into the GPU ring starting at `(startIdx % chunkCapacity) * 12` bytes, with one wrap-around copy when the write crosses the ring boundary. `cappedNew` truncates catch-up to one ring's worth so a long UI stall (e.g. moving the window) doesn't memcpy gigabytes when the renderer resumes.
+* **Frame pacing.** `MTKView.isPaused = false`, `enableSetNeedsDisplay = false`, `preferredFramesPerSecond = 60`. The semaphore caps inflight CPU work at 3 frames ahead of the GPU; reset of a wedged GPU is fatal (we accept the convention).
+* **Storage modes.** Both ring buffer and uniform buffers use `.storageModeShared`. On Apple Silicon's unified memory, this is zero-copy (CPU and GPU share pages). On Intel macs, the small bandwidth hit (~5 MB max per deck) is irrelevant compared to the round-trip cost of `.storageModePrivate` + blits.
+
+### View model
+
+* `WaveformAppModel: ObservableObject` owns a single `DubEngine`. Construction calls `refreshDevices()`; `deinit` calls `engine.stopThru()` defensively (UniFFI's `Drop` would do it too, but the explicit teardown is deterministic across SwiftUI lifecycles).
+* `start()` parses the comma-separated channel field, validates two 1-based values, and dispatches `engine.startThru(...)`. `EngineError` lifts into `lastError`.
+* `stop()` calls `engine.stopThru()` and clears `isRunning`. Idempotent (matches the engine's idempotent `stop_thru`).
+
+### Bootstrap
+
+`./scripts/bootstrap.sh` now produces:
+
+```
+apple/DubCore.xcframework/        # Universal aarch64 + x86_64 static lib + headers
+apple/DubShared/Sources/DubCore/Generated/   # dub_ffi.swift, headers, modulemap
+apple/Dub.xcodeproj/              # Generated from project.yml by XcodeGen
+```
+
+`xcodebuild build -project apple/Dub.xcodeproj -scheme Dub` produces a runnable `Dub.app` that links CoreAudio, AudioToolbox, AudioUnit, CoreFoundation, Metal, and MetalKit explicitly.
+
+### Acceptance
+
+1. `cargo test --workspace` passes.
+2. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+3. `./scripts/bootstrap.sh && xcodebuild -project apple/Dub.xcodeproj -scheme Dub -configuration Debug build` succeeds — `Dub.app` lands in DerivedData with `CoreAudio`, `AudioToolbox`, `AudioUnit`, `Metal`, `MetalKit` linked.
+4. Launching the app, picking an input, hitting Start: the waveform scrolls in real time at the device's natural rate; quitting the app cleanly tears down the audio threads (UniFFI's auto-`Drop` on the engine handle runs the documented `Drop` order on `RunningState`).
+
+### Threading + RT discipline
+
+* Audio thread → only Rust; no Swift call, no Metal call. (`.cursor/rules/audio-rt.mdc` and `ffi.mdc` invariants both satisfied.)
+* Render thread → main actor; calls `engine.peaksLen` / `peaks_extend` which read `AtomicUsize` + take an `RwLock::read` on the peak buffer. The lock is reader-priority and dropped before the encoder records any GPU work.
+* Engine teardown on `stop_thru` runs synchronously from the UI's perspective — drops the peak streams, the engine handle, then the output AU, then the input AU.
+
+### What it does not ship
+
+* **Monochrome only.** RMS modulates a greyscale brightness so transients are visible, but the multi-band data captured in M9.5b isn't read yet. M10.1 wires `band_peaks_extend` and swaps in the colour shader against the same vertex pipeline (zero changes to the renderer's vertex stage or buffer layout).
+* **Deck A only.** The FFI surface and the renderer both index decks; we only attach a Thru source on deck 0 today. Deck B is one `attach_thru_source_with_peaks_tracking(1, …)` call away in `start_thru_inner`, plus a second `WaveformView` in `MainView`. Deferred to M10.2 along with palettes.
+* **No transport / no track loading.** Thru only. Track loading remains a CLI-only feature until the M11+ library + transport milestones.
+* **No CI build target for Apple.** GitHub Actions stays Linux-only; a macOS runner + `make apple` target is part of the post-M10.2 distribution work.
+
+---
+
+---
+
+<a id="m101"></a>
+## M10.1 — Multi-colour fragment shader
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 3 days (delivered)
+
+### What it is
+
+The M10-B waveform is no longer monochrome. Each `PeakChunk` bar in the renderer now carries an 8-band perceptual-loudness vector (the `BandPeakChunk` data layer shipped in M9.5b), and the fragment shader mixes those bands into Serato-grade RGB:
+
+```
+R = mean(b[0], b[1])              kick / bass:   30 - 159 Hz
+G = mean(b[2], b[3], b[4])        mids / vocals: 159 - 1934 Hz
+B = mean(b[5], b[6], b[7])        highs / air:   1934 - 16000 Hz
+```
+
+`r`/`g`/`b` get per-channel gains (`1.2 / 1.8 / 2.4`) to compensate for the natural loudness imbalance — low bands carry more energy per FFT bin because there are fewer bins per log-spaced band. The bar's vertical extent still encodes peak amplitude (M10-B carries through); colour encodes the spectrum.
+
+### What's new in this milestone
+
+* **`Shaders.metal`**: the fragment shader picks up `bandLow`/`bandHigh` (two `float4`s = the 8 band RMS values) forwarded by the vertex shader, mixes them into RGB per the palette above, and applies a brightness floor + RMS-driven luminance pass. Silence ( `max(r,g,b) < 0.05` ) drops to neutral grey so dropouts read as "honest silence" rather than a colour cast.
+* **`WaveformRenderer.swift`**: adds a second `MTLBuffer` (`bandChunksBuffer`, 2¹⁴ × 32 B ≈ 512 KB per deck) for the parallel band ring, a second polling path (`ingestNewBandChunks`), and four new fields in the uniforms struct (`samplesPerPeakChunk`, `bandChunkOffset`, `samplesPerBandChunk`, `bandCapacity`). The vertex shader uses these to map each broadband instance to its containing band chunk via `(iid × samplesPerPeakChunk + samplesPerPeakChunk/2) / samplesPerBandChunk`.
+* **`crates/dub-ffi`**: tiny addition — `DubEngine::sample_rate() -> u32`. Combined with the already-shipped `peaks_chunk_duration_secs` / `band_peaks_chunk_duration_secs`, this lets the renderer derive `samples_per_chunk` exactly (`duration × sample_rate`) instead of snapping a heuristic across candidate sample rates. Tripwire constant `FFI_VERSION` bumps to 3.
+
+### Why the band ring is parallel, not embedded
+
+Both rings appended sequentially with `memcpy`s from the FFI; both indexed in NDC via a power-of-two modulo (which compiles to a bitmask in the shader). Keeping them parallel rather than embedding band data into `PeakChunk` keeps:
+
+* the broadband chunk stride at 12 bytes — half the size of a `(min, max, rms, 8 × band)` packed alternative;
+* M10-B and M10.1 backwards-compatible — broadband-only rendering still works exactly the same with a stopped or band-disabled engine;
+* the shader vertex-stage cost flat — one extra buffer read, no branch on "is this band data?".
+
+### Audio-thread cost
+
+Zero new audio-thread work. The M9.5b decimator thread was already producing `BandPeakChunk`s and writing them to the parallel `PeakBuffer` storage; M10.1 just consumes them on the render thread.
+
+### Renderer thread cost
+
+Per frame: one extra `engine.bandPeaksLen` (atomic load), conditionally one extra `engine.bandPeaksExtend` (RwLock read), and one extra `memcpy` (~32 KB worst case per frame even on heavy catch-up). All bounded; all main-thread.
+
+### Acceptance
+
+1. `cargo test --workspace` passes — `dub-ffi` tests for `FFI_VERSION = 3` + `sample_rate = 0 when stopped`.
+2. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+3. `./scripts/bootstrap.sh && xcodebuild build -scheme Dub` builds the universal `Dub.app`.
+4. Live qualitative check: a clean kick paints red, a hi-hat / cymbal paints blue, vocals / synth pads paint green; silence renders as a thin grey hairline; loud transients brighten the bar without changing its hue family.
+
+### What it does not ship
+
+* **No palette presets.** The default Serato-faithful mapping is baked into the shader; user-selectable palettes (high-contrast, monochrome fallback, custom) land in M10.2.
+* **No onset glow.** Beat-aware additive bloom on `dub-bpm`-confirmed onsets is M10.2.
+* **No constant-Q bass split.** The 9-band variant (sub-bass < 60 Hz, kick 60-200 Hz) is M10.2 in `dub-spectral`.
+* **Deck A only.** Same as M10-B; deck B wiring + a second `WaveformView` is M10.2.
+
+---
+
+---
+
+<a id="m102"></a>
+## M10.2 — Polish: deck B, palette presets, honest silence/clipping
+
+**Status:** shipped (partial — see "What it does not ship") &nbsp;·&nbsp; **Estimate:** 3 days (delivered)
+
+### What it is
+
+M10.2 is the "exceeds-Serato polish" pass. Per the plan it's a stack of independently-shippable bullets; this milestone ships the three with the highest visible impact and the simplest delivery cost:
+
+1. **Deck B wired identically.** Two-deck Thru sessions, two waveform views.
+2. **Palette presets.** Three baked-in palettes (Serato-faithful = M10.1 default, high-contrast, monochrome) switchable from the toolbar.
+3. **Honest silence and clipping.** The fragment shader paints silent stretches as a thin neutral hairline and clipped chunks as a solid red bar — no more "loud + silent both render as white".
+
+Onset glow, beat-aware saturation, constant-Q bass split (9-band `dub-spectral`), and mip pyramids are still pending as future polish; each is independently shippable on top of this baseline.
+
+### Deck B
+
+* **`dub-ffi` — `DubEngine::start_thru_two_deck(device, channels_a, channels_b)`.** Same shape as `start_thru` but takes two channel pairs. Opens the input AU with the combined 4-channel set, uses CoreAudio `output_pairs = [(0,1), (2,3)]` to demux into two stereo SPSC consumers in the IOProc, and attaches a `ThruSource` + `PeakStream` on both deck 0 and deck 1. Validates non-overlapping pairs (returns `EngineError::InvalidChannels` with the merged list on overlap).
+* **`start_thru_inner` is now the two-deck core.** Single-deck `start_thru` calls it with `channels_b: None`; the function builds the input options + attaches deck 1 conditionally. No code duplication between the two FFI entry points.
+* **`MainView`.** Two channel fields: `chA` (defaults to `1,2`) and `chB` (empty = single-deck mode, matching M10-B's behaviour exactly; non-empty = two-deck mode). When two-deck is running, the waveform area splits vertically via `VSplitView` into two `WaveformView`s sharing the same palette.
+* **`FFI_VERSION = 4`.**
+
+### Palettes
+
+* **Three presets in the shader.**
+  - `0` — **Serato-faithful** (M10.1 default): bass→R, mids→G, highs→B with per-channel loudness compensation + normalised brightness floor.
+  - `1` — **High-contrast**: same band mix but squared (boosts strong bands, suppresses weak), then renormalised with a higher brightness floor. Designed for bright rooms / projector-driven club setups where the default washes out.
+  - `2` — **Monochrome**: collapses hue entirely; bar tone driven purely by broadband RMS. Equivalent to the M10-B look — useful as an "honest amplitude-only" reference when the colour layer is misleading (e.g. when checking a mix).
+* **Uniforms.** The Swift-side `WaveformUniforms` gained a `palette: UInt32` field (replacing the previous `_reserved`). `WaveformView` takes a `palette: WaveformPalette` and forwards it to the renderer via `updateNSView`; the renderer reads it on the next frame.
+* **UI.** A `Menu` in the toolbar with a paintpalette icon. `WaveformPalette` is `CaseIterable` so adding palettes is a one-line addition + one shader branch.
+
+### Honest silence and clipping
+
+* **Vertex-stage flags.** Each instance now emits `flags = (clipping, silence, palette, 0)` per quad:
+  - `clipping = 1.0` when `max(|min|, |max|) >= 0.98` — a peak so close to ±1 we'd call it clipped.
+  - `silence = 1.0` when `|min| + |max| < 1e-3 AND rms < 1e-4` — essentially zero audio in this chunk.
+* **Fragment-stage branches.**
+  - Clipping ⇒ solid red `(1.0, 0.05, 0.05)`. Unmistakable; the user is expected to act on this (turn the offending deck's gain down).
+  - Silence ⇒ thin dim grey `(0.18, 0.18, 0.20)`. Honest dropout; visually distinct from a fully-saturated mid signal.
+  - Neither ⇒ colour path (per-palette mix).
+* **Why per-instance flags, not per-fragment.** The fragment shader can't see the raw `PeakChunk` `min`/`max` once the rasteriser has run; computing flags in the vertex stage and forwarding via `VertexOut` is one float4 per quad regardless of bar pixel height. All four quad corners come from the same instance, so rasteriser interpolation collapses to the per-instance constant — no precision concern.
+
+### Why these three, not all seven
+
+The plan's M10.2 list is seven items; landing all seven would have taken ~2 weeks of mostly disjoint work (BPM FFI accessors, a new band-layout migration in `dub-spectral`, a renderer-side mip pyramid). The plan explicitly calls out that each bullet is "independently shippable; user picks ordering at the end of M10.1" — so this milestone is the minimum-cost subset that lands a *user-perceptible* polish step (deck B + palettes + honest silence/clipping all visible without any audio engineering background to interpret).
+
+### Tests
+
+* **`dub-ffi`** — 11 unit tests passing. Added `start_thru_two_deck_rejects_invalid_or_overlapping_channels` covering wrong arity per side, zero indices, and the A/B overlap rejection. `FFI_VERSION = 4` tripwire.
+* **Workspace** — `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` both green.
+* **Apple build** — `./scripts/bootstrap.sh && xcodebuild -scheme Dub build` produces a universal `Dub.app`.
+
+### Acceptance
+
+1. Running the app with a single channel pair (e.g. `1,2` / empty deck B) reproduces the M10.1 single-waveform behaviour exactly.
+2. Filling in both deck fields (`3,4` / `5,6` on an SL3) opens both inputs, demuxes in the IOProc, and shows two parallel waveforms stacked via `VSplitView`. Each deck's bars colour independently.
+3. Cycling through palettes via the toolbar menu changes the waveform appearance immediately without restarting the audio session.
+4. Playing a clipped signal renders the offending bars solid red. Cutting the input mid-bar renders silence as the dim grey hairline.
+
+### What it does not ship
+
+The plan's remaining polish bullets are each independently shippable as follow-up milestones:
+
+* **Onset glow** — needs a new `dub-ffi` accessor for `dub-bpm`'s `BpmStream`'s onset confidence trail; renderer applies an additive bloom on confirmed onsets.
+* **Beat-aware saturation** — same FFI extension as onset glow; multiplies the palette gain by `(0.7 + 0.3 × confidence)` so noisy / silent stretches desaturate.
+* **Constant-Q bass split (9-band)** — touches `dub-spectral`'s band layout: bump `NUM_BANDS` from 8 to 9 by splitting the lowest log-band into a sub-bass (30-60 Hz) + kick (60-200 Hz) pair. Affects every downstream consumer (BPM ODF, peak storage, FFI wire format, shader). One coherent PR but a meaningful refactor.
+* **Mip pyramids** — pre-decimated levels (e.g. mip-2 = average every 4 chunks, mip-3 = every 16) in `dub-peaks` so the renderer can show longer time windows by reading from a coarser mip. Deferred from M9 per existing PRD note.
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M10.2 remainder onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

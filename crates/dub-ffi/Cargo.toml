@@ -7,5 +7,36 @@ license.workspace = true
 repository.workspace = true
 description = "FFI surface exposing dub-engine to Swift via UniFFI."
 
+# We export three crate types from the same crate:
+# * `lib` — so Rust workspace consumers (tests, dub-cli) can still link
+#   against the crate. Required for `cargo test`.
+# * `staticlib` — produces `libdub_ffi.a`, which `scripts/build-xcframework.sh`
+#   wraps into `DubCore.xcframework` for the Apple shell to consume.
+# * `cdylib` — produces `libdub_ffi.dylib`, used for UniFFI's "library mode"
+#   binding generation (faster than scaffolding via a UDL file because the
+#   dylib carries the type registry).
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "dub_ffi"
+
+# Bindgen binary. Invoked by `scripts/build-xcframework.sh` to generate the
+# Swift bindings from the same metadata that the `#[uniffi::export]` macros
+# in `src/lib.rs` emit. Gated behind a feature so library consumers don't
+# pull in the `clap` dependency that UniFFI's CLI uses.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]
+
+[features]
+default = []
+# Enable UniFFI's CLI surface (drag in `clap`). Used only when building the
+# `uniffi-bindgen` binary.
+uniffi-cli = ["uniffi/cli"]
+
 [dependencies]
 dub-engine = { workspace = true }
+dub-audio = { workspace = true }
+dub-peaks = { workspace = true }
+uniffi = { workspace = true }
+thiserror = { workspace = true }

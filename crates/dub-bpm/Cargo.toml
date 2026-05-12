@@ -10,6 +10,9 @@ description = "BPM/tempo estimation for Dub. Offline analysis (M7.5) and streami
 [dependencies]
 realfft = { workspace = true }
 thiserror = { workspace = true }
+# Shared STFT + log-band + magnitude-compression pipeline (M9.5a).
+# `OnsetDetector` is now a thin shell over `dub_spectral::SpectralFrameStream`.
+dub-spectral = { workspace = true }
 # Lock-free SPSC ringbuf for the audio-thread → analysis-thread tee
 # (M8 streaming driver). Same crate the engine uses for its
 # command/trash channels, so no second async primitive enters the

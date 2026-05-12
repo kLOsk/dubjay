@@ -93,6 +93,13 @@ make ci
 # Inspect output offline — `dub analyze` runs the M3.5 click detector
 # over any WAV (peak / RMS / DC / clipping / max per-sample delta).
 ./target/release/dub analyze path/to/captured.wav
+
+# Bootstrap the macOS app (M0.5 / M10). One-time: `brew install xcodegen`.
+# Generates DubCore.xcframework + Swift UniFFI bindings + Dub.xcodeproj.
+./scripts/bootstrap.sh
+open apple/Dub.xcodeproj    # ⌘R → live multicolour-roadmap M10-B waveform window:
+#                            pick an input device + channels (e.g. "3,4" for SL3),
+#                            hit Start, watch the broadband peaks scroll at 60 fps.
 ```
 
 `dub scope` keys: `q`/`Esc` quit, `c` clear lissajous, `↑/↓` engage threshold,
@@ -119,8 +126,13 @@ detailed design history for everything shipped lives in [`docs/SHIPPED.md`](docs
 | **M7.5** | ✅ shipped | **BPM engine + offline analysis.** New `dub-bpm` crate (pure-Rust spectral-flux + harmonic-summed autocorrelation, fractional-step search). `BpmEstimator` streaming core + `analyze_bpm` offline driver + `Track::bpm` field on `dub-io::Track`. Synthetic clicks at 60–174 BPM detected within ±1 BPM. Aubio was the original plan; pivoted to pure-Rust after recon — see [`docs/SHIPPED.md#m75`](docs/SHIPPED.md#m75). |
 | **M8** | ✅ shipped | **Auto-BPM on Thru — streaming driver.** `BpmTracker` (estimator + hysteresis state machine + throttled search) + `BpmStream` (per-deck off-RT analysis thread + lifecycle). Audio-thread mono-downmix tee on `ThruSource` (alloc-free). `EngineHandle::attach_thru_source_with_bpm_tracking` bundles tee + thread spawn. `dub thru` prints `searching → tentative → locked` transitions to stderr by default (`--no-bpm-track` to disable). See [`docs/SHIPPED.md#m8`](docs/SHIPPED.md#m8). |
 | **M8.1** | ✅ shipped | **BPM octave fix — log-band ODF + windowed-energy picker.** Replaced single-band spectral flux with 8-band log-spaced flux, harmonic-sum with harmonic-mean over 4 multiples, parabolic-vertex peak height with windowed local-energy (5-bin sum, invariant to bin-split asymmetry), and added centroid sub-bin refinement. Fixes the M8 hip-hop 2× regression (100 BPM detected as 200 BPM). Locks reggae 65 / hip-hop 90/100 / rolling dnb 174 at the correct octave out of the box. New `BpmRange` API + `dub thru --bpm-range MIN,MAX` escape hatch for irreducibly-ambiguous genres (dubstep 140 / 70). See [`docs/SHIPPED.md#m81`](docs/SHIPPED.md#m81). |
-| **M9** | ◻ planned | Live waveform capture (Thru) |
-| **M10** | ◻ planned | Waveform UI (Metal, 60 fps during scratch) |
+| **M9** | ✅ shipped | **Live waveform capture (Thru).** New `dub-peaks` crate (off-RT decimator thread, shape mirrors M8's `dub-bpm`). `Decimator` (online min/max/rms aggregator), `PeakBuffer` (`AtomicUsize` len + `RwLock<Vec<PeakChunk>>`, with `extend_chunks` renderer fast path), `PeakStream` (joinable analysis thread). `ThruSource` refactored to share one mono-downmix between the BPM tee and a new peaks tap (one extra `push_slice`, verified alloc-free). New `EngineHandle::attach_thru_source_with_peaks_tracking` + `attach_thru_source_with_telemetry` (BPM + peaks combined). `dub thru` defaults to peaks-tracking on, periodic stats line shows captured chunk counts, `--dump-peaks PATH` writes a CSV envelope dump on shutdown for debugging before M10's UI lands. `PeakChunk` is `#[repr(C)]` 12-byte wire format — the M10 consumer contract. See [`docs/SHIPPED.md#m9`](docs/SHIPPED.md#m9). |
+| **M0.5** | ✅ shipped | **Apple shell + smoke screen.** XcodeGen-generated `apple/Dub.xcodeproj` (AppKit `@main` + SwiftUI `SmokeScreenView` inside an `NSHostingController`). `crates/dub-ffi` upgraded to UniFFI 0.28 proc-macros + `staticlib`+`cdylib`+`uniffi-bindgen` binary. `scripts/build-xcframework.sh` builds universal (aarch64 + x86_64) `DubCore.xcframework` + Swift bindings via UniFFI's library mode. `scripts/bootstrap.sh` regenerates everything from a clean checkout. `DubShared/` Swift Package wraps the xcframework; the app window shows `"Dub engine OK · v0.0.1"` pulled live from Rust. Local "Sign to Run Locally" only — distribution signing is a separate post-M10.2 milestone. See [`docs/SHIPPED.md#m05`](docs/SHIPPED.md#m05). |
+| **M9.5 (a + b)** | ✅ shipped | **`dub-spectral` extraction + 8-band peak capture.** M9.5a moved the shared FFT + log-band + magnitude-compression pipeline out of `dub-bpm/onset.rs` into a new `dub-spectral` crate (`SpectralFrameStream`); `OnsetDetector` is a thin shell over it, byte-identical ODF values on every M8.1 fixture. M9.5b extended `dub-peaks` with `BandPeakChunk { rms_per_band: [f32; 8] }` (`#[repr(C)]` 32-byte) + `BandDecimator` running on the existing mono tap (zero new audio-thread cost); `PeakStreamConfig::bands_enabled` defaults on; `dub thru --dump-band-peaks PATH` for verification before M10.1's renderer. See [`docs/SHIPPED.md#m95`](docs/SHIPPED.md#m95). |
+| **M10 (A + B)** | ✅ shipped | **First waveform on screen.** M10-A: `dub-ffi` `DubEngine` UniFFI interface (`list_input_devices` / `start_thru` / `stop_thru` / `peaks_extend` / `peaks_len` / `peaks_chunk_duration_secs` + the matching `band_peaks_*` trio for M10.1) with a `flat_error` `EngineError`. M10-B: Apple shell shows a live, scrolling broadband waveform — Metal `MTKView` driven by a `@MainActor` renderer that owns a 2¹⁷-chunk ring buffer + triple-buffered uniforms, instanced quads per `PeakChunk`. `MainView` hosts a device picker, channels field, Start/Stop button, and the M0.5 greeting demoted to a debug overlay. `apple/project.yml` now surfaces CoreAudio/AudioToolbox/AudioUnit/Metal/MetalKit frameworks. `./scripts/bootstrap.sh && xcodebuild build -scheme Dub` produces a runnable universal `Dub.app`. See [`docs/SHIPPED.md#m10a`](docs/SHIPPED.md#m10a) and [`docs/SHIPPED.md#m10b`](docs/SHIPPED.md#m10b). |
+| **M10.1** | ✅ shipped | **Multi-colour fragment shader.** Vertex shader reads the matching `BandPeakChunk` per broadband instance from a parallel `MTLBuffer` ring; fragment shader mixes 8 perceptual bands → RGB (`R` = bass, `G` = mids, `B` = highs) with per-channel loudness compensation and broadband-RMS luminance. Silence drops to neutral grey (honest dropouts). `DubEngine::sample_rate()` accessor added so the renderer can derive `samples_per_chunk` exactly; `FFI_VERSION` bumps to 3. See [`docs/SHIPPED.md#m101`](docs/SHIPPED.md#m101). |
+| **M10.2 (first wave)** | ✅ shipped | **Polish.** Deck B wired via new `DubEngine::startThruTwoDeck(device, channelsA, channelsB)`; 4-channel input AU demuxed in the IOProc; `VSplitView` shows one waveform per deck. Three palette presets (Serato-faithful / high-contrast / monochrome) live in the toolbar. Honest silence (thin neutral hairline) and clipping (solid red bar) detected per-chunk in the vertex shader. `FFI_VERSION = 4`. See [`docs/SHIPPED.md#m102`](docs/SHIPPED.md#m102). |
+| **M10.2 (remainder)** | ◻ planned | Independently shippable bullets: onset glow, beat-aware saturation, constant-Q bass split (9-band `dub-spectral`), mip pyramids. Each is its own PR. |
 
 PRD §2.2.0 describes the reliability staging — pragmatism before users, rigor
 before stable.
@@ -139,18 +151,23 @@ dub/                                 repo root (workspace)
 │   ├── dub-timecode/                Serato CV02 + Traktor MK1/MK2 decoder (clean-room)
 │   ├── dub-thru/                    Thru-mode source-detection classifier (§5.1.1, placeholder)
 │   ├── dub-bpm/                     M7.5 + M8 + M8.1 — BpmEstimator, BpmTracker, BpmStream, log-band ODF (pure-Rust, shipped)
+│   ├── dub-spectral/                M9.5a — SpectralFrameStream (shared STFT + log-bands + magnitude compression), pure-Rust
+│   ├── dub-peaks/                   M9 + M9.5b — Decimator + BandDecimator, PeakBuffer (broadband + bands), PeakStream — live waveform capture
 │   ├── dub-fingerprint/             Chromaprint FFI (v1.1, placeholder)
 │   ├── dub-library/                 SQLite + library imports (M11/M12, placeholder)
 │   ├── dub-controller/              HID/MIDI abstractions (v1.x+, placeholder)
-│   ├── dub-ffi/                     UniFFI Swift bindings (M0.5, placeholder)
+│   ├── dub-ffi/                     UniFFI Swift bindings (M0.5 greeting + M10-A DubEngine / EngineError / peaks_extend / band_peaks_extend)
 │   └── dub-cli/                     `dub` binary (smoke / play / capture /
 │                                                 timecode-deck / thru / scope /
 │                                                 calibrate / analyze / …)
-├── apple/                           SwiftUI/AppKit shell (M0.5, not yet scaffolded)
+├── apple/                           AppKit + SwiftUI shell (M0.5 + M10-B shipped — XcodeGen-managed)
+│   ├── project.yml                  XcodeGen manifest (links CoreAudio + Metal SDK frameworks)
+│   ├── Dub/                         AppKit @main + SwiftUI MainView + Waveform/{Shaders.metal,WaveformRenderer,WaveformView}
+│   └── DubShared/                   Swift Package wrapping DubCore.xcframework
 ├── tools/
 │   └── rt-audit/                    RT-thread allocation auditor
 ├── docs/                            PRD.md, SHIPPED.md, ARCHITECTURE.md, LIBRARY-FORMATS.md
-├── scripts/                         build helpers (M0.5 / M20, not yet present)
+├── scripts/                         build-xcframework.sh, bootstrap.sh (M0.5)
 ├── .cursor/                         Cursor rules + hooks for AI-assisted dev
 └── AGENTS.md                        always-loaded project context for AI
 ```

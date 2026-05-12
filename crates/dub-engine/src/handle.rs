@@ -67,6 +67,12 @@ const THRU_TRASH_CHANNEL_CAPACITY: usize = 8;
 /// is well within budget.
 pub const BPM_TEE_RING_CAPACITY_SECS: usize = 1;
 
+/// Seconds of mono audio the M9 peaks tap ring buffers. Same
+/// sizing rationale as [`BPM_TEE_RING_CAPACITY_SECS`]: the
+/// decimator thread polls every 20 ms; 1 s of slack absorbs any
+/// scheduling jitter. 192 KB per deck.
+pub const PEAKS_TAP_RING_CAPACITY_SECS: usize = 1;
+
 /// Errors from
 /// [`EngineHandle::attach_thru_source_with_bpm_tracking`]. Carries
 /// either an underlying `ThruAttachError`, a BPM tracker
@@ -81,6 +87,40 @@ pub enum ThruAttachWithBpmError {
     BadTrackerConfig(#[from] dub_bpm::TrackerError),
     #[error("bpm tracker sample rate {tracker_sr} Hz != engine SR {engine_sr} Hz")]
     SampleRateMismatch { tracker_sr: u32, engine_sr: u32 },
+}
+
+/// Errors from
+/// [`EngineHandle::attach_thru_source_with_peaks_tracking`]. Carries
+/// either an underlying `ThruAttachError`, a peak-stream
+/// configuration error, or a sample-rate mismatch between the
+/// peak-stream config and the engine.
+#[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
+pub enum ThruAttachWithPeaksError {
+    #[error(transparent)]
+    Thru(#[from] ThruAttachError),
+    #[error("peak stream config rejected: {0}")]
+    BadPeaksConfig(#[from] dub_peaks::PeakStreamError),
+    #[error("peak stream sample rate {peaks_sr} Hz != engine SR {engine_sr} Hz")]
+    SampleRateMismatch { peaks_sr: u32, engine_sr: u32 },
+}
+
+/// Errors from
+/// [`EngineHandle::attach_thru_source_with_telemetry`]. Combined
+/// surface that can carry any of the M8 (BPM) or M9 (peaks) errors.
+#[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
+pub enum ThruAttachWithTelemetryError {
+    #[error(transparent)]
+    Thru(#[from] ThruAttachError),
+    #[error("bpm tracker config rejected: {0}")]
+    BadTrackerConfig(#[from] dub_bpm::TrackerError),
+    #[error("bpm tracker sample rate {tracker_sr} Hz != engine SR {engine_sr} Hz")]
+    BpmSampleRateMismatch { tracker_sr: u32, engine_sr: u32 },
+    #[error("peak stream config rejected: {0}")]
+    BadPeaksConfig(#[from] dub_peaks::PeakStreamError),
+    #[error("peak stream sample rate {peaks_sr} Hz != engine SR {engine_sr} Hz")]
+    PeaksSampleRateMismatch { peaks_sr: u32, engine_sr: u32 },
 }
 
 /// Errors that can occur sending a command from the UI thread.
@@ -531,6 +571,181 @@ impl EngineHandle {
         let stream = dub_bpm::BpmStream::spawn(bpm_rx, tracker)
             .map_err(ThruAttachWithBpmError::BadTrackerConfig)?;
         Ok(stream)
+    }
+
+    /// Attach a [`ThruSource`] **and** spawn an M9 peak-capture
+    /// decimator thread for it. Convenience wrapper over
+    /// [`attach_thru_source`] that wires the mono-downmix tap + the
+    /// off-RT decimator in one call.
+    ///
+    /// Returns a [`dub_peaks::PeakStream`] handle whose
+    /// [`dub_peaks::PeakStream::buffer`] is the live, lock-free
+    /// peak buffer M10 will render and CLI tools can dump.
+    ///
+    /// The peaks tap ring is sized to [`PEAKS_TAP_RING_CAPACITY_SECS`]
+    /// seconds at the engine sample rate — a brief decimator stall
+    /// (GC pause, OS scheduler hiccup) cannot lose samples on any
+    /// healthy system.
+    ///
+    /// # Errors
+    ///
+    /// * Forwards [`ThruAttachError`] from the underlying attach.
+    /// * [`ThruAttachWithPeaksError::BadPeaksConfig`] if the peak
+    ///   stream config is invalid.
+    /// * [`ThruAttachWithPeaksError::SampleRateMismatch`] if the
+    ///   peak stream sample rate doesn't match the engine sample
+    ///   rate.
+    ///
+    /// # Errors on partial failure
+    ///
+    /// If [`attach_thru_source`] succeeds but `PeakStream::spawn`
+    /// fails (extremely rare — the OS would have to refuse a
+    /// thread), the engine ends up with a Thru source attached but
+    /// no decimator thread. The error is returned so the caller can
+    /// decide whether to detach.
+    ///
+    /// [`attach_thru_source`]: Self::attach_thru_source
+    pub fn attach_thru_source_with_peaks_tracking(
+        &mut self,
+        idx: usize,
+        rx: ringbuf::HeapCons<f32>,
+        config: ThruInputConfig,
+        peaks_cfg: dub_peaks::PeakStreamConfig,
+    ) -> Result<dub_peaks::PeakStream, ThruAttachWithPeaksError> {
+        if idx >= DECK_COUNT {
+            return Err(ThruAttachError::InvalidDeck {
+                idx,
+                count: DECK_COUNT,
+            }
+            .into());
+        }
+        config.validate(self.engine_sample_rate)?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let engine_sr_u32 = self.engine_sample_rate as u32;
+        if peaks_cfg.sample_rate != engine_sr_u32 {
+            return Err(ThruAttachWithPeaksError::SampleRateMismatch {
+                peaks_sr: peaks_cfg.sample_rate,
+                engine_sr: engine_sr_u32,
+            });
+        }
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let tap_capacity = (self.engine_sample_rate as usize)
+            .saturating_mul(PEAKS_TAP_RING_CAPACITY_SECS)
+            .max(1024);
+        let tap_rb = ringbuf::HeapRb::<f32>::new(tap_capacity);
+        let (peaks_tx, peaks_rx) = ringbuf::traits::Split::split(tap_rb);
+
+        self.reclaim();
+
+        let source = Box::new(ThruSource::new(rx, config).with_peaks_tap(peaks_tx));
+
+        #[allow(clippy::cast_possible_truncation)]
+        let idx_u8 = idx as u8;
+        self.tx
+            .try_push(Command::AttachThruSource {
+                idx: idx_u8,
+                source,
+            })
+            .map_err(|_cmd| ThruAttachWithPeaksError::Thru(ThruAttachError::ChannelFull))?;
+
+        let stream = dub_peaks::PeakStream::spawn(peaks_rx, peaks_cfg)
+            .map_err(ThruAttachWithPeaksError::BadPeaksConfig)?;
+        Ok(stream)
+    }
+
+    /// Attach a [`ThruSource`] with **both** M8 BPM tracking and M9
+    /// peak capture in one call. Wires a single mono-downmix pass
+    /// on the audio thread feeding two off-RT analysis threads —
+    /// strictly cheaper than calling the BPM- and peaks-only
+    /// variants in sequence (the M8/M9 variants each instantiate a
+    /// `ThruSource`; combining them gives one source with both
+    /// taps).
+    ///
+    /// Returns `(BpmStream, PeakStream)`. Drop the tuple to stop
+    /// both analysis threads.
+    ///
+    /// # Errors
+    ///
+    /// Combined surface from both subsystems (see
+    /// [`ThruAttachWithTelemetryError`]).
+    ///
+    /// # Errors on partial failure
+    ///
+    /// The attach happens first; if either stream spawn fails after
+    /// that, the engine is left with a Thru source attached but
+    /// missing one or both analysis threads. The error indicates
+    /// which subsystem failed.
+    #[allow(clippy::missing_panics_doc, clippy::similar_names)]
+    pub fn attach_thru_source_with_telemetry(
+        &mut self,
+        idx: usize,
+        rx: ringbuf::HeapCons<f32>,
+        config: ThruInputConfig,
+        tracker: dub_bpm::TrackerConfig,
+        peaks_cfg: dub_peaks::PeakStreamConfig,
+    ) -> Result<(dub_bpm::BpmStream, dub_peaks::PeakStream), ThruAttachWithTelemetryError> {
+        if idx >= DECK_COUNT {
+            return Err(ThruAttachError::InvalidDeck {
+                idx,
+                count: DECK_COUNT,
+            }
+            .into());
+        }
+        config.validate(self.engine_sample_rate)?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let engine_sr_u32 = self.engine_sample_rate as u32;
+        if tracker.sample_rate != engine_sr_u32 {
+            return Err(ThruAttachWithTelemetryError::BpmSampleRateMismatch {
+                tracker_sr: tracker.sample_rate,
+                engine_sr: engine_sr_u32,
+            });
+        }
+        if peaks_cfg.sample_rate != engine_sr_u32 {
+            return Err(ThruAttachWithTelemetryError::PeaksSampleRateMismatch {
+                peaks_sr: peaks_cfg.sample_rate,
+                engine_sr: engine_sr_u32,
+            });
+        }
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bpm_capacity = (self.engine_sample_rate as usize)
+            .saturating_mul(BPM_TEE_RING_CAPACITY_SECS)
+            .max(1024);
+        let bpm_rb = ringbuf::HeapRb::<f32>::new(bpm_capacity);
+        let (bpm_tx, bpm_rx) = ringbuf::traits::Split::split(bpm_rb);
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let peaks_capacity = (self.engine_sample_rate as usize)
+            .saturating_mul(PEAKS_TAP_RING_CAPACITY_SECS)
+            .max(1024);
+        let peaks_rb = ringbuf::HeapRb::<f32>::new(peaks_capacity);
+        let (peaks_tx, peaks_rx) = ringbuf::traits::Split::split(peaks_rb);
+
+        self.reclaim();
+
+        let source = Box::new(
+            ThruSource::new(rx, config)
+                .with_bpm_tee(bpm_tx, config.max_block_frames)
+                .with_peaks_tap(peaks_tx),
+        );
+
+        #[allow(clippy::cast_possible_truncation)]
+        let idx_u8 = idx as u8;
+        self.tx
+            .try_push(Command::AttachThruSource {
+                idx: idx_u8,
+                source,
+            })
+            .map_err(|_cmd| ThruAttachWithTelemetryError::Thru(ThruAttachError::ChannelFull))?;
+
+        let bpm_stream = dub_bpm::BpmStream::spawn(bpm_rx, tracker)
+            .map_err(ThruAttachWithTelemetryError::BadTrackerConfig)?;
+        let peaks_stream = dub_peaks::PeakStream::spawn(peaks_rx, peaks_cfg)
+            .map_err(ThruAttachWithTelemetryError::BadPeaksConfig)?;
+        Ok((bpm_stream, peaks_stream))
     }
 
     fn send(&mut self, cmd: Command) -> Result<(), CommandError> {

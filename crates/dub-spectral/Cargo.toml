@@ -1,0 +1,11 @@
+[package]
+name = "dub-spectral"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared STFT + log-band + magnitude-compression pipeline for dub-bpm and dub-peaks."
+
+[dependencies]
+realfft = { workspace = true }

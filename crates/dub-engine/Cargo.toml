@@ -17,6 +17,10 @@ dub-timecode = { workspace = true }
 # in here; spawning the thread is opt-in via
 # `EngineHandle::attach_thru_source_with_bpm_tracking`.
 dub-bpm = { workspace = true }
+# M9 — same pattern as dub-bpm: optional waveform-peak capture
+# wired through `EngineHandle::attach_thru_source_with_peaks_tracking`
+# (or `_with_telemetry` for both at once).
+dub-peaks = { workspace = true }
 
 [dev-dependencies]
 assert_no_alloc = { workspace = true }

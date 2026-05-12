@@ -1,0 +1,22 @@
+[package]
+name = "dub-peaks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Live waveform-peak capture for Dub (M9). Off-RT decimator thread that consumes a mono-downmixed audio tap from ThruSource and produces multi-resolution PeakChunks for live waveform rendering (M10)."
+
+[dependencies]
+thiserror = { workspace = true }
+# Lock-free SPSC ringbuf for the audio-thread → decimator-thread tap.
+# Same crate the engine and dub-bpm use; keeps the async primitive set
+# at one.
+ringbuf = { workspace = true }
+# M9.5b: shared FFT + log-band + magnitude-compression pipeline that the
+# `BandDecimator` runs over the same mono tap the broadband `Decimator`
+# consumes. Same crate `dub-bpm` uses for its onset detector.
+dub-spectral = { workspace = true }
+
+[dev-dependencies]
+# nothing yet; we use std-only synthetic helpers

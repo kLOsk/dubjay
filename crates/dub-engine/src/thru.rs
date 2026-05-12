@@ -59,11 +59,13 @@
 //! - The scratch buffer is pre-allocated at attach time to
 //!   `max_block_frames * 2` interleaved samples; never resized on
 //!   the audio thread.
-//! - The optional BPM tee scratch (M8) is pre-allocated to
-//!   `max_block_frames` mono samples at the `with_bpm_tee` call;
-//!   the per-block mono-downmix is two reads + one write per frame
-//!   and the `push_slice` to the tee ring is a memcpy that
-//!   silently drops on overflow (consumer too slow → drop newest).
+//! - The mono-downmix scratch (shared by the M8 BPM tee and M9
+//!   peaks tap) is pre-allocated to `max_block_frames` mono samples
+//!   at [`ThruSource::new`]; the per-block mono-downmix is two
+//!   reads + one write per frame, computed *once* when any tap is
+//!   attached and pushed to each enabled tap. `push_slice` to a tee
+//!   ring is a memcpy that silently drops on overflow (consumer too
+//!   slow → drop newest).
 //! - No `Box`, no `Vec` resize, no `dealloc`, no syscall on the hot
 //!   path. Verified by `render_is_alloc_free` below.
 
@@ -142,15 +144,24 @@ impl ThruInputConfig {
 /// mode flip — that's the Option A FX-bypass model documented in the
 /// module-level docs.
 ///
-/// ## Optional BPM tee (M8)
+/// ## Optional mono-downmix taps (M8 + M9)
 ///
-/// `with_bpm_tee` attaches a mono-downmix tap that pushes one mono
-/// sample per stereo input frame into a second ringbuf on every
-/// `render_into` call. The consumer end is read by the M8
-/// [`dub_bpm::BpmStream`] analysis thread off-RT. Tee writes are
-/// alloc-free, non-blocking, and lose samples silently on overflow
-/// (consumer too slow → newest samples drop; the resulting brief
-/// hole in the ODF only affects BPM tracking, not the audio path).
+/// `with_bpm_tee` (M8) and `with_peaks_tap` (M9) each attach a
+/// mono-downmix tap that pushes one mono sample per stereo input
+/// frame into a second ringbuf on every `render_into` call. The
+/// downmix is computed *once* per block and dispatched to whichever
+/// taps are enabled — feeding both BPM analysis and peak capture
+/// adds one memcpy, not two passes over the buffer.
+///
+/// Consumer ends are read by:
+/// * M8 [`dub_bpm::BpmStream`] off-RT analysis thread (tempo).
+/// * M9 [`dub_peaks::PeakStream`] off-RT decimator thread
+///   (waveform).
+///
+/// Tee writes are alloc-free, non-blocking, and lose samples
+/// silently on overflow (consumer too slow → newest samples drop;
+/// the resulting brief hole in the BPM ODF or peak buffer only
+/// affects telemetry, not the audio path).
 pub struct ThruSource {
     /// Single-producer/single-consumer ring; producer is the CoreAudio
     /// input IOProc inside `dub-audio`'s `AudioInput`.
@@ -160,14 +171,21 @@ pub struct ThruSource {
     /// `max_block_frames * 2` (interleaved stereo) at attach time.
     scratch: Vec<f32>,
 
-    /// Optional producer end of the BPM tee ring (M8). Present iff
-    /// [`Self::with_bpm_tee`] was called at construction.
+    /// Optional producer end of the M8 BPM tee ring. Present iff
+    /// [`Self::with_bpm_tee`] was called.
     bpm_tx: Option<HeapProd<f32>>,
 
-    /// Pre-allocated mono-downmix scratch for the BPM tee. Empty
-    /// (zero capacity) when [`Self::bpm_tx`] is `None`; sized to
-    /// `max_block_frames` mono samples otherwise.
-    bpm_scratch: Vec<f32>,
+    /// Optional producer end of the M9 peaks tap ring. Present iff
+    /// [`Self::with_peaks_tap`] was called.
+    peaks_tx: Option<HeapProd<f32>>,
+
+    /// Pre-allocated mono-downmix scratch shared between the BPM
+    /// tee and the peaks tap. Sized to `max_block_frames` mono
+    /// samples at [`Self::new`] regardless of whether any tap is
+    /// attached — 4 KB at the default 1024-frame block, which is
+    /// negligible. Lets `with_bpm_tee` / `with_peaks_tap` be pure
+    /// "flip a flag" operations off-RT.
+    mono_scratch: Vec<f32>,
 }
 
 impl ThruSource {
@@ -180,25 +198,45 @@ impl ThruSource {
             rx,
             scratch: vec![0.0_f32; scratch_len],
             bpm_tx: None,
-            bpm_scratch: Vec::new(),
+            peaks_tx: None,
+            mono_scratch: vec![0.0_f32; cfg.max_block_frames.max(1)],
         }
     }
 
     /// Builder-style: wire a mono-downmix tap to feed M8's
     /// [`dub_bpm::BpmStream`] off-RT analysis thread.
     ///
-    /// `max_block_frames` must match what was passed in
-    /// [`ThruInputConfig`] at construction; we re-take it here to
-    /// size the mono-downmix scratch (cleaner than reading it back
-    /// off `self.scratch.len() / 2`, which the audio thread doesn't
-    /// need to know about).
+    /// `max_block_frames` is no longer used for sizing (the shared
+    /// `mono_scratch` is allocated at [`Self::new`]); the parameter
+    /// is kept for source-compatibility with M8 callers but
+    /// `debug_assert!`ed to match the constructor's value, so a
+    /// disagreement is loudly diagnosed in debug builds.
     ///
-    /// Returns `self` for chaining. Off-RT only — allocates the
-    /// scratch buffer.
+    /// Returns `self` for chaining. Off-RT only.
     #[must_use]
     pub fn with_bpm_tee(mut self, bpm_tx: HeapProd<f32>, max_block_frames: usize) -> Self {
-        self.bpm_scratch = vec![0.0_f32; max_block_frames.max(1)];
+        debug_assert_eq!(
+            self.mono_scratch.len(),
+            max_block_frames.max(1),
+            "with_bpm_tee max_block_frames {max_block_frames} != mono_scratch capacity {}; \
+             pass the same value as ThruInputConfig::max_block_frames",
+            self.mono_scratch.len()
+        );
         self.bpm_tx = Some(bpm_tx);
+        self
+    }
+
+    /// Builder-style: wire a mono-downmix tap to feed M9's
+    /// [`dub_peaks::PeakStream`] off-RT decimator thread.
+    ///
+    /// Shares the same per-block mono buffer with [`Self::with_bpm_tee`]
+    /// — calling both is exactly as cheap as either one alone plus
+    /// one extra ring `push_slice`.
+    ///
+    /// Returns `self` for chaining. Off-RT only.
+    #[must_use]
+    pub fn with_peaks_tap(mut self, peaks_tx: HeapProd<f32>) -> Self {
+        self.peaks_tx = Some(peaks_tx);
         self
     }
 
@@ -207,6 +245,13 @@ impl ThruSource {
     #[must_use]
     pub fn has_bpm_tee(&self) -> bool {
         self.bpm_tx.is_some()
+    }
+
+    /// Whether a peaks tap was attached at construction. Diagnostic /
+    /// test-only observability.
+    #[must_use]
+    pub fn has_peaks_tap(&self) -> bool {
+        self.peaks_tx.is_some()
     }
 
     /// Number of input samples currently buffered between the IOProc
@@ -276,29 +321,36 @@ impl ThruSource {
             chunk[offset + 1] += src_r * gain;
         }
 
-        // M8 BPM tee. Mono-downmix the popped stereo frames (NOT
-        // including the gain — BPM analysis wants the raw input
-        // level so the confidence stays calibrated independently of
-        // any subsequent gain ride) and push to the analysis ring.
-        // Alloc-free: `bpm_scratch` is pre-allocated, `push_slice` is
-        // a memcpy that silently writes only what fits.
-        if let Some(tx) = &mut self.bpm_tx {
+        // M8 / M9 telemetry taps. Mono-downmix the popped stereo
+        // frames (NOT including the gain — analysis wants the raw
+        // input level so confidence/envelope stay calibrated
+        // independently of any subsequent gain ride) and push to
+        // whichever taps are enabled. The downmix is computed once
+        // and dispatched; both taps see the same mono samples.
+        //
+        // Alloc-free: `mono_scratch` is pre-allocated, `push_slice`
+        // is a memcpy that silently writes only what fits.
+        if self.bpm_tx.is_some() || self.peaks_tx.is_some() {
             let mono_frames = want / 2;
-            // Guarded by the constructor — `bpm_scratch.len() >=
-            // max_block_frames` and `want / 2 <= max_block_frames`.
             debug_assert!(
-                self.bpm_scratch.len() >= mono_frames,
-                "bpm_scratch undersized: {} < {mono_frames}",
-                self.bpm_scratch.len()
+                self.mono_scratch.len() >= mono_frames,
+                "mono_scratch undersized: {} < {mono_frames}",
+                self.mono_scratch.len()
             );
             for i in 0..mono_frames {
                 let l = self.scratch[i * 2];
                 let r = self.scratch[i * 2 + 1];
-                self.bpm_scratch[i] = 0.5 * (l + r);
+                self.mono_scratch[i] = 0.5 * (l + r);
             }
+            let mono = &self.mono_scratch[..mono_frames];
             // Drop on overflow (analysis thread too slow). Returns
             // how many were pushed; we don't care for v1.
-            let _ = tx.push_slice(&self.bpm_scratch[..mono_frames]);
+            if let Some(tx) = &mut self.bpm_tx {
+                let _ = tx.push_slice(mono);
+            }
+            if let Some(tx) = &mut self.peaks_tx {
+                let _ = tx.push_slice(mono);
+            }
         }
     }
 }
@@ -677,6 +729,190 @@ mod tests {
         let tee_ring = HeapRb::<f32>::new(4096);
         let (bpm_tx, _bpm_rx) = tee_ring.split();
         let mut src = src.with_bpm_tee(bpm_tx, 256);
+        let _ = push_const(&mut tx, 256, 0.3, 0.4);
+
+        let mut out = zeros(256);
+        assert_no_alloc(|| {
+            src.render_into(&mut out, 1.0, 2, 0);
+        });
+    }
+
+    // -------- M9 peaks tap --------
+
+    #[test]
+    fn fresh_thru_source_has_no_peaks_tap() {
+        let (src, _tx) = build(cfg_default(), 4096);
+        assert!(!src.has_peaks_tap());
+    }
+
+    #[test]
+    fn with_peaks_tap_attaches() {
+        let (src, _tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, _peaks_rx) = tap_ring.split();
+        let src = src.with_peaks_tap(peaks_tx);
+        assert!(src.has_peaks_tap());
+    }
+
+    #[test]
+    fn peaks_tap_receives_mono_downmix() {
+        // L = 0.4, R = -0.2 → mono = 0.5 * (0.4 + (-0.2)) = 0.10
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, mut peaks_rx) = tap_ring.split();
+        let mut src = src.with_peaks_tap(peaks_tx);
+
+        let _ = push_const(&mut tx, 128, 0.4, -0.2);
+        let mut out = zeros(128);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        let mut mono = [0.0f32; 128];
+        let n = peaks_rx.pop_slice(&mut mono);
+        assert_eq!(n, 128);
+        for (i, &s) in mono.iter().enumerate() {
+            assert!(
+                (s - 0.10).abs() < 1e-6,
+                "frame {i}: peaks_tap mono = {s}, expected 0.10"
+            );
+        }
+    }
+
+    #[test]
+    fn peaks_tap_unaffected_by_gain() {
+        // Mirrors bpm_tee_unaffected_by_gain: the peaks envelope
+        // should reflect the raw input, not whatever the deck gain
+        // is doing on the output.
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, mut peaks_rx) = tap_ring.split();
+        let mut src = src.with_peaks_tap(peaks_tx);
+        let _ = push_const(&mut tx, 64, 1.0, 1.0);
+
+        let mut out = zeros(64);
+        src.render_into(&mut out, 0.25, 2, 0);
+
+        for i in 0..64 {
+            assert!(
+                (out[i * 2] - 0.25).abs() < 1e-6,
+                "out L {} != 0.25",
+                out[i * 2]
+            );
+        }
+
+        let mut mono = [0.0f32; 64];
+        let n = peaks_rx.pop_slice(&mut mono);
+        assert_eq!(n, 64);
+        for (i, &s) in mono.iter().enumerate() {
+            assert!(
+                (s - 1.0).abs() < 1e-6,
+                "frame {i}: peaks_tap = {s}, expected 1.0 (pre-gain)"
+            );
+        }
+    }
+
+    #[test]
+    fn peaks_tap_silently_drops_on_full_ring() {
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(16);
+        let (peaks_tx, mut peaks_rx) = tap_ring.split();
+        let mut src = src.with_peaks_tap(peaks_tx);
+        let _ = push_const(&mut tx, 64, 0.5, 0.5);
+
+        let mut out = zeros(64);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        for i in 0..64 {
+            assert!((out[i * 2] - 0.5).abs() < 1e-6);
+        }
+
+        let mut mono = [0.0f32; 64];
+        let n = peaks_rx.pop_slice(&mut mono);
+        assert!(
+            n <= 16,
+            "tap ring capacity 16 should cap reads at 16, got {n}"
+        );
+    }
+
+    #[test]
+    fn peaks_tap_render_is_alloc_free() {
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, _peaks_rx) = tap_ring.split();
+        let mut src = src.with_peaks_tap(peaks_tx);
+        let _ = push_const(&mut tx, 256, 0.3, 0.4);
+
+        let mut out = zeros(256);
+        assert_no_alloc(|| {
+            src.render_into(&mut out, 1.0, 2, 0);
+        });
+    }
+
+    #[test]
+    fn peaks_tap_underrun_pushes_zeros() {
+        let (src, _tx) = build(cfg_default(), 4096);
+        let tap_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, mut peaks_rx) = tap_ring.split();
+        let mut src = src.with_peaks_tap(peaks_tx);
+
+        let mut out = zeros(128);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        let mut mono = [0.0f32; 128];
+        let n = peaks_rx.pop_slice(&mut mono);
+        assert_eq!(n, 128, "peaks tap should push zero-fill on underrun");
+        for &s in &mono {
+            assert!(s.abs() < 1e-9);
+        }
+    }
+
+    // -------- Both taps simultaneously --------
+
+    #[test]
+    fn bpm_and_peaks_tap_both_receive_same_mono_downmix() {
+        // Attach both; both must see the same mono stream.
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let bpm_ring = HeapRb::<f32>::new(4096);
+        let (bpm_tx, mut bpm_rx) = bpm_ring.split();
+        let peaks_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, mut peaks_rx) = peaks_ring.split();
+        let mut src = src.with_bpm_tee(bpm_tx, 256).with_peaks_tap(peaks_tx);
+        assert!(src.has_bpm_tee());
+        assert!(src.has_peaks_tap());
+
+        let _ = push_const(&mut tx, 64, 0.6, 0.2);
+
+        let mut out = zeros(64);
+        src.render_into(&mut out, 1.0, 2, 0);
+
+        let mut bpm_mono = [0.0f32; 64];
+        let mut peaks_mono = [0.0f32; 64];
+        let nb = bpm_rx.pop_slice(&mut bpm_mono);
+        let np = peaks_rx.pop_slice(&mut peaks_mono);
+        assert_eq!(nb, 64);
+        assert_eq!(np, 64);
+        // Expected mono = 0.5 * (0.6 + 0.2) = 0.4
+        for i in 0..64 {
+            assert!(
+                (bpm_mono[i] - 0.4).abs() < 1e-6 && (peaks_mono[i] - 0.4).abs() < 1e-6,
+                "frame {i}: bpm = {}, peaks = {}, expected both 0.4",
+                bpm_mono[i],
+                peaks_mono[i]
+            );
+            assert!(
+                (bpm_mono[i] - peaks_mono[i]).abs() < 1e-9,
+                "frame {i}: bpm and peaks taps must see identical mono samples"
+            );
+        }
+    }
+
+    #[test]
+    fn both_taps_render_is_alloc_free() {
+        let (src, mut tx) = build(cfg_default(), 4096);
+        let bpm_ring = HeapRb::<f32>::new(4096);
+        let (bpm_tx, _bpm_rx) = bpm_ring.split();
+        let peaks_ring = HeapRb::<f32>::new(4096);
+        let (peaks_tx, _peaks_rx) = peaks_ring.split();
+        let mut src = src.with_bpm_tee(bpm_tx, 256).with_peaks_tap(peaks_tx);
         let _ = push_const(&mut tx, 256, 0.3, 0.4);
 
         let mut out = zeros(256);

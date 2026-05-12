@@ -69,16 +69,13 @@ pub use offline::{analyze_bpm, analyze_bpm_with_range, AnalysisError};
 pub use stream::BpmStream;
 pub use tracker::{BpmTracker, TrackerConfig, TrackerError};
 
-/// Window size for each FFT frame, in samples. 1024 is ≈ 21 ms at 48 kHz
-/// — long enough for stable spectral magnitudes, short enough that onset
-/// localisation isn't smeared.
-pub(crate) const FRAME_SIZE: usize = 1024;
-
-/// Hop size between consecutive frames, in samples. 512 = 50 % overlap.
-/// Gives an ODF sample rate of `sr / 512` ≈ 94 Hz at 48 kHz, which is
-/// enough resolution to distinguish e.g. 174 vs 175 BPM after parabolic
-/// interpolation.
-pub(crate) const HOP_SIZE: usize = 512;
+// M9.5a: the FFT pipeline + log-band layout + magnitude compression that
+// `OnsetDetector` builds on are now in `dub-spectral`, shared with
+// `dub-peaks`. Re-export the constants we lifted out under the same
+// internal name they used to have so the rest of this crate
+// (`offline.rs`, `estimator.rs`, `onset.rs`) keeps reading
+// `crate::FRAME_SIZE` etc. without churn.
+pub(crate) use dub_spectral::{FRAME_SIZE, HOP_SIZE};
 
 /// Minimum tempo of the default [`BpmRange`]. Below this lies the realm
 /// of "is it a beat or a tape-stop?" and the autocorrelation peak picker
@@ -89,40 +86,6 @@ pub const MIN_BPM: f64 = 60.0;
 /// feel half time anyway; for dnb/jungle (170–180) and gabber (>200) we'd
 /// want genre-specific priors, which are deferred to M9+.
 pub const MAX_BPM: f64 = 200.0;
-
-// ============================================================
-// M8.1 log-band ODF parameters
-// ============================================================
-//
-// The single-bin spectral flux used in M7.5/M8 produced 2× octave
-// errors on hip-hop because hi-hats (hundreds of bright high-bin
-// onsets per beat) dominated the flux sum over kicks (a handful of
-// loud low-bin onsets). The fix is to compute spectral flux per
-// log-spaced band, average within each band, and sum the per-band
-// fluxes equally into the final ODF — so a kick band carrying 1
-// onset/beat contributes the same weight as a hi-hat band carrying
-// 8 onsets/beat.
-//
-// References: Goto & Muraoka (1994); Klapuri (2006); Davies &
-// Plumbley (2007) all use multi-band flux for the same reason.
-//
-// 8 bands is the smallest count that gives ~ 1 octave per band over
-// 30 Hz – 16 kHz (the perceptually-relevant range), which keeps the
-// per-band averaging stable (each band has at least one bin even at
-// 44.1 kHz with `FRAME_SIZE = 1024`).
-
-/// Number of log-spaced frequency bands the ODF is summed over.
-/// See module-level note for rationale.
-pub(crate) const NUM_ODF_BANDS: usize = 8;
-
-/// Lower edge of the lowest ODF band, in Hz. Anything below this
-/// is sub-bass / room rumble and doesn't carry beat information.
-pub(crate) const ODF_BAND_MIN_HZ: f32 = 30.0;
-
-/// Upper edge of the highest ODF band, in Hz. Beyond ~ 16 kHz lies
-/// air / cymbal shimmer that's perceptually rich but rhythmically
-/// redundant with what the 4–10 kHz hi-hat band already carries.
-pub(crate) const ODF_BAND_MAX_HZ: f32 = 16_000.0;
 
 /// A single tempo estimate.
 ///

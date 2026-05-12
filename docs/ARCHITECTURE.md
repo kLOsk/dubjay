@@ -60,13 +60,14 @@ buffers, never callbacks across thread boundaries.
               │  input + output│                 │    AudioInput, owns the
               └────────────────┘                 │    AudioOutput callback)
                                                  │
-              ┌────────────────────┬─────────────┼─────────────┬────────────────┐
-              ▼                    ▼             ▼             ▼                ▼
-          dub-timecode         dub-dsp       dub-stretch   dub-io           dub-bpm
-          (Serato CV02 +      (rubato,      (Rubber Band  (symphonia       (M7.5+M8+M8.1 —
-           Traktor MK1/MK2,    biquads,      FFI; GPLv3    decoders, in-    pure-Rust log-band
-           clean-room)         FX placeholders) license)   RAM tracks)      ODF + windowed-
-                                                                            energy picker)
+              ┌────────────────────┬─────────────┬─────────────┬──────────────┬────────────────┐
+              ▼                    ▼             ▼             ▼              ▼                ▼
+          dub-timecode         dub-dsp       dub-stretch   dub-io          dub-bpm          dub-peaks
+          (Serato CV02 +      (rubato,      (Rubber Band  (symphonia       (M7.5+M8+M8.1 —  (M9 — off-RT
+           Traktor MK1/MK2,    biquads,      FFI; GPLv3    decoders, in-    pure-Rust log-   decimator +
+           clean-room)         FX placeholders) license)   RAM tracks)     band ODF +        PeakBuffer for
+                                                                           windowed-energy   live waveform
+                                                                           picker)           rendering)
 
           ┌─────────────────────────────────────────────────────────────────────┐
           │ Off-RT / placeholder for v1:                                        │
@@ -79,9 +80,9 @@ buffers, never callbacks across thread boundaries.
 
 **Two things to note that aren't obvious from the diagram:**
 
-1. **Only `dub-engine` runs on the audio thread.** Everything else is either preparatory work (decoders, format parsers, calibration), off-RT workers (M5.4.5 calibrators, M8 per-Thru-deck BPM analysis threads via `dub_bpm::BpmStream`, M5.1.1 source-detection classifier), or non-RT services (library DB, UI bindings). Crates with FFI dependencies — `dub-stretch` (GPLv3) and `dub-fingerprint` (LGPL planned) — are deliberately leaf crates so license boundaries don't leak upstream. `dub-bpm` shipped M7.5+M8 as pure-Rust so it has no FFI obligation today; if an aubio backend ever lands behind a feature flag it would stay confined to that same leaf crate.
+1. **Only `dub-engine` runs on the audio thread.** Everything else is either preparatory work (decoders, format parsers, calibration), off-RT workers (M5.4.5 calibrators, M8 per-Thru-deck BPM analysis threads via `dub_bpm::BpmStream`, M9 per-Thru-deck peak decimators via `dub_peaks::PeakStream`, M5.1.1 source-detection classifier), or non-RT services (library DB, UI bindings). Crates with FFI dependencies — `dub-stretch` (GPLv3) and `dub-fingerprint` (LGPL planned) — are deliberately leaf crates so license boundaries don't leak upstream. `dub-bpm` shipped M7.5+M8 as pure-Rust so it has no FFI obligation today; `dub-peaks` is pure-Rust too. If an aubio backend ever lands behind a feature flag it would stay confined to that same leaf crate.
 
-2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only and is currently an empty placeholder; wiring it up against UniFFI is part of M0.5.
+2. **`dub-cli` depends directly on `dub-engine` + `dub-audio`, not through `dub-ffi`.** The CLI is the headless test harness for the engine — it lives in Rust-land and never crosses the FFI boundary. `dub-ffi` is for the Swift app only. As of M10-A it ships a UniFFI 0.28 surface (proc-macros, no UDL) exposing `greeting()` + `engine_version()` (the M0.5 smoke functions) **plus** a full `DubEngine` interface for the M10-B waveform UI: `list_input_devices`, `start_thru(device, channels)` (throws `EngineError`), `stop_thru`, `peaks_extend(deck, start_idx) -> Vec<u8>` plus its `len` / `chunk_duration_secs` siblings, and the matching `band_peaks_*` trio for M10.1's multi-colour shader. All bytes are `#[repr(C)]` little-endian (`PeakChunk` = 12 B, `BandPeakChunk` = 32 B) so Swift can reinterpret-cast `Data` straight into an `MTLBuffer` upload.
 
 ## RT-safety enforcement
 
@@ -1160,6 +1161,141 @@ well-defined behaviour. Same separation we already have between
 `crates/dub-bpm/src/confidence.rs` and are re-exported at the
 crate root for future per-genre profiles to bind to.
 
+### Live waveform-peak capture — M9 (shipped)
+
+The data layer underneath M10's Metal waveform UI. New `dub-peaks`
+crate, sibling of `dub-bpm`: pure-Rust off-RT decimator that consumes
+a mono-downmixed tap from `ThruSource` and produces a growing
+append-only sequence of `PeakChunk { min, max, rms }` envelope
+records, exposed to readers via a thread-safe `PeakBuffer` handle.
+
+```text
+        ┌────────────────────────────────┐
+        │     ThruSource (audio thread)  │
+        │       ┌────────────────┐       │
+        │  input ring  pop_slice │       │
+        │       └──────┬─────────┘       │
+        │              ▼                 │
+        │   stereo render → routed out   │
+        │              │                 │
+        │              ▼                 │
+        │   mono-downmix (one pass)      │
+        │     ├─ bpm_tx.push_slice  ─────┼─► dub-bpm   (M8)
+        │     └─ peaks_tx.push_slice ────┼─► dub-peaks (M9)
+        │                                │      │
+        └────────────────────────────────┘      ▼
+                                   ┌─────────────────────────┐
+                                   │    PeakStream thread    │
+                                   │  Decimator(spc=64)      │
+                                   │  PeakBuffer::push_chunks│
+                                   └────────────┬────────────┘
+                                                ▼
+                                       ┌────────────────────┐
+                                       │   PeakBuffer       │
+                                       │   len: AtomicUsize │
+                                       │   chunks: RwLock<  │
+                                       │     Vec<PeakChunk> │
+                                       │   >                │
+                                       └────────┬───────────┘
+                                                ▼
+                                 ┌────────────────────────────┐
+                                 │ Renderer / CLI (60 fps)    │
+                                 │  len() lock-free poll      │
+                                 │  extend_chunks(idx, &mut)  │
+                                 │  → local Vec mirror        │
+                                 └────────────────────────────┘
+```
+
+**Single mono-downmix, two taps.** The M8 BPM tee and M9 peaks tap
+share the same `mono_scratch` inside `ThruSource`. The audio thread
+computes the mono downmix once per block (only if at least one tap
+is enabled) and dispatches with two `push_slice` calls. Cost of
+adding the peaks tap on top of the BPM tee: one extra memcpy into
+an SPSC ring. Verified alloc-free by `both_taps_render_is_alloc_free`.
+
+**Decimator.** Pure online aggregator. Given `samples_per_chunk = N`
+(default 64 ≈ 1.33 ms at 48 kHz), the decimator carries a
+`(min, max, sumsq, count)` running aggregate across `feed` calls and
+emits one `PeakChunk { min, max, rms }` exactly every `N` samples.
+RMS is `sqrt(sumsq / N)` with `sumsq` accumulated in `f64` for
+numerical stability at longer mip levels. Block-size invariant
+(verified by `block_size_does_not_change_output`): feeding the same
+input 1 sample at a time, 7 samples at a time, or all at once yields
+identical chunk sequences. `flush` emits a partial chunk on
+shutdown.
+
+**PeakBuffer.** Shared, append-only, lock-free length check + brief
+read-lock for bulk access:
+
+- `len()` is an Acquire-load on an `AtomicUsize`. The renderer's
+  "anything new?" check at 60 fps never touches the RwLock.
+- `extend_chunks(start_idx, &mut Vec<PeakChunk>)` is the renderer
+  fast path: O(new chunks), not O(total). Takes a read lock,
+  appends `[start_idx..len]` into the caller's mirror, releases.
+  Returns the new total length for the next call.
+- `push_chunks` (used by the decimator thread) briefly takes the
+  write-lock; happens at the decimator's 20 ms drain cadence.
+- `snapshot` returns a full owned `Vec` clone — for CLI tools and
+  tests; renderers use `extend_chunks` for the incremental path.
+
+We don't use a fully lock-free design (e.g. pre-allocated
+`UnsafeCell<[PeakChunk]>` with atomic length) because the write
+contention is one bulk `extend_from_slice` per 20 ms and read
+contention is one snapshot per 16.7 ms — RwLock is comfortably in
+range. The `AtomicUsize` length already eliminates lock acquisition
+on the common "no new data" path.
+
+**Initial capacity.** `DEFAULT_BUFFER_CAPACITY_SECS = 600` (10 min)
+× sample_rate / samples_per_chunk pre-allocates the Vec. Common
+mix-track lengths don't reallocate; longer records (90 min vinyl
+side) reallocate once or twice off-RT — the audio thread never
+reallocates.
+
+**`PeakChunk` is wire format.** `#[repr(C)]`, 12 bytes (3 × `f32`).
+The M10 consumer contract is documented at the crate root: cache
+`start_idx` per stream, call `extend_chunks` each render frame,
+treat the returned slice as something you can `glBufferSubData`
+(or Metal equivalent) into a vertex buffer with zero further
+packing. min/max/rms (not just peak) because properly mastered
+drums are asymmetric and RMS gives perceived-loudness shading for
+free.
+
+**`PeakStream` lifecycle.** Identical idiom to `BpmStream`: spawn
+returns a joinable handle, `Drop` shuts down + joins, `shutdown()`
+is the explicit form that surfaces join panics. The buffer is a
+clone-on-fetch `Arc` so a renderer can keep its `PeakBuffer` handle
+alive past stream teardown without lifetime gymnastics.
+
+**Engine integration.** Four `EngineHandle::attach_thru_source*`
+variants:
+
+- `attach_thru_source` — M7, no telemetry.
+- `attach_thru_source_with_bpm_tracking` — M8.
+- `attach_thru_source_with_peaks_tracking` — M9.
+- `attach_thru_source_with_telemetry` — M8 + M9 combined.
+
+The combined attach is strictly cheaper than two separate attaches:
+one `ThruSource`, one mono-downmix on the audio thread, two analysis
+threads sharing the deck. Each method validates the relevant
+sample rate before sending the attach command, and returns the
+spawned stream handle(s) for the caller to drive.
+
+**CLI surface.** `dub thru` defaults to peaks-tracking on; the
+periodic stats line shows `peaks=[A=N B=M]` (captured chunk counts
+per deck). `--no-peaks-track` opts out. `--dump-peaks PATH` writes
+the per-deck buffers to a CSV file on shutdown
+(`deck,chunk_idx,min,max,rms`) so the operator can validate capture
+end-to-end before M10's UI exists.
+
+**Multi-resolution mip pyramids — deliberately deferred.** M9 ships
+one base mip level (64-sample chunks). Overview rendering for a 90
+min record on a 4K screen needs ~67k samples per pixel — the
+renderer can derive that with one averaging pass over the M9
+chunks. The crate doesn't pre-build a mip pyramid because the
+renderer knows how many pixels it has and the downsample is cheap;
+adding a `MipLevel` enum or `with_decimation` config when M10
+profiles in a real bottleneck is a small follow-up.
+
 ### Two decks + debug internal mixer — M4
 
 The engine has always declared `DECK_COUNT = 2`; M4 makes the second
@@ -1500,12 +1636,35 @@ covers everything we need through M4.
 
 ## Build / link / ship
 
-- Rust core builds to a static library + cdylib.
-- UniFFI generates Swift bindings from `dub-ffi`'s UDL.
-- `scripts/build-xcframework.sh` (M0.5) orchestrates: cargo build for both
-  arches, lipo, xcodebuild -create-xcframework, UniFFI bindgen.
-- Apple app links the `DubCore.xcframework`.
-- Distribution: GitHub Releases, unsigned in v1.0, notarized in v1.1.
+- `crates/dub-ffi` has `crate-type = ["lib", "staticlib", "cdylib"]`. The
+  `lib` form is what Rust workspace consumers (`cargo test`) link against;
+  the `staticlib` is what the xcframework wraps for the Apple app; the
+  `cdylib` is what UniFFI's *library-mode* bindgen reads metadata from
+  when generating Swift bindings.
+- UniFFI generates Swift bindings from `#[uniffi::export]` proc-macros on
+  Rust items in `crates/dub-ffi/src/lib.rs`. No UDL file — the Rust
+  signatures are the single source of truth. Bindings live in
+  `apple/DubShared/Sources/DubCore/Generated/` (gitignored).
+- `scripts/build-xcframework.sh` (M0.5) orchestrates: `cargo build
+  --target aarch64-apple-darwin --target x86_64-apple-darwin -p
+  dub-ffi`, `lipo -create` for a universal static lib,
+  `cargo run --bin uniffi-bindgen --features uniffi-cli -- generate
+  --library libdub_ffi.dylib --language swift` for the Swift bindings,
+  and `xcodebuild -create-xcframework` to assemble
+  `apple/DubCore.xcframework/`.
+- `scripts/bootstrap.sh` (M0.5) wraps the above and then runs
+  `xcodegen generate` against `apple/project.yml` to (re)produce
+  `apple/Dub.xcodeproj`. The Xcode project itself is gitignored —
+  `project.yml` is the diffable source of truth.
+- Apple app (`apple/Dub/`) is hybrid AppKit + SwiftUI: `@main`
+  `NSApplicationDelegate` opens an `NSWindow`; the window's content
+  view controller is an `NSHostingController` rendering SwiftUI views.
+  The audio HUD path (M10) stays on the AppKit side for the lowest
+  overhead; everything non-realtime is SwiftUI.
+- Distribution: GitHub Releases, unsigned in v1.0 ("Sign to Run
+  Locally" only), notarized in v1.1 once an Apple Developer account
+  is in place. Sandbox is off in M0.5 / M10 to keep CoreAudio device
+  access frictionless during development.
 
 ## Tests
 
@@ -1523,8 +1682,9 @@ covers everything we need through M4.
   with cooperative work-stealing, or one thread per deck? **Decision: M3.**
 - Engine state snapshot: one big atomic struct, or many small atomics? Trade-off
   is cache-line traffic vs. update granularity. **Decision: M4.**
-- UniFFI vs `swift-bridge` for the FFI surface — UniFFI is more polished,
-  `swift-bridge` allows tighter integration. **Decision: M0.5.**
+- ~~UniFFI vs `swift-bridge` for the FFI surface — UniFFI is more polished,
+  `swift-bridge` allows tighter integration. **Decision: M0.5.**~~ Resolved
+  in M0.5 — UniFFI 0.28 proc-macros. See [`docs/SHIPPED.md#m05`](SHIPPED.md#m05).
 
 ## See also
 

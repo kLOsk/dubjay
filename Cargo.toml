@@ -7,6 +7,8 @@ members = [
     "crates/dub-io",
     "crates/dub-audio",
     "crates/dub-bpm",
+    "crates/dub-peaks",
+    "crates/dub-spectral",
     "crates/dub-timecode",
     "crates/dub-thru",
     "crates/dub-fingerprint",
@@ -40,11 +42,20 @@ dub-ffi = { path = "crates/dub-ffi" }
 dub-audio = { path = "crates/dub-audio" }
 dub-bpm = { path = "crates/dub-bpm" }
 
+dub-peaks = { path = "crates/dub-peaks" }
+dub-spectral = { path = "crates/dub-spectral" }
+
 # External (only what's needed for M0–M2; more added per milestone)
 assert_no_alloc = { version = "1.1", default-features = false }
 ringbuf = "0.4"
 thiserror = "1"
 anyhow = "1"
+
+# UniFFI for the Apple FFI surface (M0.5 onward). Pinned to a recent 0.28.x
+# because that's the release the Apple build script generates bindings with.
+# `cli` feature is only enabled on the `dub-ffi`'s `uniffi-bindgen` binary —
+# library consumers don't pull in `clap`.
+uniffi = "0.28"
 
 # Audio decoding. Add per-format features as we exercise them.
 # WAV/PCM enabled in M1. MP3/FLAC/AIFF/M4A(+ALAC) added in M3 — the

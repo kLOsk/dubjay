@@ -36,7 +36,8 @@ pub use command::Command;
 pub use deck::Deck;
 pub use handle::{
     CommandError, DeckCommand, DeckSnapshot, EngineHandle, ThruAttachWithBpmError,
-    BPM_TEE_RING_CAPACITY_SECS,
+    ThruAttachWithPeaksError, ThruAttachWithTelemetryError, BPM_TEE_RING_CAPACITY_SECS,
+    PEAKS_TAP_RING_CAPACITY_SECS,
 };
 pub use realtime::{RealtimeContext, RtError};
 pub use thru::{ThruAttachError, ThruInputConfig, ThruSource};
@@ -2358,6 +2359,257 @@ mod tests {
         assert!(matches!(
             err,
             ThruAttachWithBpmError::Thru(ThruAttachError::InvalidDeck { .. })
+        ));
+    }
+
+    // -------- M9 — peaks-tracked Thru attach --------
+
+    #[test]
+    fn handle_attach_thru_with_peaks_tracking_spawns_stream() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        let stream = handle
+            .attach_thru_source_with_peaks_tracking(
+                0,
+                rx,
+                thru_cfg(sr),
+                dub_peaks::PeakStreamConfig::at(48_000),
+            )
+            .expect("attach with peaks");
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(engine.thru_attached(0));
+        stream.shutdown();
+    }
+
+    #[test]
+    fn handle_attach_thru_with_peaks_rejects_engine_sr_mismatch() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let bad_cfg = dub_peaks::PeakStreamConfig {
+            sample_rate: 44_100,
+            samples_per_chunk: 64,
+            buffer_capacity_secs: 1,
+            bands_enabled: false,
+        };
+        let err = handle
+            .attach_thru_source_with_peaks_tracking(0, rx, thru_cfg(sr), bad_cfg)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithPeaksError::SampleRateMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_peaks_rejects_invalid_chunk_size() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let bad_cfg = dub_peaks::PeakStreamConfig {
+            sample_rate: 48_000,
+            samples_per_chunk: 0,
+            buffer_capacity_secs: 1,
+            bands_enabled: false,
+        };
+        let err = handle
+            .attach_thru_source_with_peaks_tracking(0, rx, thru_cfg(sr), bad_cfg)
+            .unwrap_err();
+        assert!(matches!(err, ThruAttachWithPeaksError::BadPeaksConfig(_)));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_peaks_forwards_invalid_deck_idx() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = handle
+            .attach_thru_source_with_peaks_tracking(
+                DECK_COUNT,
+                rx,
+                thru_cfg(sr),
+                dub_peaks::PeakStreamConfig::at(48_000),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithPeaksError::Thru(ThruAttachError::InvalidDeck { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_peaks_captures_envelope_e2e() {
+        // End-to-end: push samples onto the input ring, pump the
+        // engine through `render_routed`, and verify the
+        // PeakStream's buffer accumulates chunks reflecting the
+        // input envelope.
+        //
+        // Sequencing matters: the engine drains the attach command
+        // at the top of `render_routed`, *then* renders. So if the
+        // input ring is empty at the moment of the very first pump,
+        // we'd capture a block of zeros before the operator-pushed
+        // data lands. To pin a clean assertion, we push data BEFORE
+        // any pump, so the very first render block already sees the
+        // input we want to verify.
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(8192);
+        let (mut tx, rx) = rb.split();
+        let stream = handle
+            .attach_thru_source_with_peaks_tracking(
+                0,
+                rx,
+                thru_cfg(sr),
+                dub_peaks::PeakStreamConfig {
+                    sample_rate: 48_000,
+                    samples_per_chunk: 64,
+                    buffer_capacity_secs: 1,
+                    bands_enabled: false,
+                },
+            )
+            .expect("attach with peaks");
+
+        // Push 512 stereo frames of constant (0.5, 0.5) into the
+        // input ring BEFORE the engine drains the attach command.
+        // 512 frames × 2 channels = 1024 floats; mono-downmix →
+        // 512 mono samples → 8 chunks of 64 at rms 0.5.
+        for _ in 0..512 {
+            tx.try_push(0.5_f32).unwrap();
+            tx.try_push(0.5_f32).unwrap();
+        }
+
+        // Pump 2 blocks of 256 frames each → drains 512 stereo
+        // frames exactly. The first pump also processes the attach
+        // command, which is intentional: real-world the audio
+        // thread's first render after attach IS where capture
+        // starts.
+        let mut rt = RealtimeContext::new();
+        for _ in 0..2 {
+            pump_one_block(&mut engine, &mut rt);
+        }
+        assert!(engine.thru_attached(0));
+
+        // Wait for the decimator to drain its 20 ms poll. 8 chunks
+        // is the ground truth; the buffer may already have more
+        // queued from any partial under-runs in later blocks, but
+        // the FIRST 8 chunks are the input we pushed and must all
+        // be exactly 0.5.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while stream.len() < 8 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            stream.len() >= 8,
+            "expected ≥8 chunks captured, got {}",
+            stream.len()
+        );
+        let snap = stream.buffer().snapshot();
+        for (i, c) in snap.chunks[..8].iter().enumerate() {
+            assert!(
+                (c.rms - 0.5).abs() < 1e-5,
+                "chunk {i} rms = {}, expected 0.5",
+                c.rms
+            );
+            assert!(
+                (c.max - 0.5).abs() < 1e-5,
+                "chunk {i} max = {}, expected 0.5",
+                c.max
+            );
+            assert!(
+                (c.min - 0.5).abs() < 1e-5,
+                "chunk {i} min = {}, expected 0.5",
+                c.min
+            );
+        }
+        stream.shutdown();
+    }
+
+    // -------- M9 — combined BPM + peaks telemetry attach --------
+
+    #[test]
+    fn handle_attach_thru_with_telemetry_spawns_both_streams() {
+        let sr = 48_000.0;
+        let (mut engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(4096);
+        let (_tx, rx) = rb.split();
+        let (bpm, peaks) = handle
+            .attach_thru_source_with_telemetry(
+                0,
+                rx,
+                thru_cfg(sr),
+                dub_bpm::TrackerConfig {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    analysis_period_samples: 48_000,
+                    bpm_range: dub_bpm::BpmRange::DEFAULT,
+                },
+                dub_peaks::PeakStreamConfig::at(48_000),
+            )
+            .expect("attach with telemetry");
+        let mut rt = RealtimeContext::new();
+        pump_one_block(&mut engine, &mut rt);
+        assert!(engine.thru_attached(0));
+        // Both must shut down cleanly.
+        bpm.shutdown();
+        peaks.shutdown();
+    }
+
+    #[test]
+    fn handle_attach_thru_with_telemetry_rejects_bpm_sr_mismatch() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let err = handle
+            .attach_thru_source_with_telemetry(
+                0,
+                rx,
+                thru_cfg(sr),
+                dub_bpm::TrackerConfig {
+                    sample_rate: 44_100,
+                    channels: 1,
+                    analysis_period_samples: 44_100,
+                    bpm_range: dub_bpm::BpmRange::DEFAULT,
+                },
+                dub_peaks::PeakStreamConfig::at(48_000),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithTelemetryError::BpmSampleRateMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn handle_attach_thru_with_telemetry_rejects_peaks_sr_mismatch() {
+        let sr = 48_000.0;
+        let (_engine, mut handle) = Engine::new_with_handle(sr, 256);
+        let rb = HeapRb::<f32>::new(64);
+        let (_tx, rx) = rb.split();
+        let bad_peaks = dub_peaks::PeakStreamConfig {
+            sample_rate: 44_100,
+            samples_per_chunk: 64,
+            buffer_capacity_secs: 1,
+            bands_enabled: false,
+        };
+        let err = handle
+            .attach_thru_source_with_telemetry(
+                0,
+                rx,
+                thru_cfg(sr),
+                dub_bpm::TrackerConfig::at(48_000),
+                bad_peaks,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ThruAttachWithTelemetryError::PeaksSampleRateMismatch { .. }
         ));
     }
 

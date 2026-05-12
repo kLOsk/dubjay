@@ -1,0 +1,114 @@
+# XcodeGen manifest for the Dub macOS app shell.
+#
+# Run `./scripts/bootstrap.sh` to regenerate `apple/Dub.xcodeproj` from this
+# file. The .xcodeproj is gitignored — the source of truth is this YAML +
+# the Swift / Metal sources under `apple/Dub/`.
+#
+# https://github.com/yonaskolb/XcodeGen
+
+name: Dub
+options:
+  bundleIdPrefix: com.klos
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "13.0"
+  groupSortPosition: top
+  generateEmptyDirectories: true
+  developmentLanguage: en
+  # M0.5: local-only "Sign to Run Locally". The user does not have an
+  # Apple Developer account yet; distribution-signing arrives as its own
+  # milestone after M10.2.
+  settingPresets: none
+
+settings:
+  base:
+    # No code signing — Xcode falls back to "Sign to Run Locally"
+    # automatically when these are empty.
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    # Apple Silicon + Intel.
+    ARCHS: "$(ARCHS_STANDARD)"
+    ONLY_ACTIVE_ARCH: YES
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+# Single target: the Dub.app shell. It links DubCore.xcframework (built by
+# scripts/build-xcframework.sh) and pulls in the generated Swift bindings
+# from apple/DubShared/Sources/DubCore.
+targets:
+  Dub:
+    type: application
+    platform: macOS
+    sources:
+      - path: Dub
+        excludes:
+          - "Info.plist"
+          - "Dub.entitlements"
+    resources: []
+    info:
+      path: Dub/Info.plist
+      properties:
+        CFBundleName: Dub
+        CFBundleDisplayName: Dub
+        CFBundleIdentifier: com.klos.dub
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.0.1"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "13.0"
+        NSHighResolutionCapable: true
+        NSPrincipalClass: NSApplication
+        # M0.5 doesn't talk to the microphone or any audio input yet,
+        # but we surface the usage description from the start so the
+        # M10 device-picker (which *will* request mic access) inherits
+        # a coherent user-facing string.
+        NSMicrophoneUsageDescription: "Dub needs access to your audio input to capture timecode and audio for waveform analysis."
+    entitlements:
+      path: Dub/Dub.entitlements
+      properties:
+        # Sandbox off for M0.5 — no Apple Developer ID, no distribution
+        # targets yet. M10 keeps sandbox off so we can talk to arbitrary
+        # CoreAudio devices without entitlement gymnastics. Re-enabling
+        # sandbox + the audio-input entitlement lands with the
+        # distribution milestone after M10.2.
+        com.apple.security.app-sandbox: false
+    dependencies:
+      # Swift package wrapping the generated UniFFI bindings + the
+      # DubCore.xcframework binary target.
+      - package: DubShared
+        product: DubCore
+      # CoreAudio / AudioUnit / AudioToolbox: needed because the
+      # static `libdub_ffi.a` inside `DubCore.xcframework` references
+      # CoreAudio symbols (the Rust `coreaudio-rs` crate emits
+      # `cargo:rustc-link-lib=framework=...` directives that propagate
+      # only when Cargo drives the link). Xcode drives the link
+      # here, so we surface them explicitly.
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AudioUnit.framework
+      - sdk: CoreFoundation.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.klos.dub
+        # `settingPresets: none` above strips Xcode's auto-derived
+        # PRODUCT_NAME / PRODUCT_MODULE_NAME defaults; pin them here
+        # so the Swift compiler has a non-empty module identifier.
+        PRODUCT_NAME: Dub
+        PRODUCT_MODULE_NAME: Dub
+        # Hardened runtime stays *off* until the distribution milestone.
+        # Local development signing doesn't need it; it would just add
+        # friction (entitlement lists, JIT/exec-mem opt-ins, etc.).
+        ENABLE_HARDENED_RUNTIME: NO
+        # Default settings include some legacy options that emit a
+        # deprecation warning under recent SDKs ("traditional
+        # headermap style"). Explicitly opt into the modern hmap
+        # layout so the warning is silenced under -D warnings.
+        ALWAYS_SEARCH_USER_PATHS: NO
+
+packages:
+  DubShared:
+    path: DubShared
