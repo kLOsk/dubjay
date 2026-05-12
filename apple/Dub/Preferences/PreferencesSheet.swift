@@ -29,16 +29,49 @@ struct PreferencesSheet: View {
         VStack(alignment: .leading, spacing: DubSpacing.lg) {
             header
             Divider()
-            deviceSection
-            channelsSection
+            modeSection
+            if model.engineMode == .timecode {
+                deviceSection
+                channelsSection
+            } else {
+                prepModeNote
+            }
             paletteSection
             Spacer(minLength: 0)
             Divider()
             footer
         }
         .padding(DubSpacing.xl)
-        .frame(width: 520, height: 480)
+        .frame(width: 520, height: 540)
         .background(DubColor.surface0)
+    }
+
+    private var modeSection: some View {
+        section(title: "ENGINE MODE") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Picker("", selection: $model.engineMode) {
+                    ForEach(EngineMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(model.isRunning)
+                Text(model.engineMode == .timecode
+                    ? "Two-deck timecode capture via a multi-channel audio interface."
+                    : "Output-only file playback — no input device needed.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+            }
+        }
+    }
+
+    private var prepModeNote: some View {
+        section(title: "INPUT DEVICE") {
+            Text("Prep mode bypasses input capture. Configure your default output device in macOS Audio MIDI Setup.")
+                .font(DubFont.body)
+                .foregroundStyle(DubColor.textTertiary)
+        }
     }
 
     // MARK: - Sections
