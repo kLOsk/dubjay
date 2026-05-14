@@ -25,7 +25,7 @@ use crate::realtime::RealtimeContext;
 /// [`crate::handle::DeckCommand`] proxy. Lock-free reads from the UI
 /// thread, lock-free writes from the audio thread.
 ///
-/// Three values are made visible across the boundary:
+/// Four values are made visible across the boundary:
 ///
 /// - **position (in track frames)** as `f64::to_bits` packed in an
 ///   `AtomicU64`. The audio thread updates this once per render block
@@ -36,11 +36,20 @@ use crate::realtime::RealtimeContext;
 ///   when commands change it; UI reads to render the play/pause button.
 /// - **end-of-track flag**: set by the audio thread when the playhead
 ///   walks off the end of the source. Lets the UI auto-reset etc.
+/// - **panic-play flag (M10.6b)**: the deck is currently in
+///   Panic-Play state (PRD §6.1.2 / §5.4.2) — i.e. running at a
+///   held last-known-velocity rate, ignoring any attached
+///   timecode input until a clean LFSR re-lock or an explicit
+///   cancel. UI reads this to render the `TC · HOLD` source-pill
+///   amber-dot state and to un-gate overview click-jump in
+///   Timecode mode (M10.6c).
 #[derive(Debug)]
 pub(crate) struct DeckSharedState {
     pub(crate) position_bits: AtomicU64,
     pub(crate) is_playing: AtomicBool,
     pub(crate) at_end: AtomicBool,
+    /// M10.6b. See struct docs.
+    pub(crate) is_panic_play: AtomicBool,
 }
 
 impl DeckSharedState {
@@ -49,6 +58,7 @@ impl DeckSharedState {
             position_bits: AtomicU64::new(0.0f64.to_bits()),
             is_playing: AtomicBool::new(false),
             at_end: AtomicBool::new(false),
+            is_panic_play: AtomicBool::new(false),
         }
     }
 
@@ -75,6 +85,14 @@ impl DeckSharedState {
 
     pub(crate) fn load_at_end(&self) -> bool {
         self.at_end.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store_panic_play(&self, panic: bool) {
+        self.is_panic_play.store(panic, Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_panic_play(&self) -> bool {
+        self.is_panic_play.load(Ordering::Relaxed)
     }
 }
 
@@ -378,6 +396,17 @@ impl Deck {
         }
         self.playing = playing;
         self.shared.store_playing(playing);
+    }
+
+    /// M10.6b. Mirror the deck's Panic-Play state into the UI-
+    /// readable shared atomic. Pure atomic store, RT-safe; the
+    /// audio-thread engine calls this on engage / cancel /
+    /// auto-resume so the UI's 30 Hz poll sees the transition
+    /// within one frame. Doesn't itself change deck transport —
+    /// the engine pairs this with `set_rate` / `set_playing` to
+    /// drive the actual audio.
+    pub fn set_panic_play_visible(&self, panic: bool) {
+        self.shared.store_panic_play(panic);
     }
 
     /// Render this deck's contribution into `out`, mixing additively.

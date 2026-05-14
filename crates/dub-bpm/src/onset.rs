@@ -133,6 +133,14 @@ impl OnsetDetector {
         &self.odf
     }
 
+    /// Consume the detector and return its accumulated ODF by
+    /// move. Used by the offline beat-grid path
+    /// (`analyze_bpm_with_range_and_odf`) to avoid cloning what
+    /// can be ~50 k f32 samples on a 5-minute track.
+    pub(crate) fn into_odf(self) -> Vec<f32> {
+        self.odf
+    }
+
     /// Clear all state. Same `OnsetDetector` instance can then analyze a
     /// new audio stream — avoids re-planning the FFT and re-computing
     /// the band-bin map.

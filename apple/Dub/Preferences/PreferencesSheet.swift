@@ -3,8 +3,8 @@
 //  Dub
 //
 //  M10.3 Preferences sheet. Houses the dev toolbar — input device
-//  picker, deck A/B channel fields, palette picker — *off* the
-//  performance surface so the performance view stays clean.
+//  picker, deck A/B channel fields — *off* the performance surface
+//  so the performance view stays clean.
 //
 //  Opened via `⌘,` or the status-strip gear icon. M10.5b removed
 //  the Start / Stop / Apply buttons: every config change auto-
@@ -32,7 +32,6 @@ struct PreferencesSheet: View {
             } else {
                 prepModeNote
             }
-            paletteSection
             Spacer(minLength: 0)
             Divider()
             footer
@@ -123,18 +122,6 @@ struct PreferencesSheet: View {
                     .font(DubFont.micro)
                     .foregroundStyle(DubColor.textTertiary)
             }
-        }
-    }
-
-    private var paletteSection: some View {
-        section(title: "WAVEFORM PALETTE") {
-            Picker("", selection: $model.palette) {
-                ForEach(WaveformPalette.allCases) { p in
-                    Text(p.displayName).tag(p)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
         }
     }
 

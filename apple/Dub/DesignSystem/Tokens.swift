@@ -98,6 +98,30 @@ enum DubColor {
 
     /// Clip / error / destructive.
     static let stateError = Color(hex: 0xD45C5C)
+
+    // ----- Overview strip (M10.5c) ---------------------------------
+
+    /// Deck A's amplitude colour in the Track Overview strip.
+    /// Same hue family as `deckATint` but with reduced saturation
+    /// so the overview reads as secondary chrome — it must not
+    /// compete visually with the playing-waveform palette.
+    static let deckAOverview = Color(hex: 0x806341)
+
+    /// Deck B's amplitude colour in the Track Overview strip.
+    static let deckBOverview = Color(hex: 0x3F5A60)
+
+    /// Playhead-bracket tint on the Track Overview strip. Bright
+    /// neutral so it pops against both deck-tinted amplitude bars
+    /// without picking a side.
+    static let playheadAccent = Color(hex: 0xF0E8D8)
+
+    /// Returns the per-deck overview bar tint.
+    static func deckOverview(_ deck: DeckSide) -> Color {
+        switch deck {
+        case .a: return deckAOverview
+        case .b: return deckBOverview
+        }
+    }
 }
 
 // MARK: - Deck-side handle
@@ -208,7 +232,22 @@ enum DubLayout {
     /// rendered above the strip), the M10.5c per-deck Track-
     /// Overview waveform, and future per-deck info chips (track
     /// time, RPM, key-lock, beatgrid offset).
-    static let deckColumnWidth: CGFloat = 160
+    static let deckColumnWidth: CGFloat = 80
+
+    /// Height of the horizontal playing-waveform strip in Prep
+    /// mode. ≈ half the vertical-mode `waveformMinHeight`, sized
+    /// so the strip is tall enough to read transient envelopes
+    /// comfortably but short enough that the surrounding region
+    /// has room for the M10.5c Track-Overview waveform + cue
+    /// markers + beatgrid affordances that ship alongside.
+    static let waveformPrepHeight: CGFloat = 140
+
+    /// Height of the horizontal Track-Overview band in Prep mode.
+    /// The same ratio to `waveformPrepHeight` (≈ 0.45) that
+    /// `deckOverviewWidth` (≈ 36 px) has to `deckColumnWidth`
+    /// (80 px) in Performance mode, so the overview reads as the
+    /// secondary chrome it is rather than dominating the strip.
+    static let deckOverviewHeight: CGFloat = 60
 
     /// Width of the horizontal playing-waveform in Prep mode (M10.5c).
     /// Prep mode rotates the strip 90° — it's a single horizontal
@@ -219,6 +258,20 @@ enum DubLayout {
     /// strip + waveform-zoom controls. Read as **height** in Prep
     /// mode, since the strip runs left-to-right there.
     static let deckColumnWidthPrep: CGFloat = 280
+
+    /// Width of the per-deck Track Overview strip (M10.5c) — the
+    /// thin vertical waveform on each deck's *outside* edge
+    /// showing the whole track top→bottom with a playhead bracket
+    /// at the current position. PRD §9.6.1: ≈ 36 px wide. Click-
+    /// to-jump per §6.1 (File mode always; Timecode gated on
+    /// Panic Play in M10.6).
+    static let deckOverviewWidth: CGFloat = 36
+
+    /// Horizontal padding between the overview strip and the
+    /// playing-waveform column. Just enough breathing room for the
+    /// playhead bracket on the overview to not collide visually
+    /// with the playing strip's edge.
+    static let deckOverviewGap: CGFloat = 12
 }
 
 // MARK: - Color hex initialiser

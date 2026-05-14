@@ -10,15 +10,26 @@
 //  PRD §9.7 (TBD) + M10.5b spec:
 //      • Folder picker at the top (NSOpenPanel — directory only).
 //      • Listing pane: subfolders first, then audio files.
-//      • Single-click selects a row. Selecting a *file* updates
-//        `model.browserSelection`, which `Space` then loads into
-//        the non-master, stopped deck (PRD §5.5).
-//      • Single-click on a folder descends into it.
+//      • Single-click on **any row** (file *or* folder) selects it —
+//        the row highlights and `model.browserSelection` updates.
+//        Space loads the selected file into the non-master stopped
+//        deck (PRD §5.5); Space on a folder is a no-op with a
+//        polite error (folders aren't audio).
+//      • **Double-click on a folder** descends into it. Files are
+//        intentionally non-double-clickable to load (per the
+//        user's M10.5b decision — files load via Space or drag).
 //      • Drag-and-drop a file from this view onto a deck pane also
-//        works (the system pasteboard carries the file URL —
-//        Finder-style drag bypasses the browser entirely; we just
-//        ensure the row is `.draggable`).
-//      • **No double-click load**, per the user's M10.5b decision.
+//        works. The drag uses the legacy AppKit `.onDrag {
+//        NSItemProvider }` path rather than SwiftUI's modern
+//        `.draggable(_:preview:)` API: the latter renders the
+//        preview closure into the row's coordinate space *first*
+//        and then animates it toward the cursor at drag start,
+//        producing a visible "fly-in" from where the row sits.
+//        AppKit's drag path takes a snapshot of the source view
+//        and anchors it under the cursor at the mouse-down point,
+//        which is the OS-native feel we want. The drop side
+//        (`.dropDestination(for: URL.self)`) reads `public.file-
+//        url` from the pasteboard either way.
 //
 
 import AppKit
@@ -59,6 +70,18 @@ struct FileBrowserView: View {
 
     @State private var currentDirectory: URL = FileBrowserView.defaultDirectory()
     @State private var entries: [BrowserEntry] = []
+    /// M10.5d snappy-click bookkeeping. Stacking two `.onTapGesture`
+    /// handlers (count: 1 + count: 2) forces SwiftUI to defer the
+    /// single-tap handler until the system double-click interval
+    /// expires — a noticeable lag (~250-500 ms, NSEvent's
+    /// `doubleClickInterval`). We replace the double-click gesture
+    /// with manual detection: the single-tap handler fires the
+    /// select immediately and, if a second click on the same row
+    /// lands within `doubleClickInterval`, also descends. Net
+    /// effect: zero-lag select on every click, double-click
+    /// folder-descent still works.
+    @State private var lastClickURL: URL?
+    @State private var lastClickAt: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -141,15 +164,14 @@ struct FileBrowserView: View {
 
     @ViewBuilder
     private func row(for entry: BrowserEntry) -> some View {
-        let isSelected = (model.browserSelection == entry.url) && !entry.isDirectory
+        let isSelected = model.browserSelection == entry.url
         // M10.5b: do NOT wrap the row in a `Button`. `Button` claims
-        // the primary press gesture before `.draggable` can install
-        // its drag recogniser, which is why drag-out from this
-        // browser was silently failing while Finder drag-in (no
-        // Button in the chain) worked. Tapping is handled by
-        // `.onTapGesture` *after* `.draggable`, so SwiftUI tries
-        // drag first and falls through to tap when the pointer
-        // hasn't moved.
+        // the primary press gesture before the drag recogniser can
+        // install, which is why drag-out from this browser was
+        // silently failing while Finder drag-in (no Button in the
+        // chain) worked. Tapping is handled by `.onTapGesture`
+        // *after* `.onDrag` so AppKit tries drag first and falls
+        // through to tap when the pointer hasn't moved.
         HStack(spacing: DubSpacing.md) {
             Image(systemName: entry.isDirectory ? "folder" : "waveform")
                 .foregroundStyle(
@@ -175,20 +197,43 @@ struct FileBrowserView: View {
         .background(isSelected ? DubColor.surface2 : Color.clear)
         .contentShape(Rectangle())
         .if(!entry.isDirectory) { view in
-            view.draggable(entry.url) {
-                Text(entry.displayName)
-                    .font(DubFont.body)
-                    .padding(DubSpacing.sm)
-                    .background(DubColor.surface2)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            // AppKit drag path: NSItemProvider lets the OS use the
+            // row's snapshot as the drag image, anchored under the
+            // cursor at the mouse-down point. SwiftUI's
+            // `.draggable(_:preview:)` instead renders the preview
+            // closure at the row's layout position first and then
+            // animates it toward the cursor, producing the
+            // "fly-in from row to cursor" effect we want to avoid.
+            view.onDrag {
+                NSItemProvider(object: entry.url as NSURL)
             }
         }
         .onTapGesture {
-            if entry.isDirectory {
+            // Snappy single-click select. Fires immediately — no
+            // wait for the system double-click timeout because we
+            // do not declare a second `.onTapGesture(count: 2)`
+            // (which would force SwiftUI to defer this handler).
+            // Selection works on any row type; Space ignores
+            // directories with a polite error.
+            model.browserSelection = entry.url
+
+            // Manual double-click detection: if the previous click
+            // hit the same row inside the system double-click
+            // interval, treat *this* click as the second half of
+            // a double — folders descend, files are intentionally
+            // non-double-clickable to load (per M10.5b).
+            let now = Date()
+            let interval = NSEvent.doubleClickInterval
+            let isDouble = (lastClickURL == entry.url)
+                && (lastClickAt.map { now.timeIntervalSince($0) < interval } ?? false)
+            if isDouble, entry.isDirectory {
                 currentDirectory = entry.url
                 reload()
+                lastClickURL = nil
+                lastClickAt = nil
             } else {
-                model.browserSelection = entry.url
+                lastClickURL = entry.url
+                lastClickAt = now
             }
         }
     }

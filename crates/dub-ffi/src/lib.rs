@@ -35,10 +35,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
+// `dub_bpm::analyze_beat_grid` import is intentionally removed
+// alongside M10.5p Stage 1's beat-grid disable (see `load_track`
+// for the re-enable path). The `BeatGrid` UniFFI Record itself is
+// crate-local and doesn't need the upstream `BeatGrid as CoreBeatGrid`
+// alias until computation comes back online.
 use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
 use dub_io::Track;
 use dub_peaks::{
-    compute_offline_peaks, BandPeakChunk, OfflinePeaks, PeakChunk, PeakStream, PeakStreamConfig,
+    compute_offline_peaks, BandPeakChunk, FilteredPeakChunk, OfflinePeaks, OnsetChunk, PeakChunk,
+    PeakStream, PeakStreamConfig,
 };
 
 // UniFFI scaffolding. Emits the C ABI symbols (component contract,
@@ -76,7 +82,33 @@ uniffi::setup_scaffolding!();
 ///      would trip macOS's microphone-permission prompt on the
 ///      built-in mic). Probes transport-type metadata only — no AU
 ///      instantiation, no input-property reads.
-pub const FFI_VERSION: u32 = 7;
+/// `8`: M10.6b added Panic-Play (PRD §6.1.2): new [`DubEngine::panic_play`]
+///      and [`DubEngine::cancel_panic_play`] methods, and `PositionInfo`
+///      gains an `is_panic_play` field so the existing 30 Hz UI poll
+///      picks up the engine's panic state without a separate FFI call.
+///      Engine-side: per-deck `PanicPlayState` decouples the deck from
+///      timecode-driven transport at a held last-known-velocity, with
+///      auto-resume on a clean LFSR re-lock.
+/// `9`: M10.5l added the per-hop onset-flux side-channel for the
+///      renderer's transient-emphasising bloom + saturation pipeline:
+///      new [`DubEngine::onset_peaks_len`],
+///      [`DubEngine::onset_peaks_chunk_duration_secs`], and
+///      [`DubEngine::onset_peaks_extend`] methods, all mirroring the
+///      existing `band_peaks_*` shape but with a 4-byte stride
+///      (single `f32` per chunk). Engine-side: `PeakStream` /
+///      `compute_offline_peaks` now run an `OnsetDecimator` alongside
+///      the existing broadband + band decimators; the per-deck
+///      `PeakSource` enum delegates to it the same way it delegates
+///      to bands.
+/// `10`: M10.5p ("DJ-focused waveform") added the per-track beat
+///       grid. `load_track` now runs `dub_bpm::analyze_beat_grid`
+///       off-thread and stashes the result on `FilePeaks`; the
+///       renderer reads it via the new [`DubEngine::beat_grid`]
+///       method (returns [`BeatGrid`] — bpm + confidence + beats +
+///       beats_per_bar). Used to draw discrete beat ticks atop the
+///       new monochrome envelope and (eventually) gate the kick
+///       emphasis to on-grid kicks only.
+pub const FFI_VERSION: u32 = 11;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -239,6 +271,17 @@ enum PeakSource {
 struct FilePeaks {
     broadband: Vec<PeakChunk>,
     bands: Vec<BandPeakChunk>,
+    /// Per-hop onset-flux trail (M10.5l). Same cadence as `bands`
+    /// (one entry per FFT hop) but a single `f32` per entry. The
+    /// renderer reads this for transient-emphasising bloom +
+    /// saturation in the waveform shader.
+    onset: Vec<OnsetChunk>,
+    /// Time-domain band-filtered peaks (M10.5p Stage 3). Same
+    /// cadence as `broadband` (one entry per broadband chunk). v1
+    /// populates only the LF band; MF / HF reserved. The DJ-
+    /// landmarks shader palette reads this for the kick-prominence
+    /// gate — see [`dub_peaks::filtered`] for the design rationale.
+    filtered: Vec<FilteredPeakChunk>,
     /// Decoded-track sample rate. May differ from the engine SR
     /// (e.g. a 44.1 kHz MP3 played on a 48 kHz output). The renderer
     /// uses this to compute `chunk_duration_secs` (the time-axis
@@ -246,6 +289,14 @@ struct FilePeaks {
     sample_rate: u32,
     samples_per_broadband_chunk: u32,
     samples_per_band_chunk: u32,
+    samples_per_onset_chunk: u32,
+    /// Samples per filtered-peak chunk. Matches broadband cadence in
+    /// v1 (the renderer indexes both streams 1:1).
+    samples_per_filtered_chunk: u32,
+    /// Beat grid (M10.5p), computed off-thread inside `load_track`
+    /// via [`dub_bpm::analyze_beat_grid`]. Empty (confidence = 0)
+    /// for tracks whose tempo couldn't be estimated.
+    beat_grid: BeatGrid,
 }
 
 impl PeakSource {
@@ -288,6 +339,48 @@ impl PeakSource {
         }
     }
 
+    fn onset_len(&self) -> usize {
+        match self {
+            PeakSource::Live { stream, .. } => stream.onset_len(),
+            PeakSource::File(f) => f.onset.len(),
+        }
+    }
+
+    fn samples_per_onset_chunk(&self) -> Option<u32> {
+        match self {
+            PeakSource::Live { stream, .. } => stream
+                .samples_per_onset_chunk()
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            PeakSource::File(f) => Some(f.samples_per_onset_chunk),
+        }
+    }
+
+    /// M10.5p Stage 3 — time-domain filtered-peak chunk count.
+    ///
+    /// Thru mode (`Live`) returns 0 in v1: the streaming
+    /// `PeakStream` does not yet run a `FilteredDecimator` alongside
+    /// its broadband/band/onset decimators (parked for a follow-up
+    /// — Thru-mode users typically watch the turntable, not the
+    /// screen, and the `djLandmarks` palette degrades to monochrome
+    /// envelope without filtered data, which is acceptable). File
+    /// mode returns the offline `compute_offline_peaks` result.
+    fn filtered_len(&self) -> usize {
+        match self {
+            PeakSource::Live { .. } => 0,
+            PeakSource::File(f) => f.filtered.len(),
+        }
+    }
+
+    /// M10.5p Stage 3 — filtered-peak chunk cadence in samples.
+    /// `None` for Thru mode (no filtered stream); `Some(64)` (=
+    /// broadband cadence) for File mode.
+    fn samples_per_filtered_chunk(&self) -> Option<u32> {
+        match self {
+            PeakSource::Live { .. } => None,
+            PeakSource::File(f) => Some(f.samples_per_filtered_chunk),
+        }
+    }
+
     fn extend_broadband_from(&self, start: usize, out: &mut Vec<PeakChunk>) {
         match self {
             PeakSource::Live { stream, .. } => {
@@ -309,6 +402,33 @@ impl PeakSource {
             PeakSource::File(f) => {
                 if start < f.bands.len() {
                     out.extend_from_slice(&f.bands[start..]);
+                }
+            }
+        }
+    }
+
+    fn extend_onset_from(&self, start: usize, out: &mut Vec<OnsetChunk>) {
+        match self {
+            PeakSource::Live { stream, .. } => {
+                let _new_end = stream.buffer().extend_onset_chunks(start, out);
+            }
+            PeakSource::File(f) => {
+                if start < f.onset.len() {
+                    out.extend_from_slice(&f.onset[start..]);
+                }
+            }
+        }
+    }
+
+    /// M10.5p Stage 3. Thru mode is a no-op (no filtered stream
+    /// emitted by `PeakStream` in v1); File mode copies from the
+    /// offline-computed `filtered` Vec.
+    fn extend_filtered_from(&self, start: usize, out: &mut Vec<FilteredPeakChunk>) {
+        match self {
+            PeakSource::Live { .. } => { /* no filtered stream in Thru v1 */ }
+            PeakSource::File(f) => {
+                if start < f.filtered.len() {
+                    out.extend_from_slice(&f.filtered[start..]);
                 }
             }
         }
@@ -570,25 +690,49 @@ impl DubEngine {
 
     /// Load a track on the given deck (M10.5).
     ///
-    /// Synchronously decodes the file at `path` via
+    /// Decodes the file at `path` via
     /// [`dub_io::Track::load_from_path`], computes the whole-track
     /// peaks via [`compute_offline_peaks`], stores them in the
-    /// per-deck [`PeakSource::File`], and sends
-    /// `Command::DeckLoad` to the audio thread. Position is reset
-    /// to `0.0` and the deck starts in the paused state — the
-    /// caller is expected to follow up with [`Self::play`].
+    /// per-deck [`PeakSource::File`], and sends `Command::DeckLoad`
+    /// to the audio thread. Position is reset to `0.0` and the
+    /// deck starts in the paused state — the caller is expected to
+    /// follow up with [`Self::play`].
     ///
-    /// Off-RT: decoding a typical 4-minute MP3 takes ~50 ms on
-    /// Apple silicon; offline peaks are another ~20 ms. Both are
-    /// done on the calling thread (UniFFI marshals the call from
-    /// Swift's main actor), which is fine because the audio thread
-    /// is not blocked — it continues rendering silence on the deck
-    /// until the `Command::DeckLoad` is dequeued.
+    /// **Locking discipline (M10.5d).** This call is split into
+    /// three phases:
+    ///
+    /// 1. **Quick check** under the engine-state mutex: validate
+    ///    that `start_engine` has been called. Mutex is released
+    ///    before the slow work begins.
+    /// 2. **Slow decode + peaks compute, mutex-free.** A typical
+    ///    4-minute MP3 spends ~50 ms in symphonia and another
+    ///    ~20 ms in `compute_offline_peaks`; both are heap-allocating
+    ///    and would block every concurrent `position()` /
+    ///    `peaks_extend()` / `track_info()` call (the 30 Hz UI poll)
+    ///    if held under the mutex. With the mutex released, the
+    ///    rest of the API stays responsive throughout the load.
+    ///    The Apple shell additionally dispatches this whole call
+    ///    onto a `Task.detached`, so it doesn't block the SwiftUI
+    ///    main actor either.
+    /// 3. **Quick swap** under the engine-state mutex: install the
+    ///    new `Arc<Track>` + `FilePeaks` and bump
+    ///    `peak_generation_seq` so the renderer resets to the new
+    ///    peaks on the next frame.
+    ///
+    /// The check between phases 1 and 3 is repeated — the engine
+    /// can theoretically be stopped while decode is in flight, in
+    /// which case phase 3 returns [`EngineError::EngineNotRunning`]
+    /// and the decoded `Arc<Track>` + peak vectors are dropped on
+    /// the caller's thread (off-RT, harmless). Two concurrent
+    /// loads on the same deck race for phase 3: whichever lands
+    /// last wins, and the earlier one's `Arc<Track>` is then
+    /// displaced via the engine's existing trash-channel path on
+    /// the next `Command::DeckLoad` swap.
     ///
     /// # Errors
     ///
     /// * [`EngineError::EngineNotRunning`] if `start_engine` /
-    ///   `start_thru` hasn't been called.
+    ///   `start_thru` hasn't been called (checked at phases 1 and 3).
     /// * [`EngineError::InvalidDeckIndex`] if `deck_idx >=
     ///   DECK_COUNT`.
     /// * [`EngineError::TrackDecodeFailed`] for any IO / codec /
@@ -598,11 +742,22 @@ impl DubEngine {
     ///   the channel is sized for hundreds of pending commands).
     pub fn load_track(&self, deck_idx: u64, path: String) -> Result<(), EngineError> {
         let idx = deck_idx_to_usize(deck_idx)?;
-        let mut state = lock_state(&self.state);
-        let EngineState::Running(running) = &mut *state else {
-            return Err(EngineError::EngineNotRunning);
-        };
 
+        // Phase 1: quick mutex-protected check that the engine is
+        // running. Mutex drops at the end of this scope so the
+        // expensive decode below doesn't starve the 30 Hz poll.
+        {
+            let state = lock_state(&self.state);
+            if !matches!(*state, EngineState::Running(_)) {
+                return Err(EngineError::EngineNotRunning);
+            }
+        }
+
+        // Phase 2: slow work, mutex-free. Both `Track::load_from_path`
+        // (symphonia decode + Vec<f32> allocation) and
+        // `compute_offline_peaks` (broadband + band ring fills) are
+        // heap-heavy; running them under the engine mutex would
+        // block every UI poll for the duration of the load.
         let track = Track::load_from_path(&path)
             .map_err(|e| EngineError::TrackDecodeFailed(format!("{path}: {e}")))?;
         let track = Arc::new(track);
@@ -610,11 +765,54 @@ impl DubEngine {
         let OfflinePeaks {
             broadband,
             bands,
+            onset,
+            filtered,
             sample_rate,
             samples_per_broadband_chunk,
             samples_per_band_chunk,
+            samples_per_onset_chunk,
+            samples_per_filtered_chunk,
         } = compute_offline_peaks(track.samples(), track.sample_rate(), track.channels())
             .map_err(|e| EngineError::TrackDecodeFailed(format!("peaks: {e}")))?;
+
+        // Beat grid (M10.5p) — *temporarily disabled* alongside the
+        // Stage 1 tick overlay (parked for a dedicated future
+        // "beat-grid v2" milestone — tempo-drift handling, manual
+        // phase correction, downbeat detection, all the sub-tasks
+        // a real grid feature needs). The original M10.5p Stage 1
+        // pass added ~100 ms per `load_track` (BPM + ODF + phase
+        // search on the whole sample buffer) for a feature that's
+        // not currently rendered. Skipping it here keeps loads
+        // snappy. The `BeatGrid` FFI Record + the
+        // `DubEngine::beat_grid` accessor stay in place so the
+        // future grid milestone can wire the computation back in
+        // without an FFI version bump.
+        //
+        // Re-enable path: replace the line below with
+        //
+        //     let beat_grid = match dub_bpm::analyze_beat_grid(
+        //         track.samples(),
+        //         track.sample_rate(),
+        //         track.channels(),
+        //     ) {
+        //         Ok(g) => BeatGrid::from_core(g),
+        //         Err(_) => BeatGrid::empty(),
+        //     };
+        //
+        // and re-add the `analyze_beat_grid` import at the top.
+        // `dub_bpm::analyze_beat_grid` and its tests stay live
+        // (see `dub-bpm/src/beats.rs`) so the contract doesn't
+        // bit-rot in the meantime.
+        let beat_grid = BeatGrid::empty();
+
+        // Phase 3: quick mutex-protected swap. Re-validate that the
+        // engine is still running — it may have been stopped while
+        // we were decoding, in which case we drop the freshly-built
+        // Arc<Track> + peaks here (off-RT, harmless).
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
 
         running
             .handle
@@ -631,12 +829,26 @@ impl DubEngine {
         running.peaks[idx] = Some(PeakSource::File(FilePeaks {
             broadband,
             bands,
+            onset,
+            filtered,
             sample_rate,
             samples_per_broadband_chunk: u32::try_from(samples_per_broadband_chunk)
                 .unwrap_or(u32::MAX),
             samples_per_band_chunk: u32::try_from(samples_per_band_chunk).unwrap_or(u32::MAX),
+            samples_per_onset_chunk: u32::try_from(samples_per_onset_chunk).unwrap_or(u32::MAX),
+            samples_per_filtered_chunk: u32::try_from(samples_per_filtered_chunk)
+                .unwrap_or(u32::MAX),
+            beat_grid,
         }));
-        self.bump_peak_generation(idx);
+        // The generation atomic lives on `DubEngine` directly, not
+        // inside `Mutex<EngineState>`, so this access doesn't
+        // re-acquire the state mutex (which would deadlock us). We
+        // bump it while still holding the guard so a renderer poll
+        // that sees the new peaks also sees the new generation —
+        // no torn-read window.
+        if let Some(a) = self.peak_generation_seq.get(idx) {
+            a.fetch_add(1, Ordering::Release);
+        }
 
         Ok(())
     }
@@ -678,6 +890,71 @@ impl DubEngine {
             return Err(EngineError::EngineNotRunning);
         };
         running.handle.deck(idx).pause().map_err(map_command_error)
+    }
+
+    /// M10.6b Panic-Play engage (PRD §6.1.2).
+    ///
+    /// Tells the engine to ignore the deck's timecode input until
+    /// either a clean LFSR re-lock auto-cancels, or the UI sends
+    /// [`Self::cancel_panic_play`]. While engaged the deck plays at
+    /// its last-known good velocity (read from
+    /// `LiftPolicy::last_locked_rate` if a timecode input is
+    /// attached, falling back to the deck's commanded rate). The
+    /// held rate is normalised to a positive forward value per the
+    /// PRD: a panicked backspin will continue forward, not keep
+    /// rewinding.
+    ///
+    /// Idempotent w.r.t. the engine: calling `panic_play` on a deck
+    /// already in panic state simply re-captures the held rate
+    /// (useful if the user re-triggers panic after a slight pitch
+    /// adjustment). The UI's "click panic glyph" pattern is a
+    /// toggle layered on top of this FFI surface — when the deck is
+    /// already in panic the UI should send
+    /// [`Self::cancel_panic_play`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::play`].
+    pub fn panic_play(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .panic_play()
+            .map_err(map_command_error)
+    }
+
+    /// Panic-Play manual cancel (PRD §6.1.2, M10.6d UI redesign).
+    ///
+    /// Clears the engine's panic state and hands deck transport
+    /// authority back to the timecode driver. Crucially, this **does
+    /// not** pause the deck — if a clean carrier is present, the
+    /// next render block re-locks on it and the deck stays audible
+    /// (Serato INT→ABS path). If the carrier is silent, the
+    /// driver's existing `DropoutHoldRate` arm pauses the deck on
+    /// the next block, yielding the pre-M10.6c "pause on held
+    /// position" outcome without racing a manual `set_playing(false)`
+    /// against the next Locked sample. Idempotent — a cancel on a
+    /// non-engaged deck is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::play`].
+    pub fn cancel_panic_play(&self, deck_idx: u64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+        running
+            .handle
+            .deck(idx)
+            .cancel_panic_play()
+            .map_err(map_command_error)
     }
 
     /// Seek to the given time position on the deck (M10.5).
@@ -742,6 +1019,7 @@ impl DubEngine {
             return PositionInfo {
                 has_track: false,
                 is_playing: snap.is_playing,
+                is_panic_play: snap.is_panic_play,
                 ..PositionInfo::EMPTY
             };
         };
@@ -766,6 +1044,7 @@ impl DubEngine {
             is_playing: snap.is_playing,
             at_end: snap.at_end,
             has_track: true,
+            is_panic_play: snap.is_panic_play,
         }
     }
 
@@ -791,6 +1070,39 @@ impl DubEngine {
             channels: u32::from(track.channels()),
             bpm: track.bpm(),
         })
+    }
+
+    /// Per-deck beat grid (M10.5p). Returns the cached
+    /// [`dub_bpm::analyze_beat_grid`] result from the most recent
+    /// `load_track` call.
+    ///
+    /// Returns an empty grid (`confidence == 0.0`, `beats: []`)
+    /// when:
+    ///
+    /// * the engine isn't running
+    /// * `deck_idx` is out of range
+    /// * the deck has no track loaded
+    /// * the deck holds a live (Thru) source — Thru-mode beat
+    ///   tracking is M11.5 scope (the streaming `BpmTracker` only
+    ///   tracks tempo today, no phase)
+    /// * the loaded track was too short for tempo analysis or its
+    ///   tempo couldn't be estimated
+    ///
+    /// Renderers should redraw their tick overlay whenever
+    /// [`Self::peaks_generation`] for the same deck changes.
+    #[must_use]
+    pub fn beat_grid(&self, deck_idx: u64) -> BeatGrid {
+        let Ok(idx) = deck_idx_to_usize(deck_idx) else {
+            return BeatGrid::empty();
+        };
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return BeatGrid::empty();
+        };
+        match running.peaks[idx].as_ref() {
+            Some(PeakSource::File(f)) => f.beat_grid.clone(),
+            _ => BeatGrid::empty(),
+        }
     }
 
     /// Monotonic generation counter for the deck's [`PeakSource`].
@@ -960,6 +1272,132 @@ impl DubEngine {
         source.extend_band_from(usize_from_u64(start_idx), &mut chunks);
         band_peak_chunks_to_bytes(&chunks)
     }
+
+    /// Number of [`OnsetChunk`]s captured so far on `deck_idx`
+    /// (M10.5l). Returns `0` if onset capture is disabled or the
+    /// engine is stopped.
+    #[must_use]
+    pub fn onset_peaks_len(&self, deck_idx: u64) -> u64 {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return 0;
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return 0;
+        };
+        source.onset_len() as u64
+    }
+
+    /// Wall-clock duration of one [`OnsetChunk`] on `deck_idx`, in
+    /// seconds. Equals `samples_per_onset_chunk / sample_rate`,
+    /// which is identical to the band-chunk cadence (one entry per
+    /// FFT hop).
+    ///
+    /// Returns `0.0` if onset capture is disabled, the engine is
+    /// stopped, or the deck has no stream.
+    #[must_use]
+    pub fn onset_peaks_chunk_duration_secs(&self, deck_idx: u64) -> f64 {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return 0.0;
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return 0.0;
+        };
+        let Some(spoc) = source.samples_per_onset_chunk() else {
+            return 0.0;
+        };
+        let sr = source.sample_rate();
+        if sr == 0 {
+            return 0.0;
+        }
+        f64::from(spoc) / f64::from(sr)
+    }
+
+    /// Fetch new [`OnsetChunk`]s captured since `start_idx`,
+    /// serialised as bytes (1 × `f32` per chunk = 4 bytes stride).
+    /// Used by the M10.5l transient-emphasising waveform shader.
+    ///
+    /// Returns an empty `Vec` when onset capture is disabled, the
+    /// engine is stopped, or `start_idx >= onset_len()`.
+    #[must_use]
+    pub fn onset_peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8> {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return Vec::new();
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return Vec::new();
+        };
+        let mut chunks: Vec<OnsetChunk> = Vec::new();
+        source.extend_onset_from(usize_from_u64(start_idx), &mut chunks);
+        onset_chunks_to_bytes(&chunks)
+    }
+
+    /// M10.5p Stage 3 — number of [`FilteredPeakChunk`]s available on
+    /// `deck_idx`. Returns `0` for Thru-mode decks (no filtered
+    /// stream emitted in v1) and for stopped engines.
+    #[must_use]
+    pub fn filtered_peaks_len(&self, deck_idx: u64) -> u64 {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return 0;
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return 0;
+        };
+        source.filtered_len() as u64
+    }
+
+    /// M10.5p Stage 3 — wall-clock duration of one
+    /// [`FilteredPeakChunk`] on `deck_idx`, in seconds. Equal to the
+    /// broadband-chunk duration (filtered cadence matches broadband
+    /// 1:1 by design). Returns `0.0` for Thru-mode decks and
+    /// stopped engines.
+    #[must_use]
+    pub fn filtered_peaks_chunk_duration_secs(&self, deck_idx: u64) -> f64 {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return 0.0;
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return 0.0;
+        };
+        let Some(spfc) = source.samples_per_filtered_chunk() else {
+            return 0.0;
+        };
+        let sr = source.sample_rate();
+        if sr == 0 {
+            return 0.0;
+        }
+        f64::from(spfc) / f64::from(sr)
+    }
+
+    /// M10.5p Stage 3 — fetch new [`FilteredPeakChunk`]s captured
+    /// since `start_idx`, serialised as bytes (6 × `f32` per chunk =
+    /// 24 bytes stride). Used by the DJ-landmarks waveform palette
+    /// to drive the kick-prominence gate from time-domain LF peak
+    /// amplitudes rather than μ-law-compressed FFT magnitudes.
+    ///
+    /// Wire layout per chunk (LE `f32`, in this order): `lf_min`,
+    /// `lf_max`, `mf_min`, `mf_max`, `hf_min`, `hf_max`. In v1
+    /// the MF / HF fields are always `0.0`.
+    ///
+    /// Returns an empty `Vec` for Thru-mode decks, for stopped
+    /// engines, or when `start_idx >= filtered_peaks_len()`.
+    #[must_use]
+    pub fn filtered_peaks_extend(&self, deck_idx: u64, start_idx: u64) -> Vec<u8> {
+        let state = lock_state(&self.state);
+        let Some(running) = state.as_running() else {
+            return Vec::new();
+        };
+        let Some(source) = peak_source_for(running, deck_idx) else {
+            return Vec::new();
+        };
+        let mut chunks: Vec<FilteredPeakChunk> = Vec::new();
+        source.extend_filtered_from(usize_from_u64(start_idx), &mut chunks);
+        filtered_peak_chunks_to_bytes(&chunks)
+    }
 }
 
 impl EngineState {
@@ -994,6 +1432,15 @@ pub struct PositionInfo {
     /// "position" concept doesn't apply because the timecode
     /// drives the rate).
     pub has_track: bool,
+    /// M10.6b. `true` while the deck is in Panic-Play state
+    /// (PRD §6.1.2) — i.e. running at a held last-known-velocity
+    /// rate, ignoring the attached timecode input until either a
+    /// clean LFSR re-lock auto-cancels or the UI sends
+    /// `cancel_panic_play`. The Apple shell uses this to render
+    /// the deck-header `TC · HOLD` amber-dot source-pill state
+    /// (M10.6c) and to un-gate overview click-jump in two-deck
+    /// Timecode mode.
+    pub is_panic_play: bool,
 }
 
 impl PositionInfo {
@@ -1004,7 +1451,55 @@ impl PositionInfo {
         is_playing: false,
         at_end: false,
         has_track: false,
+        is_panic_play: false,
     };
+}
+
+/// Per-track beat grid: BPM, confidence, and per-beat time stamps
+/// in seconds (M10.5p).
+///
+/// Returned by [`DubEngine::beat_grid`]. Computed off-thread inside
+/// [`DubEngine::load_track`] (via [`dub_bpm::analyze_beat_grid`])
+/// and cached on the deck's [`PeakSource::File`] entry. Live (Thru)
+/// decks return an empty grid for now — M11 / M11.5 will plumb the
+/// streaming `BpmTracker` output through here too.
+///
+/// Consumed by the renderer's beat-tick overlay (M10.5p) to draw a
+/// dot at every position in `beats`, with every `beats_per_bar`-th
+/// dot rendered brighter (the visual "downbeat"; downbeat *phase*
+/// is the first emitted beat — see the v0 limitations note on
+/// [`dub_bpm::BeatGrid`]).
+///
+/// `confidence` mirrors the BPM-estimator confidence; if it's
+/// `0.0` the grid is empty and callers should not draw anything.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BeatGrid {
+    /// Tempo in beats per minute. Meaningful iff `confidence > 0`.
+    pub bpm: f64,
+    /// Estimator confidence in `[0.0, 1.0]`. `0.0` ⇒ no beats.
+    pub confidence: f32,
+    /// Beat positions in seconds from sample 0 of the loaded
+    /// track. Empty when `confidence == 0`.
+    pub beats: Vec<f64>,
+    /// Beats per bar. v0 always reports `4`. Reserved for future
+    /// time-signature inference (M11+).
+    pub beats_per_bar: u32,
+}
+
+impl BeatGrid {
+    fn empty() -> Self {
+        Self {
+            bpm: 0.0,
+            confidence: 0.0,
+            beats: Vec::new(),
+            beats_per_bar: 4,
+        }
+    }
+
+    // `from_core(g: dub_bpm::BeatGrid) -> Self` was removed alongside
+    // the M10.5p Stage 1 disable. Re-add when wiring beat-grid
+    // computation back into `load_track`; the conversion is a
+    // straight field copy with `beats_per_bar: u32::from(g.beats_per_bar)`.
 }
 
 /// Metadata for a File-mode loaded track (M10.5).
@@ -1271,19 +1766,55 @@ fn band_peak_chunks_to_bytes(chunks: &[BandPeakChunk]) -> Vec<u8> {
     bytes
 }
 
+/// Serialise per-hop onset chunks to a packed little-endian byte
+/// buffer matching `#[repr(C)] OnsetChunk` (4 bytes per chunk: one
+/// `f32` LE flux value).
+fn onset_chunks_to_bytes(chunks: &[OnsetChunk]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(chunks));
+    for c in chunks {
+        bytes.extend_from_slice(&c.flux.to_le_bytes());
+    }
+    bytes
+}
+
+/// Serialise time-domain filtered-peak chunks to a packed little-
+/// endian byte buffer matching `#[repr(C)] FilteredPeakChunk` (24
+/// bytes per chunk: six `f32` LE values in field-declaration order:
+/// `lf_min`, `lf_max`, `mf_min`, `mf_max`, `hf_min`, `hf_max`).
+fn filtered_peak_chunks_to_bytes(chunks: &[FilteredPeakChunk]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(chunks));
+    for c in chunks {
+        bytes.extend_from_slice(&c.lf_min.to_le_bytes());
+        bytes.extend_from_slice(&c.lf_max.to_le_bytes());
+        bytes.extend_from_slice(&c.mf_min.to_le_bytes());
+        bytes.extend_from_slice(&c.mf_max.to_le_bytes());
+        bytes.extend_from_slice(&c.hf_min.to_le_bytes());
+        bytes.extend_from_slice(&c.hf_max.to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ffi_version_is_seven_after_external_interface_probe() {
+    fn ffi_version_is_eleven_after_filtered_peaks() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
         // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
         // (start_engine, load_track, play, pause, seek, position,
         // track_info, PositionInfo + TrackInfo records),
         // M10.5b 5→6 (peaks_generation),
-        // M10.5b polish 6→7 (has_external_audio_interface).
-        assert_eq!(FFI_VERSION, 7);
+        // M10.5b polish 6→7 (has_external_audio_interface),
+        // M10.6b 7→8 (panic_play / cancel_panic_play +
+        // PositionInfo.is_panic_play),
+        // M10.5l 8→9 (onset_peaks_len / onset_peaks_extend /
+        // onset_peaks_chunk_duration_secs),
+        // M10.5p 9→10 (beat_grid + BeatGrid record),
+        // M10.5p Stage 3 10→11 (filtered_peaks_len /
+        // filtered_peaks_extend / filtered_peaks_chunk_duration_secs
+        // + FilteredPeakChunk wire format).
+        assert_eq!(FFI_VERSION, 11);
     }
 
     #[test]
@@ -1374,10 +1905,15 @@ mod tests {
         // Extend on a stopped engine is empty (never panics).
         assert!(engine.peaks_extend(0, 0).is_empty());
         assert!(engine.band_peaks_extend(0, 0).is_empty());
+        assert!(engine.onset_peaks_extend(0, 0).is_empty());
+        assert!(engine.filtered_peaks_extend(0, 0).is_empty());
+        assert_eq!(engine.onset_peaks_len(0), 0);
+        assert_eq!(engine.filtered_peaks_len(0), 0);
         #[allow(clippy::float_cmp)]
         {
             assert_eq!(engine.peaks_chunk_duration_secs(0), 0.0);
             assert_eq!(engine.band_peaks_chunk_duration_secs(0), 0.0);
+            assert_eq!(engine.onset_peaks_chunk_duration_secs(0), 0.0);
         }
     }
 
@@ -1474,8 +2010,40 @@ mod tests {
     }
 
     #[test]
+    fn onset_chunks_to_bytes_round_trips_one_chunk() {
+        let c = OnsetChunk { flux: 0.42 };
+        let bytes = onset_chunks_to_bytes(std::slice::from_ref(&c));
+        assert_eq!(bytes.len(), 4);
+        let v = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert!((v - c.flux).abs() < 1e-6);
+    }
+
+    #[test]
+    fn filtered_peak_chunks_to_bytes_round_trips_one_chunk() {
+        let c = FilteredPeakChunk {
+            lf_min: -0.42,
+            lf_max: 0.84,
+            mf_min: -0.1,
+            mf_max: 0.2,
+            hf_min: -0.05,
+            hf_max: 0.07,
+        };
+        let bytes = filtered_peak_chunks_to_bytes(std::slice::from_ref(&c));
+        assert_eq!(bytes.len(), 24);
+        let read = |o| f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        assert!((read(0) - c.lf_min).abs() < 1e-6);
+        assert!((read(4) - c.lf_max).abs() < 1e-6);
+        assert!((read(8) - c.mf_min).abs() < 1e-6);
+        assert!((read(12) - c.mf_max).abs() < 1e-6);
+        assert!((read(16) - c.hf_min).abs() < 1e-6);
+        assert!((read(20) - c.hf_max).abs() < 1e-6);
+    }
+
+    #[test]
     fn empty_chunks_serialise_to_empty_bytes() {
         assert!(peak_chunks_to_bytes(&[]).is_empty());
         assert!(band_peak_chunks_to_bytes(&[]).is_empty());
+        assert!(onset_chunks_to_bytes(&[]).is_empty());
+        assert!(filtered_peak_chunks_to_bytes(&[]).is_empty());
     }
 }

@@ -44,6 +44,7 @@ fn constant_signal_yields_uniform_chunks() {
         samples_per_chunk: 64,
         buffer_capacity_secs: 1,
         bands_enabled: false,
+        onset_enabled: false,
     };
     let (mut tx, rx) = ring(4096);
     let stream = PeakStream::spawn(rx, cfg).expect("spawn");
@@ -71,6 +72,7 @@ fn bursts_have_silent_chunks_between() {
         samples_per_chunk: 64,
         buffer_capacity_secs: 1,
         bands_enabled: false,
+        onset_enabled: false,
     };
     let (mut tx, rx) = ring(4096);
     let stream = PeakStream::spawn(rx, cfg).expect("spawn");
@@ -113,6 +115,7 @@ fn incremental_extend_mirrors_full_stream() {
         samples_per_chunk: 64,
         buffer_capacity_secs: 1,
         bands_enabled: false,
+        onset_enabled: false,
     };
     let (mut tx, rx) = ring(8192);
     let stream = PeakStream::spawn(rx, cfg).expect("spawn");

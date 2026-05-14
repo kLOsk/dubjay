@@ -32,7 +32,10 @@
 //! * **No mip pyramids.** Single mip level, same as `PeakStream`. The
 //!   renderer derives any coarser overview by averaging in shader-land.
 
-use crate::{BandDecimator, BandPeakChunk, Decimator, PeakChunk, DEFAULT_SAMPLES_PER_CHUNK};
+use crate::{
+    BandDecimator, BandPeakChunk, Decimator, FilteredDecimator, FilteredPeakChunk, OnsetChunk,
+    OnsetDecimator, PeakChunk, DEFAULT_SAMPLES_PER_CHUNK,
+};
 
 /// Frames per inner feed slice when computing offline peaks.
 ///
@@ -65,6 +68,17 @@ pub struct OfflinePeaks {
     /// Per-band loudness chunks at `BAND_SAMPLES_PER_CHUNK` cadence
     /// (~10.6 ms at 48 kHz; one per FFT hop).
     pub bands: Vec<BandPeakChunk>,
+    /// Per-hop onset-flux values (M10.5l) at the same cadence as
+    /// `bands`. The renderer's transient-emphasising bloom +
+    /// saturation pipeline consumes this slice in parallel with
+    /// the band stream.
+    pub onset: Vec<OnsetChunk>,
+    /// Time-domain band-filtered peak chunks (M10.5p Stage 3). Same
+    /// cadence as `broadband` (one entry per broadband chunk), so
+    /// `filtered[k]` covers the same sample range as `broadband[k]`.
+    /// v1 populates only the LF band; MF / HF fields are zero. See
+    /// [`FilteredPeakChunk`] for the per-band semantics.
+    pub filtered: Vec<FilteredPeakChunk>,
     /// The sample rate the input was analysed at. Surfaced so callers
     /// can compute `chunk_duration_secs` without tracking the rate
     /// alongside the chunks separately.
@@ -74,6 +88,15 @@ pub struct OfflinePeaks {
     pub samples_per_broadband_chunk: usize,
     /// `BAND_SAMPLES_PER_CHUNK`. Same rationale.
     pub samples_per_band_chunk: usize,
+    /// Onset-chunk cadence in samples. Equal to
+    /// `samples_per_band_chunk` (= one FFT hop); surfaced as its
+    /// own field so a future hop-decoupling refactor doesn't break
+    /// callers.
+    pub samples_per_onset_chunk: usize,
+    /// Samples per [`FilteredPeakChunk`]. Currently equal to
+    /// `samples_per_broadband_chunk` (matched cadence so the renderer
+    /// can index broadband and filtered streams as a 1:1 pair).
+    pub samples_per_filtered_chunk: usize,
 }
 
 /// Errors emitted by [`compute_offline_peaks`].
@@ -166,9 +189,21 @@ pub fn compute_offline_peaks(
         2 => Vec::with_capacity(samples.len() / (crate::BAND_SAMPLES_PER_CHUNK * 2) + 1),
         _ => unreachable!("validated above"),
     };
+    let mut onset = match channels {
+        1 => Vec::with_capacity(samples.len() / crate::BAND_SAMPLES_PER_CHUNK + 1),
+        2 => Vec::with_capacity(samples.len() / (crate::BAND_SAMPLES_PER_CHUNK * 2) + 1),
+        _ => unreachable!("validated above"),
+    };
+    let mut filtered = match channels {
+        1 => Vec::with_capacity(samples.len() / DEFAULT_SAMPLES_PER_CHUNK + 1),
+        2 => Vec::with_capacity(samples.len() / (DEFAULT_SAMPLES_PER_CHUNK * 2) + 1),
+        _ => unreachable!("validated above"),
+    };
 
     let mut bb = Decimator::new(DEFAULT_SAMPLES_PER_CHUNK);
     let mut bd = BandDecimator::new(sample_rate);
+    let mut od = OnsetDecimator::new(sample_rate);
+    let mut fd = FilteredDecimator::new(sample_rate, DEFAULT_SAMPLES_PER_CHUNK);
 
     // We feed the decimators in slices to avoid an intermediate mono
     // Vec the size of the whole track. The slice size is set at the
@@ -180,6 +215,8 @@ pub fn compute_offline_peaks(
             for slice in samples.chunks(FEED_CHUNK_FRAMES) {
                 bb.feed(slice, |c| broadband.push(c));
                 bd.feed(slice, |c| bands.push(c));
+                od.feed(slice, |c| onset.push(c));
+                fd.feed(slice, |c| filtered.push(c));
             }
         }
         2 => {
@@ -194,6 +231,8 @@ pub fn compute_offline_peaks(
                 let mono = &mono_scratch[..frame_count];
                 bb.feed(mono, |c| broadband.push(c));
                 bd.feed(mono, |c| bands.push(c));
+                od.feed(mono, |c| onset.push(c));
+                fd.feed(mono, |c| filtered.push(c));
             }
         }
         _ => unreachable!(),
@@ -206,6 +245,7 @@ pub fn compute_offline_peaks(
     // renderer would draw as a tiny gap above the bottom edge of the
     // deck pane.
     bb.flush(|c| broadband.push(c));
+    fd.flush(|c| filtered.push(c));
     // BandDecimator does NOT have a public flush — the streaming
     // path doesn't need it (the analysis thread keeps polling). For
     // offline we accept the residual: at most one FFT hop (~512
@@ -217,9 +257,13 @@ pub fn compute_offline_peaks(
     Ok(OfflinePeaks {
         broadband,
         bands,
+        onset,
+        filtered,
         sample_rate,
         samples_per_broadband_chunk: DEFAULT_SAMPLES_PER_CHUNK,
         samples_per_band_chunk: crate::BAND_SAMPLES_PER_CHUNK,
+        samples_per_onset_chunk: crate::BAND_SAMPLES_PER_CHUNK,
+        samples_per_filtered_chunk: DEFAULT_SAMPLES_PER_CHUNK,
     })
 }
 
@@ -325,6 +369,31 @@ mod tests {
         // actual samples (Decimator::flush uses the partial count,
         // not samples_per_chunk).
         assert!((peaks.broadband[1].rms - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn offline_emits_onset_chunks_at_hop_cadence() {
+        // 8192 mono samples → ~16 hops; bands.len() and onset.len()
+        // must match (they share a cadence + a SpectralFrameStream
+        // primitive, so any divergence is a wiring bug).
+        let peaks = compute_offline_peaks(&vec![0.1f32; 8_192], 48_000, 1).unwrap();
+        assert_eq!(
+            peaks.bands.len(),
+            peaks.onset.len(),
+            "bands and onset must share cadence"
+        );
+        for c in &peaks.onset {
+            assert!(c.flux >= 0.0, "onset flux must be non-negative");
+        }
+        assert_eq!(peaks.samples_per_onset_chunk, crate::BAND_SAMPLES_PER_CHUNK);
+    }
+
+    #[test]
+    fn offline_silence_produces_zero_flux() {
+        let peaks = compute_offline_peaks(&vec![0.0f32; 8_192], 48_000, 1).unwrap();
+        for (i, c) in peaks.onset.iter().enumerate() {
+            assert!(c.flux < 1e-3, "silence onset {i}: {}", c.flux);
+        }
     }
 
     #[test]

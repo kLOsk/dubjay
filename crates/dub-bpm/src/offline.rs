@@ -105,6 +105,29 @@ pub fn analyze_bpm_with_range(
     channels: u8,
     range: BpmRange,
 ) -> Result<BpmEstimate, AnalysisError> {
+    analyze_bpm_with_range_and_odf(samples, sample_rate, channels, range).map(|(est, _)| est)
+}
+
+/// Like [`analyze_bpm_with_range`] but also returns the computed
+/// ODF (the same one the tempo estimator ran on).
+///
+/// Exposed so downstream beat-grid analysis (`beats::analyze_beat_grid`)
+/// can reuse the ODF for phase finding instead of computing it again —
+/// the ODF pass dominates `analyze_bpm`'s cost on real tracks, so
+/// sharing it halves the per-load CPU bill.
+///
+/// `pub(crate)` only — the public surface stays `analyze_bpm` /
+/// `analyze_bpm_with_range`; this is an internal optimisation hook.
+///
+/// # Errors
+///
+/// Same as [`analyze_bpm_with_range`].
+pub(crate) fn analyze_bpm_with_range_and_odf(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u8,
+    range: BpmRange,
+) -> Result<(BpmEstimate, Vec<f32>), AnalysisError> {
     if sample_rate == 0 {
         return Err(AnalysisError::ZeroSampleRate);
     }
@@ -156,7 +179,13 @@ pub fn analyze_bpm_with_range(
         detector.process(&mono);
     }
 
-    Ok(estimate_tempo(detector.odf(), odf_sr, range).unwrap_or(BpmEstimate::NONE))
+    let estimate = estimate_tempo(detector.odf(), odf_sr, range).unwrap_or(BpmEstimate::NONE);
+    // Take ownership of the ODF vec without a re-clone. `detector`
+    // is about to be dropped anyway — the explicit destructure
+    // (`let odf = detector.into_odf()`) avoids a redundant copy
+    // of what can be ~50 k f32 samples on a 5-min track.
+    let odf = detector.into_odf();
+    Ok((estimate, odf))
 }
 
 #[cfg(test)]

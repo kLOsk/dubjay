@@ -97,6 +97,33 @@ struct DeckState: Equatable {
     /// loaded on each deck.
     var sourceURL: URL? = nil
 
+    /// M10.5d. `true` while a `load_track` FFI call is in flight on
+    /// this deck (decode + offline-peaks-compute happens on a
+    /// background `Task.detached` so the SwiftUI main actor stays
+    /// responsive). Drives the deck-header source pill to its
+    /// `.loading` variant ("LOADING…", amber dot) and gates
+    /// concurrent loads (drag-drop + Space on a loading deck flash
+    /// the load-error overlay). Cleared by the model on completion
+    /// or error of the dispatched task. Independent from
+    /// `hasTrack`: a deck mid-replace-load keeps `hasTrack = true`
+    /// (the previous track still plays / renders) while `isLoading
+    /// = true`; a cold first load has `hasTrack = false` *and*
+    /// `isLoading = true`.
+    var isLoading: Bool = false
+
+    /// M10.6c. `true` while the engine is in Panic-Play (PRD
+    /// §6.1.2): the deck is decoupled from its timecode input and
+    /// running at a held last-known-velocity rate. Driven by the
+    /// 30 Hz position poll (`PositionInfo.isPanicPlay`), set / cleared
+    /// by `WaveformAppModel.{panic, cancelPanic}(side:)` for an
+    /// optimistic round-trip, and auto-cleared by the engine when a
+    /// clean LFSR re-lock is detected (PRD §6.1.2 auto-resume).
+    /// The deck-header source pill flips to `TC · HOLD` and the
+    /// Panic glyph fills while this is `true`; in two-deck Timecode
+    /// mode the overview click-jump (PRD §6.1) is allowed only when
+    /// this is `true`.
+    var isPanicPlay: Bool = false
+
     static let empty = DeckState()
 
     /// `true` when the deck has a track but isn't currently
@@ -121,7 +148,7 @@ final class WaveformAppModel: ObservableObject {
     /// Empty = single-deck mode (only in `.timecode`); always
     /// ignored in `.prep` (deck B stays off).
     @Published var channelsBText: String = ""
-    @Published var palette: WaveformPalette = .seratoFaithful
+    @Published var palette: WaveformPalette = .serato
 
     /// Engine mode the next Start call will use. Auto-default
     /// computed at launch; user can override in Preferences.
@@ -372,6 +399,7 @@ final class WaveformAppModel: ObservableObject {
         next.durationSecs = pos.durationSecs
         next.elapsedSecs = pos.elapsedSecs
         next.remainingSecs = pos.remainingSecs
+        next.isPanicPlay = pos.isPanicPlay
         // Clear stale error flash once it elapses; the deck pane
         // will hide the overlay automatically when it observes
         // `Date() > errorFlashUntil`.
@@ -413,15 +441,31 @@ final class WaveformAppModel: ObservableObject {
 
     // MARK: Track load + transport
 
-    /// Load a track onto `side`. Refuses (and red-flashes the deck
-    /// pane) if the target deck is currently playing, per PRD §5.5
-    /// + §6.4 — the user must lift the needle / pause first.
+    /// Load a track onto `side` (M10.5d background-load).
     ///
-    /// Returns `true` on a successful load (the deck is now armed
-    /// and ready; caller can follow up with `play(side)` to start
-    /// Casual Play, but Space-load is intentionally load-only).
+    /// Refuses (and red-flashes the deck pane) if the target deck
+    /// is currently playing (PRD §5.5 + §6.4 — the user must lift
+    /// the needle / pause first) **or** if another load is already
+    /// in flight on the same deck (avoids racing two decoders
+    /// against each other and stomping the deck's `Arc<Track>`).
+    ///
+    /// **Concurrency.** `engine.loadTrack` is the Rust FFI, which
+    /// in M10.5d does its decode + offline-peaks compute outside
+    /// the engine-state mutex (see `dub-ffi` `load_track` docs).
+    /// We wrap the FFI call in `Task.detached` so it runs off the
+    /// SwiftUI main actor — the 30 Hz position poll + waveform
+    /// rendering both stay responsive throughout. Returns `true`
+    /// on success.
+    ///
+    /// **Optimistic UI.** Title + format chip flip to the *new*
+    /// file before decode starts (so the deck immediately reads
+    /// "Loading… MyTrack.mp3"); duration / has-track land once the
+    /// FFI call returns. If a previous track was loaded, its
+    /// waveform stays visible until the new peaks arrive — the
+    /// renderer's `peaksGeneration` mismatch handler resets the
+    /// view at the moment of swap.
     @discardableResult
-    func loadTrack(side: DeckSide, url: URL) -> Bool {
+    func loadTrack(side: DeckSide, url: URL) async -> Bool {
         guard isRunning else {
             surfaceError("Engine not running. Open Preferences (⌘,) and Start.")
             return false
@@ -431,29 +475,57 @@ final class WaveformAppModel: ObservableObject {
             flashLoadError(side: side)
             return false
         }
-        do {
-            try engine.loadTrack(deckIdx: side.ffiDeckIdx, path: url.path)
-            var next = target
+        if target.isLoading {
+            flashLoadError(side: side)
+            surfaceError("Deck \(side.label) is already loading a track. Wait or load onto the other deck.")
+            return false
+        }
+
+        // Optimistic UI: header pill flips to LOADING + new title
+        // appears before the decode work starts.
+        var starting = target
+        starting.isLoading = true
+        starting.sourceURL = url
+        starting.displayName = url.deletingPathExtension().lastPathComponent
+        starting.errorFlashUntil = nil
+        setState(starting, for: side)
+
+        let deckIdx = side.ffiDeckIdx
+        let engineRef = engine
+        let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+            do {
+                try engineRef.loadTrack(deckIdx: deckIdx, path: url.path)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }.value
+
+        switch result {
+        case .success:
+            var next = state(for: side)
             next.hasTrack = true
             next.atEnd = false
             next.isPlaying = false
             next.elapsedSecs = 0
             next.remainingSecs = 0
-            next.sourceURL = url
-            next.displayName = url.deletingPathExtension().lastPathComponent
-            if let info = engine.trackInfo(deckIdx: side.ffiDeckIdx) {
+            next.isLoading = false
+            if let info = engine.trackInfo(deckIdx: deckIdx) {
                 next.durationSecs = info.durationSecs
                 next.formatChip = formatChip(for: url, info: info)
             }
-            next.errorFlashUntil = nil
             setState(next, for: side)
             recomputeMaster()
             return true
-        } catch let error as EngineError {
-            surfaceError(describe(error))
-            return false
-        } catch {
-            surfaceError("Unexpected load error: \(error.localizedDescription)")
+        case .failure(let error):
+            var failed = state(for: side)
+            failed.isLoading = false
+            setState(failed, for: side)
+            if let engineError = error as? EngineError {
+                surfaceError(describe(engineError))
+            } else {
+                surfaceError("Unexpected load error: \(error.localizedDescription)")
+            }
             return false
         }
     }
@@ -468,7 +540,7 @@ final class WaveformAppModel: ObservableObject {
     ///   A. Prep mode by definition has no deck B, and single-
     ///   channel Timecode never spins one up, so "non-master" isn't
     ///   meaningful and Space loads onto the only deck that exists.
-    func loadBrowserSelectionIntoTargetDeck() {
+    func loadBrowserSelectionIntoTargetDeck() async {
         guard isRunning else {
             surfaceError("Engine not running.")
             return
@@ -477,13 +549,24 @@ final class WaveformAppModel: ObservableObject {
             surfaceError("Select a file in the browser first.")
             return
         }
+        // Single-click in the browser now selects folders too (so
+        // the highlight follows keyboard intuition) — but Space
+        // shouldn't try to load a folder as audio. Skip with a
+        // polite hint instead of letting the FFI return a decode
+        // error.
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+           isDir.boolValue {
+            surfaceError("Selected entry is a folder — double-click it to enter, or pick an audio file inside.")
+            return
+        }
         let candidate = spaceLoadTarget()
         let target = state(for: candidate)
         if target.isPlaying {
             flashLoadError(side: candidate)
             return
         }
-        _ = loadTrack(side: candidate, url: url)
+        _ = await loadTrack(side: candidate, url: url)
     }
 
     /// The deck Space-load targets in the current engine config.
@@ -522,6 +605,127 @@ final class WaveformAppModel: ObservableObject {
             surfaceError(describe(error))
         } catch {
             surfaceError("Pause failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// M10.6a Casual-Play "Restart" (PRD §6.1.3). Seeks the deck to
+    /// 0:00 and resumes playback. No-op if the engine isn't running
+    /// or the deck has no track loaded. Mirror of `play(side:)` for
+    /// error handling + master recomputation.
+    func restart(side: DeckSide) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack else { return }
+        do {
+            try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: 0)
+            try engine.play(deckIdx: side.ffiDeckIdx)
+            var s = state(for: side)
+            s.elapsedSecs = 0
+            s.atEnd = false
+            s.isPlaying = true
+            setState(s, for: side)
+            lastPlayStart[side] = Date()
+            recomputeMaster()
+        } catch let error as EngineError {
+            surfaceError(describe(error))
+        } catch {
+            surfaceError("Restart failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// M10.6a zoomed click-scrub (PRD §6.1). Given a signed offset
+    /// in seconds relative to the current playhead, clamp into the
+    /// track's `[0, durationSecs]` range and seek the engine there.
+    /// `WaveformView` only invokes this when the parent
+    /// `PerformanceView` opts in (Prep mode in M10.6a; Timecode-mode
+    /// click-scrub is intentionally disabled per the PRD).
+    func scrub(side: DeckSide, relativeSecs: TimeInterval) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack, deck.durationSecs > 0 else { return }
+        let target = max(0, min(deck.durationSecs, deck.elapsedSecs + relativeSecs))
+        do {
+            try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: target)
+            var s = state(for: side)
+            s.elapsedSecs = target
+            s.atEnd = false
+            setState(s, for: side)
+        } catch let error as EngineError {
+            surfaceError(describe(error))
+        } catch {
+            surfaceError("Scrub failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: Panic Play (PRD §6.1.2 / M10.6c)
+
+    /// Engage Panic Play on `side`. Engine decouples the deck from
+    /// its timecode input and holds the last-known forward velocity
+    /// (M10.6b engine logic). UI-side we set `isPanicPlay` optimistically
+    /// so the deck header pill / glyph flip without waiting for the
+    /// next 30 Hz poll round-trip; the poll then keeps the field
+    /// authoritative (in particular, picking up an engine-side
+    /// auto-cancel on clean LFSR re-lock).
+    ///
+    /// No-op if the engine isn't running or the deck has no track —
+    /// Panic Play needs audible audio to recover *to*. The deck-header
+    /// glyph is gated to the same conditions, so this is mostly a
+    /// defence-in-depth check.
+    func panic(side: DeckSide) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack else { return }
+        do {
+            try engine.panicPlay(deckIdx: side.ffiDeckIdx)
+            var s = state(for: side)
+            s.isPanicPlay = true
+            s.isPlaying = true
+            setState(s, for: side)
+            lastPlayStart[side] = Date()
+            recomputeMaster()
+        } catch let error as EngineError {
+            surfaceError(describe(error))
+        } catch {
+            surfaceError("Panic Play failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Cancel Panic Play on `side` — Serato INT→ABS toggle.
+    ///
+    /// PRD §6.1.2 / M10.6d: the engine clears its panic flag but
+    /// *does not* touch deck transport. The next render block lets
+    /// the timecode driver re-engage on a healthy carrier (deck
+    /// keeps playing) or pause the deck via the existing
+    /// `DropoutHoldRate` arm on a silent / broken cartridge. We
+    /// mirror that here: clear `isPanicPlay` optimistically but
+    /// leave `isPlaying` alone — the 30 Hz poll will read whatever
+    /// the engine decides ≤33 ms from now.
+    func cancelPanic(side: DeckSide) {
+        guard isRunning else { return }
+        do {
+            try engine.cancelPanicPlay(deckIdx: side.ffiDeckIdx)
+            var s = state(for: side)
+            s.isPanicPlay = false
+            setState(s, for: side)
+            recomputeMaster()
+        } catch let error as EngineError {
+            surfaceError(describe(error))
+        } catch {
+            surfaceError("Cancel Panic failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Timecode-mode primary-button toggle (M10.6d UI redesign).
+    /// Mirrors Serato's INT/ABS button: tap once to switch from
+    /// platter-driven playback to internal (panic engaged), tap
+    /// again to switch back. The deck-header transport button uses
+    /// this directly when `engineMode == .timecode` and a track is
+    /// loaded; Prep mode still routes through `play` / `pause`.
+    func panicToggle(side: DeckSide) {
+        if state(for: side).isPanicPlay {
+            cancelPanic(side: side)
+        } else {
+            panic(side: side)
         }
     }
 
@@ -686,7 +890,7 @@ private struct KeyEventMonitorHost: NSViewRepresentable {
         context.coordinator.install(
             onSpace: {
                 Task { @MainActor in
-                    model.loadBrowserSelectionIntoTargetDeck()
+                    await model.loadBrowserSelectionIntoTargetDeck()
                 }
                 return true
             },

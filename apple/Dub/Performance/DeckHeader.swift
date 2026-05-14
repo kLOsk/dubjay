@@ -9,7 +9,16 @@
 //
 //  Row 1: deck label · source pill · MASTER chip · track title · artist · format chip
 //  Row 2: pitch · BPM · key · FX chip
-//  Row 3: (File mode only) track time / total · remaining
+//  Row 3: (track loaded) Play/Pause · Restart · track time / total · remaining
+//
+//  M10.6a (Casual Play UI, PRD §6.1.3): the time row gains a left-
+//  aligned transport-glyph cluster — Play/Pause toggle + Restart —
+//  so the DJ can start file playback by mouse before a set begins
+//  (or pause / restart it). Glyphs render exactly when `timeRow`
+//  renders (i.e. a file track is loaded), which covers both the
+//  Prep-mode single-deck shell and the Casual-Play-pre-Timecode
+//  case in two-deck Timecode mode. Transport callbacks are passed
+//  in from `PerformanceView` via a `DeckHeaderCallbacks` value.
 //
 
 import SwiftUI
@@ -44,11 +53,55 @@ struct DeckHeaderState: Equatable {
     /// Whether this deck is the current master (PRD §6.4).
     let isMaster: Bool
 
+    /// M10.6a: whether the deck is currently advancing the playhead.
+    /// Drives the Play / Pause toggle in the transport-glyph cluster
+    /// (PRD §6.1.3 Casual Play). Independent from `timeRow != nil`
+    /// — `timeRow` says "a file is loaded so render the time
+    /// indicators"; `isPlaying` says "the engine is advancing
+    /// elapsed time right now". A paused-mid-track deck has
+    /// `timeRow != nil` and `isPlaying == false` — the Play glyph
+    /// shows.
+    let isPlaying: Bool
+
+    /// M10.6c: whether the engine has Panic Play engaged on this
+    /// deck (PRD §6.1.2). When `true` the source pill flips to the
+    /// `.tcHold` variant ("TC · HOLD" / amber dot) and the
+    /// transport-cluster primary button renders the "re-engage
+    /// timecode" icon. Authoritative source is the engine via
+    /// `PositionInfo.isPanicPlay` (30 Hz poll); the model also sets
+    /// it optimistically on `panic(side:)` for zero-frame UI
+    /// latency.
+    let isPanicPlay: Bool
+
+    /// M10.6d: whether the transport cluster's primary button should
+    /// behave as a Serato-style INT/ABS toggle (engage / cancel
+    /// Panic Play) rather than as a Play/Pause toggle. True iff
+    /// the engine is in Timecode mode with a loaded track — Panic
+    /// Play needs audible audio to recover *to* (PRD §6.1.2) so
+    /// the toggle is meaningless without a track, and Prep mode
+    /// never engages timecode in the first place. In Timecode mode
+    /// the toggle subsumes Casual Play: tap once to engage internal
+    /// playback (= start the track when the platter is silent / mid-
+    /// fix), tap again to hand control back to the timecode driver.
+    let useTimecodeToggle: Bool
+
     enum Source: Equatable {
         case off
         case thru
         case timecode
         case file
+        /// M10.6c. Engine mode is Timecode, a file track is the
+        /// audio source, but Panic Play is engaged so the deck is
+        /// decoupled from its timecode input and holding the last-
+        /// known velocity (PRD §6.1.2). Renders as `TC · HOLD` with
+        /// an amber dot.
+        case tcHold
+        /// M10.5d. A `load_track` FFI call is in flight on this
+        /// deck (decode + offline peaks running on a background
+        /// `Task.detached`). Renders as `LOADING…` with an amber
+        /// dot — supersedes `.file` / `.tcHold` while the load is
+        /// running so the user sees the deck is busy.
+        case loading
     }
 
     struct TimeRow: Equatable {
@@ -61,8 +114,32 @@ struct DeckHeaderState: Equatable {
     static let idle = DeckHeaderState(
         isLive: false, source: .off,
         trackTitle: nil, trackArtist: nil, formatChip: nil,
-        timeRow: nil, isMaster: false
+        timeRow: nil, isMaster: false, isPlaying: false,
+        isPanicPlay: false, useTimecodeToggle: false
     )
+}
+
+/// M10.6a transport callbacks the deck header invokes when the user
+/// clicks Play / Pause / Restart in the time row. Kept off
+/// `DeckHeaderState` so the state value stays `Equatable` (closures
+/// aren't). `PerformanceView` constructs an instance per render that
+/// forwards into `WaveformAppModel.{play, pause, restart}(side:)`.
+struct DeckHeaderCallbacks {
+    /// Casual-Play start (Prep mode + track loaded + paused).
+    var onPlay:    () -> Void = {}
+    /// Casual-Play pause (Prep mode + track loaded + playing).
+    var onPause:   () -> Void = {}
+    /// M10.6d INT/ABS toggle. Used by the transport cluster when
+    /// the engine is in Timecode mode with a track loaded: tap
+    /// engages Panic Play (internal playback at last-known rate);
+    /// tap-while-engaged cancels it (hand back to timecode driver).
+    /// `PerformanceView` routes this to
+    /// `WaveformAppModel.panicToggle(side:)`.
+    var onPanicToggle: () -> Void = {}
+
+    /// No-op fallback used by the cold-launch / preview state where
+    /// no model is wired in yet.
+    static let noop = DeckHeaderCallbacks()
 }
 
 /// The deck header. Stateless — caller supplies a `DeckHeaderState`
@@ -71,6 +148,9 @@ struct DeckHeader: View {
 
     let side: DeckSide
     let state: DeckHeaderState
+    /// M10.6a Casual-Play transport callbacks. Defaults to no-op so
+    /// the cold-launch / preview path doesn't have to wire anything.
+    var callbacks: DeckHeaderCallbacks = .noop
 
     var body: some View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
@@ -134,11 +214,12 @@ struct DeckHeader: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - Row 3 — track time (File mode only)
+    // MARK: - Row 3 — track time + transport glyphs (track loaded)
 
     @ViewBuilder
     private func timeRow(_ time: DeckHeaderState.TimeRow) -> some View {
         HStack(spacing: DubSpacing.md) {
+            transportGlyphs
             Text(time.elapsedText)
                 .font(DubFont.numericInline)
                 .foregroundStyle(DubColor.textPrimary)
@@ -154,6 +235,98 @@ struct DeckHeader: View {
                 .foregroundStyle(DubColor.textSecondary)
         }
         .monospacedDigit()
+    }
+
+    /// Transport-cluster primary button (PRD §6.1).
+    ///
+    /// Sits left of the elapsed-time numbers in Row 3, and only
+    /// renders because `timeRow(_:)` only renders when a track is
+    /// loaded — no button in Thru mode where there's no canonical
+    /// playhead. Branches on `useTimecodeToggle`:
+    ///
+    /// * Prep mode (`useTimecodeToggle == false`): classic
+    ///   Play/Pause toggle. Drives `onPlay` / `onPause` per
+    ///   `isPlaying`.
+    /// * Timecode mode + track loaded (`useTimecodeToggle == true`):
+    ///   Serato-style INT/ABS toggle. Drives `onPanicToggle` either
+    ///   way; the icon flips between `play.fill` (currently following
+    ///   platter — tap to play internally) and `opticaldisc.fill`
+    ///   amber (currently internal — tap to re-engage timecode).
+    ///   Subsumes Casual Play: a paused-in-Timecode deck still
+    ///   shows `play.fill`, and tapping engages Panic Play which
+    ///   starts internal playback at last-known rate — fixing the
+    ///   "Play does nothing in Timecode mode" bug where the prior
+    ///   `engine.play` call was instantly overwritten by the next
+    ///   `DropoutHoldRate` block.
+    ///
+    /// The Restart button from the M10.6a draft is gone: the
+    /// Track Overview strip's click-to-top handles seek-to-zero,
+    /// and Panic Play handles "keep playing through a glitch", so
+    /// we don't need a third glyph.
+    private var transportGlyphs: some View {
+        HStack(spacing: DubSpacing.sm) {
+            primaryButton
+        }
+    }
+
+    @ViewBuilder
+    private var primaryButton: some View {
+        if state.useTimecodeToggle {
+            timecodeToggleButton
+        } else {
+            playPauseButton
+        }
+    }
+
+    /// Prep-mode Play/Pause toggle (PRD §6.1.3).
+    private var playPauseButton: some View {
+        transportButton(
+            systemName: state.isPlaying ? "pause.fill" : "play.fill",
+            accessibilityLabel: state.isPlaying ? "Pause" : "Play",
+            tint: DubColor.textPrimary,
+            background: DubColor.surface2,
+            action: state.isPlaying ? callbacks.onPause : callbacks.onPlay)
+    }
+
+    /// Timecode-mode INT/ABS toggle (PRD §6.1.2 / M10.6d). Amber
+    /// tint + background while panic is engaged so the button
+    /// visually agrees with the `TC · HOLD` source-pill amber dot.
+    private var timecodeToggleButton: some View {
+        transportButton(
+            systemName: state.isPanicPlay
+                ? "opticaldisc.fill"
+                : "play.fill",
+            accessibilityLabel: state.isPanicPlay
+                ? "Re-engage timecode"
+                : "Play internally (disengage timecode)",
+            tint: state.isPanicPlay
+                ? DubColor.stateTentative
+                : DubColor.textPrimary,
+            background: state.isPanicPlay
+                ? DubColor.stateTentative.opacity(0.15)
+                : DubColor.surface2,
+            action: callbacks.onPanicToggle)
+    }
+
+    @ViewBuilder
+    private func transportButton(
+        systemName: String,
+        accessibilityLabel: String,
+        tint: Color,
+        background: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .symbolRenderingMode(.monochrome)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(tint)
+                .frame(width: 20, height: 20)
+                .background(background)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     // MARK: - Subviews
@@ -205,6 +378,8 @@ struct DeckHeader: View {
         case .thru:     return state.isLive ? "THRU · LIVE" : "THRU"
         case .timecode: return state.isLive ? "TIMECODE · LIVE" : "TIMECODE"
         case .file:     return "FILE"
+        case .tcHold:   return "TC · HOLD"
+        case .loading:  return "LOADING…"
         }
     }
 
@@ -215,6 +390,8 @@ struct DeckHeader: View {
         case .thru:     return DubColor.stateLocked
         case .timecode: return DubColor.stateLocked
         case .file:     return DubColor.stateTentative
+        case .tcHold:   return DubColor.stateTentative
+        case .loading:  return DubColor.stateTentative
         }
     }
 
@@ -307,19 +484,59 @@ extension DeckHeaderState {
     ) -> DeckHeaderState {
         guard engineRunning, deckEnabled else { return .idle }
 
+        // M10.5d: cold load (no previous track) — render the
+        // header with the new title + LOADING pill but no time row
+        // (duration is unknown until decode completes). The
+        // transport-toggle is gated off until `hasTrack` flips
+        // true.
+        if deckState.isLoading, !deckState.hasTrack {
+            return DeckHeaderState(
+                isLive: true,
+                source: .loading,
+                trackTitle: deckState.displayName,
+                trackArtist: nil,
+                formatChip: nil,
+                timeRow: nil,
+                isMaster: isMaster,
+                isPlaying: false,
+                isPanicPlay: false,
+                useTimecodeToggle: false)
+        }
+
         if deckState.hasTrack {
             let time = DeckHeaderState.TimeRow(
                 elapsedText: DeckTimeFormat.format(deckState.elapsedSecs),
                 totalText:   DeckTimeFormat.format(deckState.durationSecs),
                 remainingText: DeckTimeFormat.format(deckState.remainingSecs, signed: true))
+            // M10.6c: in Timecode mode + Panic Play engaged, the
+            // source pill flips from FILE → TC · HOLD (PRD §6.1.2).
+            // M10.5d: a replace-load (new file decoded while the
+            // previous one is still resident) shows the LOADING
+            // pill but keeps the old time row + transport-toggle
+            // available — the previous track stays audible /
+            // visible until the new peaks swap in at decode
+            // completion (one frame after the engine bumps
+            // `peak_generation_seq`).
+            let inPanic = thruMode && deckState.isPanicPlay
+            let source: Source
+            if deckState.isLoading {
+                source = .loading
+            } else if inPanic {
+                source = .tcHold
+            } else {
+                source = .file
+            }
             return DeckHeaderState(
                 isLive: true,
-                source: .file,
+                source: source,
                 trackTitle: deckState.displayName,
                 trackArtist: nil,
                 formatChip: deckState.formatChip,
                 timeRow: time,
-                isMaster: isMaster)
+                isMaster: isMaster,
+                isPlaying: deckState.isPlaying,
+                isPanicPlay: inPanic,
+                useTimecodeToggle: thruMode)
         }
 
         if thruMode {
@@ -330,6 +547,10 @@ extension DeckHeaderState {
             // via Thru mode auto-detection") — even though M5.6's
             // actual timecode decoder isn't wired through the UI
             // yet, this is the milestone the surface advertises.
+            //
+            // No transport toggle here: panic needs a loaded track
+            // to recover *to* (PRD §6.1.2). The button only appears
+            // once the DJ has loaded a file onto the deck.
             return DeckHeaderState(
                 isLive: true,
                 source: .timecode,
@@ -337,7 +558,10 @@ extension DeckHeaderState {
                 trackArtist: "capturing live",
                 formatChip: nil,
                 timeRow: nil,
-                isMaster: isMaster)
+                isMaster: isMaster,
+                isPlaying: false,
+                isPanicPlay: false,
+                useTimecodeToggle: false)
         }
 
         return DeckHeaderState(
@@ -347,7 +571,10 @@ extension DeckHeaderState {
             trackArtist: nil,
             formatChip: nil,
             timeRow: nil,
-            isMaster: false)
+            isMaster: false,
+            isPlaying: false,
+            isPanicPlay: false,
+            useTimecodeToggle: false)
     }
 }
 
@@ -362,7 +589,9 @@ extension DeckHeaderState {
     DeckHeader(side: .a, state: DeckHeaderState(
         isLive: true, source: .thru,
         trackTitle: "Real Record", trackArtist: "capturing live",
-        formatChip: nil, timeRow: nil, isMaster: true))
+        formatChip: nil, timeRow: nil,
+        isMaster: true, isPlaying: false,
+        isPanicPlay: false, useTimecodeToggle: false))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -378,7 +607,25 @@ extension DeckHeaderState {
             elapsedText: "01:23",
             totalText: "03:45",
             remainingText: "-02:22"),
-        isMaster: false))
+        isMaster: false, isPlaying: true,
+        isPanicPlay: false, useTimecodeToggle: true))
+        .frame(width: 720)
+        .background(DubColor.surface0)
+        .padding()
+}
+
+#Preview("Deck B — Timecode, Panic Play engaged") {
+    DeckHeader(side: .b, state: DeckHeaderState(
+        isLive: true, source: .tcHold,
+        trackTitle: "Stakes Is High",
+        trackArtist: nil,
+        formatChip: "MP3 · 44.1 kHz · stereo",
+        timeRow: DeckHeaderState.TimeRow(
+            elapsedText: "01:23",
+            totalText: "03:45",
+            remainingText: "-02:22"),
+        isMaster: true, isPlaying: true,
+        isPanicPlay: true, useTimecodeToggle: true))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()

@@ -73,12 +73,18 @@ struct PerformanceView: View {
     @ViewBuilder
     private var deckHeaders: some View {
         if model.engineMode == .prep {
-            DeckHeader(side: .a, state: headerState(side: .a))
+            DeckHeader(side: .a,
+                       state: headerState(side: .a),
+                       callbacks: headerCallbacks(side: .a))
                 .background(DubColor.divider)
         } else {
             HStack(spacing: 1) {
-                DeckHeader(side: .a, state: headerState(side: .a))
-                DeckHeader(side: .b, state: headerState(side: .b))
+                DeckHeader(side: .a,
+                           state: headerState(side: .a),
+                           callbacks: headerCallbacks(side: .a))
+                DeckHeader(side: .b,
+                           state: headerState(side: .b),
+                           callbacks: headerCallbacks(side: .b))
             }
             .background(DubColor.divider)
         }
@@ -100,6 +106,17 @@ struct PerformanceView: View {
             isMaster: model.masterDeck == side)
     }
 
+    /// M10.6a Casual-Play transport callbacks for the deck header.
+    /// Pure forwarders into the model — the header doesn't get a
+    /// direct model reference, which keeps the view trivially
+    /// snapshot-testable in M18.
+    private func headerCallbacks(side: DeckSide) -> DeckHeaderCallbacks {
+        DeckHeaderCallbacks(
+            onPlay:    { model.play(side: side) },
+            onPause:   { model.pause(side: side) },
+            onPanicToggle: { model.panicToggle(side: side) })
+    }
+
     // MARK: - Waveform region
 
     /// Centre region. **Two-deck modes** keep the §9.2 symmetric
@@ -111,9 +128,18 @@ struct PerformanceView: View {
     @ViewBuilder
     private var waveformRegion: some View {
         if model.engineMode == .prep {
-            deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
-                .frame(minHeight: DubLayout.waveformMinHeight)
-                .background(DubColor.divider)
+            // Prep mode: horizontal Track-Overview band stacked
+            // *above* the horizontal scrolling playing waveform.
+            // Both span the full window width. Time runs left →
+            // right; playhead at 25 % from the left edge of the
+            // playing strip, at the elapsed-fraction position on
+            // the overview band.
+            VStack(spacing: 1) {
+                prepOverviewBand
+                deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
+                    .frame(height: DubLayout.waveformPrepHeight)
+            }
+            .background(DubColor.divider)
         } else {
             HStack(spacing: 1) {
                 deckPane(side: .a, deckIdx: 0, enabled: deckAEnabled)
@@ -124,18 +150,32 @@ struct PerformanceView: View {
         }
     }
 
-    /// Column width the playing waveform strip is rendered at.
-    /// Serato Scratch Live's playing waveform is ≈ 110–140 px tall
-    /// in its horizontal orientation; translated into our vertical
-    /// bottom-→-top scroll that maps to a ≈ 160 px-wide strip
-    /// (`DubLayout.deckColumnWidth`). Prep mode gets a wider strip
-    /// (`deckColumnWidthPrep`) because the single-deck surface has
-    /// more horizontal real estate to spend; M10.5c will rotate
-    /// that strip 90° into a true horizontal layout.
+    /// Prep-mode horizontal Track-Overview strip stacked above
+    /// the playing waveform. Always rendered — when no track is
+    /// loaded `TrackOverviewView`'s empty-state path draws the
+    /// faint dashed midline placeholder, which keeps the
+    /// `VStack` layout from jumping when a track loads.
+    @ViewBuilder
+    private var prepOverviewBand: some View {
+        TrackOverviewView(model: model, side: .a, deckIdx: 0,
+                          orientation: .horizontal)
+    }
+
+    /// Orientation of the playing waveform for the current engine
+    /// mode. Performance (Timecode) mode keeps the canonical PRD
+    /// §9.1 vertical scroll; Prep mode rotates 90° to a horizontal
+    /// strip so a single-deck workflow can spread the whole audible
+    /// window across the screen width.
+    private var waveformOrientation: WaveformOrientation {
+        model.engineMode == .prep ? .horizontal : .vertical
+    }
+
+    /// Column width the playing waveform strip is rendered at in
+    /// **vertical** orientation (Performance / Timecode mode). In
+    /// Prep mode the strip is horizontal and uses
+    /// `DubLayout.waveformPrepHeight` instead.
     private var waveformColumnWidth: CGFloat {
-        model.engineMode == .prep
-            ? DubLayout.deckColumnWidthPrep
-            : DubLayout.deckColumnWidth
+        DubLayout.deckColumnWidth
     }
 
     /// One deck's pane — Metal waveform when the deck has any
@@ -153,21 +193,53 @@ struct PerformanceView: View {
         let hasSource = enabled && (deckState.hasTrack
                                     || (model.engineMode == .timecode && model.isRunning))
         ZStack {
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                Group {
-                    if hasSource {
-                        WaveformView(
-                            engine: model.engine, deckIdx: deckIdx,
-                            palette: model.palette, side: side)
-                            .background(DubColor.surface0)
+            switch waveformOrientation {
+            case .vertical:
+                // Per-deck vertical-mode row layout (PRD §9.2 /
+                // §9.6.1):
+                //   Deck A: [filler] [playing] [filler] [overview] [edge]
+                //   Deck B: [edge]   [overview] [filler] [playing] [filler]
+                // The overview sits on the deck's **outside** edge,
+                // matching Serato / Traktor / rekordbox. The filler
+                // regions are reserved for forthcoming info chips
+                // (RPM toggle, key-lock, beatgrid offset) and the
+                // M10.7 centre-gutter Phase-Drift Trail.
+                HStack(spacing: 0) {
+                    if side == .a {
+                        Spacer(minLength: 0)
+                        playingColumn(
+                            side: side, deckIdx: deckIdx,
+                            hasSource: hasSource)
+                        Spacer(minLength: 0)
+                        if deckState.hasTrack {
+                            Spacer().frame(width: DubLayout.deckOverviewGap)
+                            TrackOverviewView(
+                                model: model, side: side, deckIdx: deckIdx)
+                        }
                     } else {
-                        idlePane(side: side)
+                        if deckState.hasTrack {
+                            TrackOverviewView(
+                                model: model, side: side, deckIdx: deckIdx)
+                            Spacer().frame(width: DubLayout.deckOverviewGap)
+                        }
+                        Spacer(minLength: 0)
+                        playingColumn(
+                            side: side, deckIdx: deckIdx,
+                            hasSource: hasSource)
+                        Spacer(minLength: 0)
                     }
                 }
-                .frame(width: waveformColumnWidth)
-                .frame(maxHeight: .infinity)
-                Spacer(minLength: 0)
+            case .horizontal:
+                // Prep-mode horizontal strip — playing waveform
+                // fills the full pane width, no side spacers, no
+                // overview (the Track Overview lives on a separate
+                // surface in Prep mode). Stops the SwiftUI
+                // `Spacer(minLength: 0)` siblings from competing
+                // with `playingColumn`'s `maxWidth: .infinity` and
+                // collapsing the strip.
+                playingColumn(
+                    side: side, deckIdx: deckIdx,
+                    hasSource: hasSource)
             }
             loadErrorOverlay(side: side, deckState: deckState)
         }
@@ -184,12 +256,65 @@ struct PerformanceView: View {
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }
             Task { @MainActor in
-                if model.loadTrack(side: side, url: url) {
+                // M10.5d: loadTrack is async (decode + peaks on a
+                // background Task.detached). Await it so we only
+                // auto-start Casual Play after the new track is
+                // actually swapped in.
+                if await model.loadTrack(side: side, url: url) {
                     model.play(side: side)
                 }
             }
             return true
         }
+    }
+
+    /// The width-capped centre column inside a `deckPane` —
+    /// either the playing waveform (Metal `WaveformView`) or the
+    /// idle placeholder. Pulled out of `deckPane` so the two
+    /// row-layouts (deck A vs deck B mirror) share the same
+    /// rendering.
+    @ViewBuilder
+    private func playingColumn(side: DeckSide, deckIdx: UInt64, hasSource: Bool) -> some View {
+        let orientation = waveformOrientation
+        let content = Group {
+            if hasSource {
+                WaveformView(
+                    engine: model.engine, deckIdx: deckIdx,
+                    palette: model.palette, side: side,
+                    orientation: orientation,
+                    onClickScrubRelativeSecs: clickScrubCallback(side: side))
+                    .background(DubColor.surface0)
+            } else {
+                idlePane(side: side)
+            }
+        }
+        switch orientation {
+        case .vertical:
+            content
+                .frame(width: waveformColumnWidth)
+                .frame(maxHeight: .infinity)
+        case .horizontal:
+            // Horizontal Prep-mode strip: full window width, fixed
+            // height. The deckPane's outer `.frame(height:)` already
+            // constrains the vertical extent so we just let the
+            // strip expand horizontally to fill its parent.
+            content
+                .frame(maxWidth: .infinity)
+                .frame(maxHeight: .infinity)
+        }
+    }
+
+    /// PRD §6.1 click-scrub gating: enabled in **File mode only**;
+    /// **disabled in Timecode mode regardless of Panic Play state**
+    /// (fine-scrub via mouse on a timecode-controlled deck would
+    /// race with the needle and confuse the operator). M10.6a wires
+    /// the Prep-mode shell; revisiting in M10.6c if the Casual-Play-
+    /// in-Timecode-mode case needs nuance. `nil` return → no
+    /// gesture installed at all, which is what `WaveformView`
+    /// expects.
+    private func clickScrubCallback(side: DeckSide) -> ((TimeInterval) -> Void)? {
+        guard model.engineMode == .prep else { return nil }
+        return { secs in model.scrub(side: side, relativeSecs: secs) }
     }
 
     /// Red flash overlay surfaced for ~200 ms when a load is
@@ -237,16 +362,31 @@ struct PerformanceView: View {
     /// Idle pane content — a 1-px deck-tinted playhead hairline at
     /// 25 % from the top (so the canonical orientation reads from
     /// the moment the app launches, even before any audio plays),
-    /// plus a context-appropriate hint.
+    /// plus a context-appropriate hint. Mirrors `WaveformView`'s
+    /// `playheadOverlay` orientation logic: vertical mode draws a
+    /// horizontal hairline at y = 25 % from the top, horizontal
+    /// mode draws a vertical hairline at x = 25 % from the left.
     private func idlePane(side: DeckSide) -> some View {
-        GeometryReader { geo in
+        let orientation = waveformOrientation
+        return GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 DubColor.surface0
-                Rectangle()
-                    .fill(DubColor.deckTint(side).opacity(0.35))
-                    .frame(width: geo.size.width, height: 1)
-                    .offset(y: geo.size.height
-                        * CGFloat(WaveformRenderer.pastRegionFraction))
+                Group {
+                    switch orientation {
+                    case .vertical:
+                        Rectangle()
+                            .fill(DubColor.deckTint(side).opacity(0.35))
+                            .frame(width: geo.size.width, height: 1)
+                            .offset(y: geo.size.height
+                                * CGFloat(WaveformRenderer.pastRegionFraction))
+                    case .horizontal:
+                        Rectangle()
+                            .fill(DubColor.deckTint(side).opacity(0.35))
+                            .frame(width: 1, height: geo.size.height)
+                            .offset(x: geo.size.width
+                                * CGFloat(WaveformRenderer.pastRegionFraction))
+                    }
+                }
                 VStack(spacing: DubSpacing.sm) {
                     Text(side.label)
                         .font(DubFont.caps)

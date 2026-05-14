@@ -23,7 +23,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::{BandPeakChunk, PeakChunk};
+use crate::{BandPeakChunk, OnsetChunk, PeakChunk};
 
 /// Shared peak buffer. Cloning is cheap (Arc bump); all clones see
 /// the same underlying data.
@@ -52,6 +52,14 @@ struct Inner {
     /// can inspect `band_len()` to discover whether band data is
     /// available without poking at this Option directly.
     bands: Option<BandStorage>,
+    /// Parallel storage for per-hop onset-flux chunks (M10.5l).
+    /// Same lifetime / shape as `bands` (independent atomic len +
+    /// `RwLock<Vec>`) but the chunks are single-`f32` values
+    /// rather than 8-`f32` arrays. `None` when the buffer was
+    /// constructed without onset capture; the M10.5l renderer
+    /// gracefully degrades to "no transient bloom" if it sees
+    /// `onset_len() == 0`.
+    onset: Option<OnsetStorage>,
 }
 
 #[derive(Debug)]
@@ -60,11 +68,17 @@ struct BandStorage {
     chunks: RwLock<Vec<BandPeakChunk>>,
 }
 
+#[derive(Debug)]
+struct OnsetStorage {
+    len: AtomicUsize,
+    chunks: RwLock<Vec<OnsetChunk>>,
+}
+
 impl PeakBuffer {
     /// Construct an empty buffer with the given pre-allocated
-    /// broadband capacity (in chunks). No band storage; band-related
-    /// methods will return as if "off". Growth beyond `capacity` is
-    /// allowed transparently.
+    /// broadband capacity (in chunks). No band storage, no onset
+    /// storage — both side-channel methods return as if "off".
+    /// Growth beyond `capacity` is allowed transparently.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -72,19 +86,21 @@ impl PeakBuffer {
                 len: AtomicUsize::new(0),
                 chunks: RwLock::new(Vec::with_capacity(capacity)),
                 bands: None,
+                onset: None,
             }),
         }
     }
 
     /// Construct an empty buffer with both broadband and per-band
     /// storage. `capacity` sizes the broadband Vec; `band_capacity`
-    /// sizes the band Vec. Either Vec grows transparently when
-    /// exceeded.
+    /// sizes the band Vec. No onset storage.
     ///
-    /// This is the M9.5b construction path; it's used when the
-    /// caller (the `PeakStream` worker) wants to capture band
-    /// energy alongside the broadband envelope for multi-colour
-    /// rendering.
+    /// Either Vec grows transparently when exceeded.
+    ///
+    /// This is the M9.5b construction path; it's used by tests +
+    /// CLI clients that only want broadband + bands. The M10.5l
+    /// renderer-facing path uses
+    /// [`Self::with_capacity_with_bands_and_onset`] instead.
     #[must_use]
     pub fn with_capacity_with_bands(capacity: usize, band_capacity: usize) -> Self {
         Self {
@@ -92,6 +108,34 @@ impl PeakBuffer {
                 len: AtomicUsize::new(0),
                 chunks: RwLock::new(Vec::with_capacity(capacity)),
                 bands: Some(BandStorage {
+                    len: AtomicUsize::new(0),
+                    chunks: RwLock::new(Vec::with_capacity(band_capacity)),
+                }),
+                onset: None,
+            }),
+        }
+    }
+
+    /// Construct an empty buffer with broadband + band + onset
+    /// storage all enabled (M10.5l). `capacity` sizes the
+    /// broadband Vec, `band_capacity` sizes both the band Vec and
+    /// the onset Vec — they share a cadence (one chunk per FFT hop)
+    /// so capacity-in-chunks is identical.
+    ///
+    /// Each Vec grows transparently when exceeded. This is the
+    /// construction path the M10.5l-capable `PeakStream` worker
+    /// uses by default.
+    #[must_use]
+    pub fn with_capacity_with_bands_and_onset(capacity: usize, band_capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                len: AtomicUsize::new(0),
+                chunks: RwLock::new(Vec::with_capacity(capacity)),
+                bands: Some(BandStorage {
+                    len: AtomicUsize::new(0),
+                    chunks: RwLock::new(Vec::with_capacity(band_capacity)),
+                }),
+                onset: Some(OnsetStorage {
                     len: AtomicUsize::new(0),
                     chunks: RwLock::new(Vec::with_capacity(band_capacity)),
                 }),
@@ -291,6 +335,102 @@ impl PeakBuffer {
             chunks: guard.clone(),
         }
     }
+
+    // ---- Onset capture (M10.5l) ----------------------------------------
+
+    /// True iff this buffer was constructed with onset storage.
+    /// Mirrors [`Self::has_bands`]; the M10.5l renderer reads this
+    /// to decide whether to drive transient-emphasising bloom from
+    /// real flux data (Yes) or to skip the onset-trail upload
+    /// entirely (No → gracefully degrades to M10.5h-style "all
+    /// chunks bloom equally").
+    #[must_use]
+    pub fn has_onset(&self) -> bool {
+        self.inner.onset.is_some()
+    }
+
+    /// Lock-free length query for the onset stream. Returns `0`
+    /// when onset storage is disabled. The renderer's "anything
+    /// new in the transient channel?" check.
+    #[must_use]
+    pub fn onset_len(&self) -> usize {
+        self.inner
+            .onset
+            .as_ref()
+            .map_or(0, |o| o.len.load(Ordering::Acquire))
+    }
+
+    /// Append onset-flux chunks. No-op when onset storage is
+    /// disabled; the worker thread is free to call this
+    /// unconditionally rather than branching on `has_onset()`
+    /// every drain loop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the onset `RwLock` is poisoned. See
+    /// [`Self::push_chunks`] for the rationale.
+    pub fn push_onset_chunks(&self, chunks: &[OnsetChunk]) {
+        if chunks.is_empty() {
+            return;
+        }
+        let Some(storage) = self.inner.onset.as_ref() else {
+            return;
+        };
+        let mut guard = storage
+            .chunks
+            .write()
+            .expect("PeakBuffer onset storage poisoned; a producer panicked mid-write");
+        guard.extend_from_slice(chunks);
+        storage.len.store(guard.len(), Ordering::Release);
+    }
+
+    /// Renderer fast path for onset chunks. Same semantics as
+    /// [`Self::extend_chunks`] / [`Self::extend_band_chunks`]:
+    /// appends new chunks (index `>= start_idx`) into `dst` and
+    /// returns the new total length. Returns `0` immediately when
+    /// onset storage is disabled (caller treats that as "no
+    /// transient data — keep the M10.5h-style uniform bloom").
+    ///
+    /// # Panics
+    ///
+    /// Panics if the onset `RwLock` is poisoned. See
+    /// [`Self::push_chunks`] for the rationale.
+    pub fn extend_onset_chunks(&self, start_idx: usize, dst: &mut Vec<OnsetChunk>) -> usize {
+        let Some(storage) = self.inner.onset.as_ref() else {
+            return 0;
+        };
+        let guard = storage
+            .chunks
+            .read()
+            .expect("PeakBuffer onset storage poisoned; a producer panicked mid-write");
+        let len = guard.len();
+        if start_idx >= len {
+            return len;
+        }
+        dst.extend_from_slice(&guard[start_idx..]);
+        len
+    }
+
+    /// Snapshot the full onset buffer. Empty if onset storage is
+    /// disabled. Mirrors [`Self::band_snapshot`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the onset `RwLock` is poisoned. See
+    /// [`Self::push_chunks`] for the rationale.
+    #[must_use]
+    pub fn onset_snapshot(&self) -> OnsetSnapshot {
+        let Some(storage) = self.inner.onset.as_ref() else {
+            return OnsetSnapshot { chunks: Vec::new() };
+        };
+        let guard = storage
+            .chunks
+            .read()
+            .expect("PeakBuffer onset storage poisoned; a producer panicked mid-write");
+        OnsetSnapshot {
+            chunks: guard.clone(),
+        }
+    }
 }
 
 /// A point-in-time copy of a [`PeakBuffer`]. Owns its chunks so it
@@ -335,6 +475,31 @@ impl BandPeakSnapshot {
     }
 
     /// True iff no band chunks were captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+}
+
+/// Point-in-time copy of a [`PeakBuffer`]'s onset side (M10.5l).
+/// Owns its chunks so it outlives the originating buffer without
+/// holding any locks. Empty when the originating buffer has no
+/// onset storage; same type-level surface as [`PeakSnapshot`] and
+/// [`BandPeakSnapshot`].
+#[derive(Debug, Clone)]
+pub struct OnsetSnapshot {
+    /// All onset-flux chunks captured at snapshot time, in order.
+    pub chunks: Vec<OnsetChunk>,
+}
+
+impl OnsetSnapshot {
+    /// Number of onset chunks in the snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// True iff no onset chunks were captured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
@@ -505,6 +670,64 @@ mod tests {
         assert_eq!(n2, 4);
         assert_eq!(dst.len(), 4);
         assert!((dst[3].rms_per_band[0] - 0.4).abs() < 1e-6);
+    }
+
+    // -------- Per-onset capture (M10.5l) ---------------------------
+
+    fn oc(flux: f32) -> OnsetChunk {
+        OnsetChunk { flux }
+    }
+
+    #[test]
+    fn no_onset_storage_unless_constructed_with_onset() {
+        let b = PeakBuffer::with_capacity_with_bands(8, 4);
+        assert!(!b.has_onset());
+        assert_eq!(b.onset_len(), 0);
+        b.push_onset_chunks(&[oc(1.0)]);
+        assert_eq!(b.onset_len(), 0, "push must no-op when onset off");
+        let mut dst = Vec::new();
+        let n = b.extend_onset_chunks(0, &mut dst);
+        assert_eq!(n, 0);
+        assert!(dst.is_empty());
+        assert!(b.onset_snapshot().is_empty());
+    }
+
+    #[test]
+    fn with_bands_and_onset_enables_onset_storage() {
+        let b = PeakBuffer::with_capacity_with_bands_and_onset(8, 4);
+        assert!(b.has_onset());
+        assert!(b.has_bands());
+        b.push_onset_chunks(&[oc(0.5), oc(2.0)]);
+        assert_eq!(b.onset_len(), 2);
+        let snap = b.onset_snapshot();
+        assert_eq!(snap.len(), 2);
+        assert!((snap.chunks[0].flux - 0.5).abs() < 1e-6);
+        assert!((snap.chunks[1].flux - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn onset_extend_chunks_appends_only_new() {
+        let b = PeakBuffer::with_capacity_with_bands_and_onset(8, 4);
+        b.push_onset_chunks(&[oc(0.1), oc(0.2), oc(0.3)]);
+        let mut dst = Vec::new();
+        let n1 = b.extend_onset_chunks(0, &mut dst);
+        assert_eq!(n1, 3);
+        b.push_onset_chunks(&[oc(0.4)]);
+        let n2 = b.extend_onset_chunks(n1, &mut dst);
+        assert_eq!(n2, 4);
+        assert_eq!(dst.len(), 4);
+        assert!((dst[3].flux - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn onset_and_broadband_storage_are_independent() {
+        let b = PeakBuffer::with_capacity_with_bands_and_onset(8, 4);
+        b.push_chunks(&[pc(0.0, 0.5, 0.3); 10]);
+        assert_eq!(b.len(), 10);
+        assert_eq!(b.onset_len(), 0);
+        b.push_onset_chunks(&[oc(7.0)]);
+        assert_eq!(b.len(), 10);
+        assert_eq!(b.onset_len(), 1);
     }
 
     #[test]

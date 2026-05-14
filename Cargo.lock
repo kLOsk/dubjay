@@ -616,6 +616,7 @@ name = "dub-ffi"
 version = "0.0.1"
 dependencies = [
  "dub-audio",
+ "dub-bpm",
  "dub-engine",
  "dub-io",
  "dub-peaks",

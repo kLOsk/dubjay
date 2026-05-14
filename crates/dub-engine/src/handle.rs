@@ -250,6 +250,7 @@ impl EngineHandle {
             position_frames: shared.load_position(),
             is_playing: shared.load_playing(),
             at_end: shared.load_at_end(),
+            is_panic_play: shared.load_panic_play(),
         })
     }
 
@@ -788,6 +789,13 @@ pub struct DeckSnapshot {
     pub is_playing: bool,
     /// Whether the playhead is past either end of the loaded track.
     pub at_end: bool,
+    /// M10.6b. Whether the deck is currently in Panic-Play state
+    /// (PRD §6.1.2) — i.e. running at a held last-known-velocity
+    /// rate with timecode-driven transport updates suppressed.
+    /// Flips automatically back to `false` when the engine sees a
+    /// clean `LiftIntent::Locked` (auto-resume) or the UI issues
+    /// `cancel_panic_play`.
+    pub is_panic_play: bool,
 }
 
 /// Per-deck command builder. Returned by [`EngineHandle::deck`]; consumes
@@ -845,6 +853,42 @@ impl DeckCommand<'_> {
         self.handle.send(Command::DeckSetRate { idx, rate })
     }
 
+    /// M10.6b Panic-Play engage (PRD §6.1.2). Decouples the deck
+    /// from any attached timecode input and pins it to its last-
+    /// known good velocity (or unity forward if no policy is
+    /// attached / no velocity has been observed). Auto-cancels on a
+    /// clean LFSR re-lock; manual-cancels via
+    /// [`Self::cancel_panic_play`].
+    ///
+    /// Sending `panic_play` on a deck that is already in panic
+    /// state is harmless — the engine just re-captures the held
+    /// rate from `LiftPolicy::last_locked_rate()` and re-pins. The
+    /// FFI surface exposes this as a "click once to engage, click
+    /// again to cancel" pattern; the engine doesn't enforce that —
+    /// the UI does.
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn panic_play(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckPanicPlay { idx })
+    }
+
+    /// Panic-Play manual cancel (PRD §6.1.2 / M10.6d). Clears the
+    /// engaged flag and hands transport authority back to the
+    /// timecode driver — does **not** touch `is_playing` / `rate`.
+    /// A healthy carrier keeps the deck playing (Serato INT→ABS);
+    /// a silent carrier pauses it on the next block via the
+    /// existing `DropoutHoldRate` path. Idempotent on decks not in
+    /// panic state (engine drops the command silently).
+    ///
+    /// # Errors
+    /// See impl-level docs.
+    pub fn cancel_panic_play(self) -> Result<(), CommandError> {
+        let idx = self.handle.check_deck(self.idx)?;
+        self.handle.send(Command::DeckCancelPanicPlay { idx })
+    }
+
     /// Set the linear deck gain.
     ///
     /// # Errors
@@ -899,6 +943,7 @@ impl DeckCommand<'_> {
             position_frames: 0.0,
             is_playing: false,
             at_end: false,
+            is_panic_play: false,
         })
     }
 }

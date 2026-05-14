@@ -2,339 +2,355 @@
 //  Shaders.metal
 //  Dub
 //
-//  M10-B vertex + M10.1 multi-colour fragment shaders for the
-//  broadband waveform view.
+//  Serato-faithful main-waveform shader.
 //
-//  Vertex stage (M10-B): one instance per `PeakChunk`; instanced
-//  quads (4 verts each, drawn as a triangle strip) form the
-//  familiar Serato min/max bars. The vertex shader also looks up
-//  the matching `BandPeakChunk` (8 × f32 RMS, one per log-spaced
-//  band) and forwards it to the fragment stage.
+//  This is a deliberate, audited reset from M10's HDR / bloom /
+//  onset-confidence / chroma-desat / kick-prominence / RMS-body /
+//  djLandmarks stack down to the reference algorithm Mixxx ships
+//  (commit 358662d, Oct 2025) which itself mirrors what Serato has
+//  done since Scratch Live. The look it produces is:
 //
-//  Fragment stage (M10.1): mixes the 8 perceptual-band loudness
-//  values into RGB:
+//      height(x) = max broadband peak over the pixel column
+//      hue(x)    = R = lowPeak  · low.r + midPeak · mid.r + highPeak · high.r
+//                  G = lowPeak  · low.g + midPeak · mid.g + highPeak · high.g
+//                  B = lowPeak  · low.b + midPeak · mid.b + highPeak · high.b
+//                  → normalise so max(R, G, B) == 1
 //
-//      R = mean(b[0], b[1])                 (kick / bass: 30-159 Hz)
-//      G = mean(b[2], b[3], b[4])           (mids / vox: 159-1934 Hz)
-//      B = mean(b[5], b[6], b[7])           (highs:      1934-16000 Hz)
+//  Bands map onto Serato-style colour anchors — *not* the pure RGB
+//  primaries Mixxx's stock skin uses. The reason is human-readable
+//  band-mix discrimination:
 //
-//  Band boundaries are determined by `dub_spectral`'s log-spaced
-//  layout (30 Hz – 16 kHz, 8 bands). The mapping above is the
-//  default M10.1 palette; M10.2 will surface palette presets via
-//  a SwiftUI sub-view.
+//      Pure RGB primaries: bass + mid → yellow (R + G), bass + high
+//      → magenta, mid + high → cyan. Because almost every musical
+//      sample has measurable energy in *both* bass and mid, the
+//      pixel column lands on yellow-orange the overwhelming
+//      majority of the time. Sections with very different spectral
+//      content end up rendering as visually-similar warm hues —
+//      the eye can't tell a kick-only break apart from a kick +
+//      snare drop.
 //
-//  Layout / sizing (M10.4 vertical + M10.5b single-pass past+future):
+//      Serato's anchors are chosen so the *pairwise mixes* stay
+//      readable without letting bass + mid collapse into the old
+//      yellow wash. Low stays warm red/orange; mid/presence is
+//      green (guitar/string/vocal body); high is blue/cyan.
 //
-//  Each chunk is rendered as a **horizontal** bar at a fixed vertical
-//  position. The deck column is a *tall* MTKView; chunks stack
-//  vertically with time running bottom → top (forward play = waveform
-//  marches upward through the playhead — see PRD §9.1).
+//          low  = (1.00, 0.30, 0.05)  warm orange-red  (kick / bass)
+//          mid  = (0.10, 0.95, 0.28)  green            (guitar / string / vocal body)
+//          high = (0.18, 0.62, 1.00)  cyan-blue         (hats / cymbals / air)
 //
-//  Vertical NDC ranges (NDC y goes from -1 = bottom to +1 = top):
-//      • Past region:   y ∈ [+0.5, +1.0]  (top 25 % of viewport)
-//      • Playhead line: y =  +0.5         (25 % from the top; rendered
-//                                          as an overlay by `WaveformView`)
-//      • Future region: y ∈ [-1.0, +0.5)  (bottom 75 % of viewport)
+//      Equal-energy broadband peaks still trend toward white because
+//      all three anchors contribute different channels; quiet columns
+//      are separately desaturated by broadband peak amplitude below.
 //
-//  The renderer dispatches a single draw with `chunksVisible` total
-//  instances. The first `chunksAbovePlayhead` instances land in the
-//  past region (top 25 %); the remaining `chunksVisible -
-//  chunksAbovePlayhead` instances land in the future region (bottom
-//  75 %). The shader does the piecewise NDC mapping below.
+//  **Critical:** `dub-spectral` log-compresses every FFT bin via
+//  `ln(1 + λ · |X|)` with `λ = 1000` *before* the per-band RMS, so
+//  the band values arriving here are perceptual loudness values,
+//  not linear amplitudes. Because the decimator stores
+//  `sqrt(mean(log_mag²))`, the transform is not invertible with a
+//  plain `exp()` in the shader:
 //
-//  iid 0                       → oldest visible past chunk (top of
-//                                viewport, y → +1.0)
-//  iid chunksAbovePlayhead - 1 → newest past chunk (just above the
-//                                playhead, y → +0.5)
-//  iid chunksAbovePlayhead     → first future chunk (just below the
-//                                playhead, y → +0.5⁻)
-//  iid chunksVisible - 1       → last future chunk (bottom of
-//                                viewport, y → -1.0)
+//      exp(sqrt(mean(log(x)²))) != mean(x)
 //
-//  This single-pass scheme works regardless of mode:
-//    • Thru mode: `chunksAbovePlayhead == chunksVisible` (no future
-//      data), the shader's past branch fires for every instance, the
-//      future region renders empty — identical to M10.4 behaviour.
-//    • File mode: `chunksAbovePlayhead > 0` AND `chunksAbovePlayhead
-//      < chunksVisible`, both branches fire.
-//    • Track-just-started: `chunksAbovePlayhead == 0`, only future
-//      branch fires; the past region is empty (no audio has played
-//      yet), which is correct.
+//  That bad inverse was the "all white" bug: it expanded loud
+//  perceptual values back into huge pseudo-linear amplitudes and
+//  every colour channel clipped. The fragment stage below instead
+//  uses the compressed values directly, with separate handling for
+//  brightness (how loud the column is) and chroma (which bands rise
+//  above the column's shared broadband floor).
 //
-//  Per-instance NDC math:
-//      Let n_above = max(1, chunksAbovePlayhead)
-//          n_below = max(1, chunksVisible - chunksAbovePlayhead)
+//  Bands come from `dub-spectral`'s 8 log-spaced RMS bands aggregated
+//  into 3 (max-of-band-in-group, matching Mixxx's per-pixel max):
+//      bass = max(b0, b1)
+//      mid  = max(b2, b3, b4, b5)
+//      high = max(b6, b7)
 //
-//      If iid < chunksAbovePlayhead:           // past
-//          fy      = (iid + 0.5) / n_above     in [0, 1]
-//          yCenter = +1.0 - fy * 0.5           in [+1.0, +0.5]
-//          dy      = 0.25 / n_above
-//      Else:                                   // future
-//          j       = iid - chunksAbovePlayhead
-//          fy      = (j + 0.5) / n_below       in [0, 1]
-//          yCenter = +0.5 - fy * 1.5           in [+0.5, -1.0]
-//          dy      = 0.75 / n_below
+//  Height comes from the broadband `PeakChunk` min/max — the envelope
+//  is the geometry, the colour is the fragment.
 //
-//      x = sample amplitude * yScale  in [-yScale, +yScale]
+//  Geometry (per-pixel-column max aggregation, the Mixxx primitive):
+//  each region (past / future) is one triangle strip of `2 ×
+//  chunksVisible` vertices where `chunksVisible` is the **drawn
+//  column count** (≈ region pixels along the time axis). For every
+//  drawn column the vertex stage loops over `chunksPerColumn`
+//  consecutive raw chunks and emits the max envelope + max
+//  per-band-group. This is the same operation Mixxx's
+//  `WaveformRendererRGB::draw` performs CPU-side; doing it in the
+//  vertex shader keeps the data path zero-copy. With 1 drawn column
+//  per drawable pixel the trapezoidal slices are ≥ 1 px tall, so the
+//  amplitude variance between adjacent raw chunks no longer creates
+//  the "pin-stripe / venetian-blind" comb pattern the un-aggregated
+//  version produced at high zoom.
 //
-//  Band chunk lookup:
+//  Vertical NDC layout (PRD §9.1 — vertical performance default):
+//      Past region:   y ∈ [+0.5, +1.0]   (top 25 %)
+//      Playhead line: y =  +0.5          (drawn as a SwiftUI overlay)
+//      Future region: y ∈ [-1.0, +0.5)   (bottom 75 %)
 //
-//  Broadband chunks tick once per `samplesPerPeakChunk` (default
-//  64) audio samples; band chunks tick once per
-//  `samplesPerBandChunk` (default 512). For broadband instance
-//  `k`, the corresponding band index is:
+//  Horizontal layout (Prep mode, M10.8) flips time onto the x-axis;
+//  the renderer flags this via `Uniforms.orientation` and the vertex
+//  swap is the only difference.
 //
-//      bandLocal = (k * samplesPerPeakChunk + samplesPerPeakChunk/2)
-//                  / samplesPerBandChunk
-//      bandRing  = (bandChunkOffset + bandLocal) % bandCapacity
-//
-//  Renderer guarantees both ring buffers' offsets refer to the
-//  same point in audio-time (their writes are coupled to the same
-//  M9 mono-downmix tap), so this math always lands on a band
-//  chunk that's actually been written.
 
 #include <metal_stdlib>
 using namespace metal;
 
-// Mirrors `#[repr(C)] PeakChunk` from crates/dub-peaks/src/lib.rs.
-// Same memory layout: three IEEE-754 f32s, little-endian on both ARM64
-// and x86_64 macOS, identical alignment.
+/// Per-frame uniforms. Field order + types must match
+/// `WaveformRenderer.WaveformUniforms` exactly — `memcpy`'d each
+/// frame from the host with no padding adjustment.
+struct Uniforms {
+    /// Ring offset of the oldest visible broadband (and filtered)
+    /// chunk for this region.
+    uint chunkOffset;
+    /// Number of broadband chunks in this region's draw.
+    uint chunksVisible;
+    /// > 0 ⇒ this is the past-region draw; == 0 ⇒ future region.
+    uint chunksAbovePlayhead;
+    /// Amplitude scale in NDC. 0.95 leaves a small gutter so peaks
+    /// don't kiss the deck-column edge.
+    float yScale;
+    /// Audio samples per broadband chunk (for the band-ring lookup).
+    uint samplesPerPeakChunk;
+    /// Ring offset of the oldest visible band chunk for this region.
+    uint bandChunkOffset;
+    /// Audio samples per band chunk.
+    uint samplesPerBandChunk;
+    /// Power-of-two band-ring capacity. The vertex shader does
+    /// `(idx & (capacity - 1))` to wrap.
+    uint bandCapacity;
+    /// 0 = vertical (time→y), 1 = horizontal (time→x).
+    uint orientation;
+    /// Raw broadband chunks aggregated into one drawn column. ≥ 1.
+    /// The vertex shader reads this many consecutive chunks starting
+    /// at `chunkOffset + chunkInWindow * chunksPerColumn` and emits
+    /// the max envelope + max per-band-group for that range.
+    uint chunksPerColumn;
+};
+
+/// One element of the broadband-peak ring. CPU-side
+/// `PeakChunkLayout` mirror — 12 bytes, no padding.
 struct PeakChunk {
     float minSample;
     float maxSample;
     float rms;
 };
 
-// Mirrors `#[repr(C)] BandPeakChunk { rms_per_band: [f32; 8] }`.
-// Eight perceptual RMS values per chunk, one per log-spaced band.
+/// One element of the band-peak ring. CPU-side `BandPeakChunkLayout`
+/// mirror — 32 bytes (8 × f32 band RMS).
 struct BandPeakChunk {
-    float band[8];
-};
-
-struct Uniforms {
-    // First broadband chunk to render (ring index).
-    uint  chunkOffset;
-    // Total chunks visible across both past and future regions.
-    // `instance_id` ranges over [0, chunksVisible).
-    uint  chunksVisible;
-    // Number of `chunksVisible` instances assigned to the past region
-    // (top 25 % strip). The remaining `chunksVisible -
-    // chunksAbovePlayhead` instances render in the future region
-    // (bottom 75 %). 0 = no past (track just started); == chunksVisible
-    // = no future (Thru mode behaviour). See file-level layout doc.
-    uint  chunksAbovePlayhead;
-    // Horizontal amplitude scale applied to min/max before NDC.
-    // 0.95 keeps the bars off the very edge of the viewport
-    // horizontally (name kept as `yScale` for ABI continuity — the
-    // M10.4 rotation swaps the *axis* this value applies to but
-    // keeps the wire layout identical).
-    float yScale;
-    // Number of audio samples per broadband chunk (M9 default 64).
-    uint  samplesPerPeakChunk;
-    // First band chunk to render (ring index).
-    uint  bandChunkOffset;
-    // Number of audio samples per band chunk (M9.5b default 512).
-    uint  samplesPerBandChunk;
-    // Total band-chunk ring capacity (power-of-two).
-    uint  bandCapacity;
-    // M10.2 palette index. 0 = Serato-faithful (the M10.1 default),
-    // 1 = high-contrast, 2 = monochrome.
-    uint  palette;
+    float b0; float b1; float b2; float b3;
+    float b4; float b5; float b6; float b7;
 };
 
 struct VertexOut {
     float4 position [[position]];
-    float  rms;
-    // Per-band RMS values forwarded to the fragment shader. Metal
-    // pipelines all four lanes of float4 even if we only need 3
-    // (R/G/B) values, so we pack as two float4s and let the fragment
-    // mix them.
-    float4 bandLow;   // b0, b1, b2, b3
-    float4 bandHigh;  // b4, b5, b6, b7
-    // M10.2 honest-state flags. All four corners of a quad come
-    // from the same instance, so even though [[position]]-driven
-    // rasterizer interpolation happens, every per-fragment value
-    // collapses to the per-instance constant we wrote in the
-    // vertex stage.
-    //   flags.x = 1.0 if this chunk is clipping (|peak| >= 0.98)
-    //   flags.y = 1.0 if this chunk is essentially silent
-    //              (|min| + |max| < 1e-3 AND rms < 1e-4)
-    //   flags.z = palette index (as float, rounded in fragment).
-    //   flags.w = reserved.
-    float4 flags;
+    /// Aggregated low / mid / high band peaks for this chunk.
+    /// Linear, raw — no smoothing, no normalisation. The fragment
+    /// stage mixes them into RGB.
+    float3 bands;
+    /// Aggregated sub-bass band (`b0`, ≈ 43-86 Hz at 44.1 kHz).
+    /// Used only for Serato-style quiet greying: quiet columns
+    /// should recede when they are sub-bass/rumble, not when they
+    /// contain audible midrange instruments.
+    float subBass;
+    /// Aggregated broadband peak amplitude for this drawn column.
+    /// This is the same peak envelope that drives geometry height,
+    /// surfaced to the fragment stage so quiet columns can be
+    /// desaturated without confusing "quiet" with "low frequency."
+    float peak;
 };
 
-vertex VertexOut waveformVertex(
-    uint vid                       [[vertex_id]],
-    uint iid                       [[instance_id]],
-    constant Uniforms& u           [[buffer(0)]],
-    constant PeakChunk* chunks     [[buffer(1)]],
-    constant BandPeakChunk* bands  [[buffer(2)]]
-) {
-    // Read the broadband chunk this instance belongs to. Past-the-end
-    // accesses are guarded by the renderer.
-    PeakChunk c = chunks[u.chunkOffset + iid];
-
-    // Honest-state flags. Computed once per instance so the
-    // fragment shader doesn't need the original min/max/rms (it
-    // only sees the post-rasteriser interpolated VertexOut).
-    float maxAbs = max(fabs(c.minSample), fabs(c.maxSample));
-    float clipping = (maxAbs >= 0.98) ? 1.0 : 0.0;
-    float silence  = ((fabs(c.minSample) + fabs(c.maxSample) < 1e-3) &&
-                      (c.rms < 1e-4)) ? 1.0 : 0.0;
-
-    // Treat empty chunks (no samples yet) as a centred near-zero
-    // bar so the leading edge of the waveform draws as a hairline
-    // rather than a hidden zero-thickness triangle.
-    float lo = c.minSample;
-    float hi = c.maxSample;
-    if (hi - lo < 1e-5) {
-        lo = -1e-4;
-        hi =  1e-4;
-    }
-
-    // M10.5b piecewise NDC mapping. iid < chunksAbovePlayhead lands
-    // in the past region (top 25 %); iid >= chunksAbovePlayhead in
-    // the future region (bottom 75 %). See file-level doc for the
-    // full layout math.
-    float ndcY;
-    float dy;
-    if (iid < u.chunksAbovePlayhead) {
-        float n_above = float(max(1u, u.chunksAbovePlayhead));
-        float fy = (float(iid) + 0.5) / n_above;
-        ndcY = 1.0 - fy * 0.5;
-        dy   = 0.25 / n_above;
-    } else {
-        uint chunksBelow = u.chunksVisible - u.chunksAbovePlayhead;
-        float n_below = float(max(1u, chunksBelow));
-        uint j = iid - u.chunksAbovePlayhead;
-        float fy = (float(j) + 0.5) / n_below;
-        ndcY = 0.5 - fy * 1.5;
-        dy   = 0.75 / n_below;
-    }
-
-    // Quad corners (triangle strip vertex order, post-rotation):
-    //   0: bottom-left, 1: bottom-right, 2: top-left, 3: top-right
-    // Vertex-id bit layout (kept identical to the M10-B horizontal
-    // version for ABI continuity):
-    //   bit 1 (`vid & 2u`) selects the *amplitude extreme*:
-    //                       cleared → low (left edge of bar)
-    //                       set     → high (right edge of bar)
-    //   bit 0 (`vid & 1u`) selects the *time-edge* of the chunk:
-    //                       cleared → older edge (top of bar in
-    //                                 vertical layout = y_center + dy)
-    //                       set     → newer edge (bottom of bar
-    //                                 in vertical layout = y_center
-    //                                 - dy)
-    //
-    // Triangle strip vertex order with this mapping still produces
-    // a single non-self-intersecting quad — the strip's winding
-    // doesn't matter because we don't enable back-face culling for
-    // the waveform pipeline.
-    float x = (vid & 2u) ? (hi * u.yScale) : (lo * u.yScale);
-    float y = (vid & 1u) ? (ndcY - dy) : (ndcY + dy);
-
-    // Map the broadband instance to its containing band chunk.
-    // Half-sample offset (+ samplesPerPeakChunk/2) picks the band
-    // chunk that overlaps the *centre* of this peak chunk, which is
-    // less prone to off-by-one drift at chunk boundaries than the
-    // strict integer-division mapping.
-    uint sampleCentre = iid * u.samplesPerPeakChunk + (u.samplesPerPeakChunk >> 1u);
-    uint bandLocal = (u.samplesPerBandChunk == 0u) ? 0u
-                                                   : (sampleCentre / u.samplesPerBandChunk);
-    uint bandRing = (u.bandChunkOffset + bandLocal) % max(1u, u.bandCapacity);
-    BandPeakChunk b = bands[bandRing];
-
+/// Vertex shader. Two vertices per chunk at the chunk's time-centre:
+/// even `vid` = `-min` edge, odd `vid` = `+max` edge. Triangle strip
+/// topology stitches them into a continuous envelope.
+vertex VertexOut waveformVertex(uint vid                       [[vertex_id]],
+                                constant Uniforms& u           [[buffer(0)]],
+                                constant PeakChunk* chunks     [[buffer(1)]],
+                                constant BandPeakChunk* bands  [[buffer(2)]]) {
     VertexOut out;
-    out.position = float4(x, y, 0.0, 1.0);
-    out.rms = c.rms;
-    out.bandLow  = float4(b.band[0], b.band[1], b.band[2], b.band[3]);
-    out.bandHigh = float4(b.band[4], b.band[5], b.band[6], b.band[7]);
-    out.flags    = float4(clipping, silence, float(u.palette), 0.0);
+
+    const uint chunkInWindow = vid >> 1u;
+    const bool isMaxEdge     = (vid & 1u) == 1u;
+
+    // Visibility guard. The renderer caps the draw count to
+    // `2 × chunksVisible`, but a one-off layout race could oversend
+    // vertices; collapse them onto the clear colour so they don't
+    // streak.
+    if (u.chunksVisible == 0u || chunkInWindow >= u.chunksVisible) {
+        out.position = float4(0, 0, 0, 0);
+        out.bands    = float3(0);
+        out.subBass  = 0.0;
+        out.peak     = 0.0;
+        return out;
+    }
+
+    // Per-drawn-column max aggregation. We span `chunksPerColumn`
+    // consecutive raw chunks (the broadband ring and the band ring
+    // are both addressed at this cadence) and take the per-band
+    // max + the broadband min/max envelope across the run. This is
+    // the operation Mixxx's CPU renderer performs once per pixel
+    // column and is the difference between a smooth filled
+    // envelope and a sub-pixel comb pattern when the trapezoidal
+    // strip's row height drops below 1 px.
+    const uint colStart = u.chunkOffset + chunkInWindow * u.chunksPerColumn;
+    const uint nAgg     = max(u.chunksPerColumn, 1u);
+
+    float maxPos  = 0.0;
+    float maxNeg  = 0.0;
+    float maxBass = 0.0;
+    float maxMid  = 0.0;
+    float maxHigh = 0.0;
+    float maxSubBass = 0.0;
+
+    for (uint i = 0u; i < nAgg; ++i) {
+        const uint chunkIdx = colStart + i;
+        // chunkCapacity is fixed at 2^20 on the host; mirroring
+        // that here as a bitmask keeps the modulo free.
+        const PeakChunk pc = chunks[chunkIdx & (1048576u - 1u)];
+        maxPos = max(maxPos, pc.maxSample);
+        maxNeg = max(maxNeg, fabs(pc.minSample));
+
+        // Band-chunk lookup within the visible region. `chunkIdx`
+        // above is a broadband *ring offset*, not a global timeline
+        // index. The host already computed the first visible band
+        // ring offset (`u.bandChunkOffset`), so add the local
+        // broadband sample offset from the start of this draw.
+        const uint localChunkInWindow = chunkInWindow * u.chunksPerColumn + i;
+        const uint localSampleIdx = localChunkInWindow * u.samplesPerPeakChunk;
+        const uint bandIdx = u.bandChunkOffset + localSampleIdx / u.samplesPerBandChunk;
+        const BandPeakChunk bc = bands[bandIdx & (u.bandCapacity - 1u)];
+
+        maxSubBass = max(maxSubBass, bc.b0);
+        maxBass = max(maxBass, max(bc.b0, bc.b1));
+        maxMid  = max(maxMid,  max(max(max(bc.b2, bc.b3), bc.b4), bc.b5 * 0.92));
+        maxHigh = max(maxHigh, max(max(bc.b5 * 0.35, bc.b6), bc.b7));
+    }
+
+    out.bands = float3(maxBass, maxMid, maxHigh);
+    out.subBass = maxSubBass;
+    out.peak = max(maxPos, maxNeg);
+
+    // Amplitude edge. `pc.minSample` is signed and ≤ 0 for normal
+    // music; the envelope's lower edge is `pc.minSample`, the
+    // upper edge `pc.maxSample`. The visual envelope is symmetric
+    // around 0 (M10.5b convention), so we flip `minSample`'s sign
+    // here and let the strip topology fill the trapezoid.
+    const float amp = isMaxEdge ? maxPos : -maxNeg;
+    const float ampNDC = clamp(amp * u.yScale, -1.0, 1.0);
+
+    // Time-axis NDC. Past region maps `chunkInWindow ∈ [0, K)` to
+    // `y ∈ [+1.0, +0.5]` (oldest at top, newest at the playhead).
+    // Future region maps `chunkInWindow ∈ [0, K)` to `y ∈ [+0.5, -1.0]`
+    // (oldest just under the playhead, newest at the bottom).
+    const float frac = (u.chunksVisible > 1u)
+        ? float(chunkInWindow) / float(u.chunksVisible - 1u)
+        : 0.0;
+    float timeNDC;
+    if (u.chunksAbovePlayhead > 0u) {
+        // Past: top at +1.0, bottom of past region at +0.5.
+        timeNDC = 1.0 - 0.5 * frac;
+    } else {
+        // Future: top of future region at +0.5, bottom at -1.0.
+        timeNDC = 0.5 - 1.5 * frac;
+    }
+
+    // Vertical (default) puts time on y, amplitude on x.
+    // Horizontal swaps the two — the playhead lives at x = -0.5
+    // (= NDC 25 % from the left) for the same chunkInWindow-=-0
+    // start. The amplitude axis flips sign in horizontal so the
+    // `+max` edge sits *above* the time axis (positive y) and
+    // `-min` *below*, matching the eye's "up is louder" intuition.
+    if (u.orientation == 0u) {
+        out.position = float4(ampNDC, timeNDC, 0.0, 1.0);
+    } else {
+        // Horizontal: rotate 90° clockwise. Time runs left → right,
+        // playhead at x = -0.5 (mirrors the vertical "top = past"
+        // semantic: left = past, right = future).
+        const float xNDC = -timeNDC;
+        out.position = float4(xNDC, ampNDC, 0.0, 1.0);
+    }
     return out;
 }
 
-// Pre-compute the (r, g, b) loudness mix common to every palette.
-// Indices match `dub-peaks`'s 8-band layout, 30 Hz - 16 kHz:
-//   b0..b1 → red    (sub-bass + bass:           30 - 159 Hz)
-//   b2..b4 → green  (low-mids + mids + presence: 159 - 1934 Hz)
-//   b5..b7 → blue   (highs + air:               1934 - 16000 Hz)
-inline float3 bandMix(float4 bandLow, float4 bandHigh) {
-    float r = 0.5 * (bandLow.x + bandLow.y);
-    float g = (bandLow.z + bandLow.w + bandHigh.x) * (1.0 / 3.0);
-    float b = (bandHigh.y + bandHigh.z + bandHigh.w) * (1.0 / 3.0);
-    // Channel-side gain. Without this, bass tends to dominate (it
-    // routinely lives at 0.4-0.8 RMS in compressed magnitudes
-    // because there are fewer FFT bins per low band, so each bin
-    // carries more weight). Tuned so a balanced track lands near
-    // (r, g, b) ≈ (0.5, 0.5, 0.5).
-    return float3(r * 1.2, g * 1.8, b * 2.4);
-}
-
-// Normalise + brightness-floor a colour vector. Silence (max <
-// `silenceThreshold`) collapses to a configurable neutral grey;
-// otherwise we rescale so the brightest channel sits at
-// `targetBrightness` × `saturate(maxC)`. Keeps the bar visible
-// without saturating to pure RGB primaries.
-inline float3 normaliseColour(float3 colour, float silenceGrey, float brightnessFloor) {
-    float maxC = max(max(colour.r, colour.g), colour.b);
-    if (maxC < 0.05) {
-        return float3(silenceGrey);
-    }
-    return colour / maxC * mix(brightnessFloor, 1.0, saturate(maxC));
-}
-
+/// Fragment shader. Uses the perceptual band loudness values as
+/// perceptual values. Brightness comes from the column's loudest
+/// band; hue comes from a **calibrated** low/mid/high comparison.
+///
+/// The calibration is not cosmetic. `dub-spectral`'s RMS-over-log-
+/// magnitude bands are structurally bass-heavy: on "Potential
+/// Victims" at 1:24-1:28, the raw grouped max classifier produced
+/// low/mid/high winners of 338/7/0. Serato shows obvious mid/high
+/// colour in the same region, so the renderer must whiten the
+/// groups before deciding hue. The bias/gain below is a compressed-
+/// domain equal-loudness correction for this analysis path.
 fragment float4 waveformFragment(VertexOut in [[stage_in]]) {
-    // M10.2 honest-state. Clipping always wins (top-priority
-    // visualisation); silence is rendered as the palette's neutral
-    // grey before the colour mix even runs.
-    bool clipping = in.flags.x > 0.5;
-    bool silence  = in.flags.y > 0.5;
-    uint palette  = uint(round(in.flags.z));
+    const float bass = max(in.bands.x, 0.0);
+    const float mid  = max(in.bands.y, 0.0);
+    const float high = max(in.bands.z, 0.0);
 
-    if (clipping) {
-        // Pure red so a peak-clipped bar is unmistakable. The
-        // user is expected to act on this (turn the gain down on
-        // the offending deck).
-        return float4(1.0, 0.05, 0.05, 1.0);
-    }
-    if (silence) {
-        // Honest dropout: thin, dim grey hairline. The amplitude
-        // shape (essentially zero) already conveys silence; the
-        // colour just stops painting hue, so a stretch of silence
-        // is visually distinct from a stretch of fully-saturated
-        // mid signal.
-        return float4(0.18, 0.18, 0.20, 1.0);
-    }
+    const float3 raw = float3(bass, mid, high);
+    const float rawMax = max(max(raw.x, raw.y), raw.z);
 
-    float3 colour = bandMix(in.bandLow, in.bandHigh);
+    // Compressed-loudness scale: silence sits near 0; strong music
+    // in this analysis path lands around 8-12. Keep gate and brightness in
+    // that same domain instead of pretending the values are linear.
+    const float gate = smoothstep(0.02, 0.12, rawMax);
+    const float brightness = smoothstep(0.4, 11.5, rawMax) * gate;
 
-    if (palette == 1u) {
-        // High-contrast palette. Pushes the colour primaries
-        // harder by squaring the per-channel value (boosts strong
-        // bands, suppresses weak ones), then rescales. Useful in
-        // bright rooms / projector-driven club setups where the
-        // M10.1 default washes out.
-        colour = colour * colour;
-        colour = normaliseColour(colour, 0.30, 0.55);
-    } else if (palette == 2u) {
-        // Monochrome palette. Collapses all hue information and
-        // shows the broadband RMS as a single near-white tone.
-        // Equivalent to the M10-B look — useful as a "honest"
-        // amplitude-only reference when the colour layer is
-        // misleading.
-        float intensity = clamp(0.35 + in.rms * 1.6, 0.35, 1.0);
-        return float4(intensity, intensity, intensity, 1.0);
+    // Serato-faithful anchors. After moving the 1.5-3.3 kHz
+    // presence band (`b5`) into mid, guitars/strings and many vocal
+    // consonants should read green, while true top-end (`b6-b7`)
+    // stays cyan/blue.
+    const float3 lowColor  = float3(1.00, 0.12, 0.24);
+    const float3 midColor  = float3(0.08, 0.94, 0.22);
+    const float3 highColor = float3(0.58, 0.36, 1.00);
+
+    // Equal-loudness calibration in the compressed domain. These
+    // numbers are deliberately offsets, not multipliers alone: a
+    // constant broadband hip-hop loop raises the low band by about
+    // two log-loudness units over mid and four over high before
+    // there is any useful colour information. Subtract that fixed
+    // bias first, then give high a modest gain so hats/brilliance
+    // can win instead of just tinting red.
+    const float3 bandBias = float3(9.45, 7.75, 5.75);
+    const float3 bandGain = float3(1.00, 0.82, 1.00);
+    float3 calibrated = max((raw - bandBias) * bandGain, float3(0.0));
+
+    // Loud, short columns with real low-band content are usually
+    // kicks. Give those a modest low-band push so kick transients
+    // stay pink/red instead of being pulled green by the broad
+    // mid/presence bucket. Quiet strings/guitars do not trigger
+    // this because their broadband peak is low and their low band
+    // is weak.
+    const float kickPush =
+        smoothstep(0.18, 0.42, in.peak) * smoothstep(0.25, 1.10, calibrated.x);
+    calibrated.x *= mix(1.0, 1.35, kickPush);
+    calibrated.y *= mix(1.0, 0.78, kickPush);
+    const float chromaMax = max(max(calibrated.x, calibrated.y), calibrated.z);
+    float3 hue;
+    if (chromaMax > 0.03) {
+        const float3 weights = pow(saturate(calibrated / chromaMax), float3(1.45));
+        float3 mixRgb = weights.x * lowColor
+                      + weights.y * midColor
+                      + weights.z * highColor;
+        const float mixMax = max(max(mixRgb.r, mixRgb.g), mixRgb.b);
+        hue = mixRgb / max(mixMax, 1e-6);
     } else {
-        // 0 = Serato-faithful (the M10.1 default).
-        colour = normaliseColour(colour, 0.35, 0.45);
+        hue = float3(1.0);
     }
 
-    // Final RMS-driven luminance: louder bar = brighter colour.
-    // Keeps the visual amplitude shape from M10-B; the bands only
-    // affect *hue*. clamp avoids over-saturation on transients.
-    float luminance = clamp(0.45 + in.rms * 1.6, 0.45, 1.0);
-    colour *= luminance;
+    // Serato's greyed details are quiet sub-bass/rumble columns,
+    // not quiet midrange instruments. The broadband peak says
+    // "quiet"; `subBass / rawMax` says "mostly below ≈ 80 Hz".
+    // Requiring both keeps green guitar/string notes alive while
+    // letting barely-audible low bed material recede.
+    const float quiet = 1.0 - smoothstep(0.08, 0.20, in.peak);
+    const float subFocus = smoothstep(0.62, 0.90, in.subBass / max(rawMax, 1e-6));
+    const float audibleMidTop = smoothstep(0.20, 0.85, max(calibrated.y, calibrated.z));
+    const float quietGrey = quiet * subFocus * (1.0 - 0.70 * audibleMidTop);
+    hue = mix(hue, float3(0.56), quietGrey);
+    const float finalBrightness = brightness * mix(0.30, 1.0, 1.0 - quietGrey);
 
-    return float4(colour, 1.0);
+    const float3 rgb = saturate(hue * finalBrightness);
+
+    return float4(rgb, 1.0);
 }

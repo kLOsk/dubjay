@@ -75,6 +75,41 @@ pub enum Command {
     /// reverse at unity speed; `0.0` = paused without resetting state.
     DeckSetRate { idx: u8, rate: f64 },
 
+    /// Engage Panic-Play (M10.6b, PRD §6.1.2) on deck `idx`. The
+    /// engine captures the deck's current "last known good"
+    /// velocity (preferring `LiftPolicy::last_locked_rate()` if a
+    /// timecode input is attached, falling back to the deck's
+    /// commanded rate otherwise), forces the policy into a
+    /// disengaged state so the next `LiftIntent::Locked` is a
+    /// fresh re-engagement, and starts the deck playing at the
+    /// captured rate. From this point on the deck ignores
+    /// timecode-driven rate / play-state updates (the `Locked` /
+    /// `DropoutHoldRate` branches of `apply_timecode_intents`)
+    /// until either:
+    ///
+    /// - the policy reports a clean `LiftIntent::Locked` (carrier
+    ///   alive + confidence above the engage threshold), at which
+    ///   point panic auto-cancels and normal timecode handling
+    ///   resumes — the held playhead position becomes the new zero
+    ///   reference for the LFSR's relative motion; or
+    /// - the user issues [`Self::DeckCancelPanicPlay`], which
+    ///   hands transport authority back to the timecode driver.
+    ///
+    /// `Locked`-with-cached-rate sticky-window samples don't count
+    /// as a clean re-lock because the policy stays disengaged
+    /// until it sees an above-engage-threshold confidence sample.
+    DeckPanicPlay { idx: u8 },
+
+    /// Cancel Panic-Play on deck `idx` (PRD §6.1.2 / M10.6d). The
+    /// engine clears its panic-play flag and hands transport
+    /// authority back to the timecode driver: a clean carrier
+    /// keeps the deck playing at the platter rate (Serato INT→ABS
+    /// path); a silent carrier pauses it on the next block via the
+    /// existing `DropoutHoldRate` arm. Crucially this command does
+    /// **not** flip `is_playing` itself — the driver does, on the
+    /// next render block. Idempotent on decks not in panic mode.
+    DeckCancelPanicPlay { idx: u8 },
+
     /// Set deck `idx`'s linear gain. `1.0` = unity, `0.0` = silence.
     DeckSetGain { idx: u8, gain: f32 },
 
@@ -155,6 +190,13 @@ impl std::fmt::Debug for Command {
                 .debug_struct("DeckSetRate")
                 .field("idx", idx)
                 .field("rate", rate)
+                .finish(),
+            Self::DeckPanicPlay { idx } => {
+                f.debug_struct("DeckPanicPlay").field("idx", idx).finish()
+            }
+            Self::DeckCancelPanicPlay { idx } => f
+                .debug_struct("DeckCancelPanicPlay")
+                .field("idx", idx)
                 .finish(),
             Self::DeckSetGain { idx, gain } => f
                 .debug_struct("DeckSetGain")

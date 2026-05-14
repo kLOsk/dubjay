@@ -52,8 +52,9 @@ use ringbuf::HeapCons;
 use crate::band_decimator::BandDecimator;
 use crate::buffer::PeakBuffer;
 use crate::decimator::Decimator;
+use crate::onset::OnsetDecimator;
 use crate::{
-    BandPeakChunk, PeakChunk, BAND_SAMPLES_PER_CHUNK, DEFAULT_BUFFER_CAPACITY_SECS,
+    BandPeakChunk, OnsetChunk, PeakChunk, BAND_SAMPLES_PER_CHUNK, DEFAULT_BUFFER_CAPACITY_SECS,
     DEFAULT_SAMPLES_PER_CHUNK,
 };
 
@@ -94,12 +95,24 @@ pub struct PeakStreamConfig {
     /// who only want broadband peaks and want to keep the worker
     /// budget minimal.
     pub bands_enabled: bool,
+    /// Whether to run the [`OnsetDecimator`] alongside the
+    /// broadband + band decimators (M10.5l). Adds a second
+    /// hop-cadence FFT on the worker thread — the marginal cost
+    /// over `bands_enabled = true` is roughly the same again (one
+    /// extra forward FFT plus a half-spectrum subtract-and-sum per
+    /// hop, ≈ 40 µs total on M-class silicon at 48 kHz).
+    ///
+    /// The M10.5l renderer drives transient-emphasising bloom +
+    /// saturation from this stream. Default `true`. CLI consumers
+    /// that don't render a waveform can flip it off without
+    /// affecting BPM / peaks / bands.
+    pub onset_enabled: bool,
 }
 
 impl PeakStreamConfig {
-    /// Convenience constructor with the M9 + M9.5b defaults: 64
-    /// samples-per-broadband-chunk, 10 min initial buffer, bands
-    /// on.
+    /// Convenience constructor with the M9 + M9.5b + M10.5l
+    /// defaults: 64 samples-per-broadband-chunk, 10 min initial
+    /// buffer, bands on, onset on.
     #[must_use]
     pub fn at(sample_rate: u32) -> Self {
         Self {
@@ -107,6 +120,7 @@ impl PeakStreamConfig {
             samples_per_chunk: DEFAULT_SAMPLES_PER_CHUNK,
             buffer_capacity_secs: DEFAULT_BUFFER_CAPACITY_SECS,
             bands_enabled: true,
+            onset_enabled: true,
         }
     }
 
@@ -164,6 +178,13 @@ pub struct PeakStream {
     /// to map a broadband chunk index to its containing band chunk:
     /// `band_idx = peak_idx × samples_per_chunk / samples_per_band_chunk`.
     samples_per_band_chunk: Option<usize>,
+    /// Samples per onset chunk (M10.5l). `None` when
+    /// `onset_enabled: false`. Always equals
+    /// `samples_per_band_chunk` when both are enabled — same
+    /// FFT-hop cadence — but kept as an independent field so a
+    /// future hop-decoupling refactor doesn't require touching
+    /// every consumer.
+    samples_per_onset_chunk: Option<usize>,
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -173,8 +194,10 @@ impl std::fmt::Debug for PeakStream {
         f.debug_struct("PeakStream")
             .field("len", &self.buffer.len())
             .field("band_len", &self.buffer.band_len())
+            .field("onset_len", &self.buffer.onset_len())
             .field("samples_per_chunk", &self.samples_per_chunk)
             .field("samples_per_band_chunk", &self.samples_per_band_chunk)
+            .field("samples_per_onset_chunk", &self.samples_per_onset_chunk)
             .field("running", &self.join.is_some())
             .field("shutdown_pending", &self.shutdown.load(Ordering::Relaxed))
             .finish()
@@ -219,7 +242,19 @@ impl PeakStream {
             return Err(PeakStreamError::InvalidChunkSize);
         }
 
-        let buffer = if cfg.bands_enabled {
+        // M10.5l: onset capture requires band storage's hop-cadence
+        // side-channel infrastructure, so we lift the bands_enabled
+        // flag to "true" implicitly whenever onset_enabled is true.
+        // The renderer pipeline always wants both together; the
+        // independent flags exist so a CLI caller can opt-in to
+        // exactly one if they really want to.
+        let bands_storage_enabled = cfg.bands_enabled || cfg.onset_enabled;
+        let buffer = if cfg.onset_enabled {
+            PeakBuffer::with_capacity_with_bands_and_onset(
+                cfg.initial_chunk_capacity(),
+                cfg.initial_band_chunk_capacity(),
+            )
+        } else if bands_storage_enabled {
             PeakBuffer::with_capacity_with_bands(
                 cfg.initial_chunk_capacity(),
                 cfg.initial_band_chunk_capacity(),
@@ -233,6 +268,7 @@ impl PeakStream {
         let spc = cfg.samples_per_chunk;
         let sample_rate = cfg.sample_rate;
         let bands_enabled = cfg.bands_enabled;
+        let onset_enabled = cfg.onset_enabled;
 
         let join = thread::Builder::new()
             .name("dub-peaks-decimator".to_string())
@@ -243,6 +279,7 @@ impl PeakStream {
                     spc,
                     sample_rate,
                     bands_enabled,
+                    onset_enabled,
                     shutdown_for_thread,
                 );
             })
@@ -252,6 +289,7 @@ impl PeakStream {
             buffer,
             samples_per_chunk: spc,
             samples_per_band_chunk: bands_enabled.then_some(BAND_SAMPLES_PER_CHUNK),
+            samples_per_onset_chunk: onset_enabled.then_some(BAND_SAMPLES_PER_CHUNK),
             shutdown,
             join: Some(join),
         })
@@ -273,6 +311,23 @@ impl PeakStream {
     #[must_use]
     pub fn band_len(&self) -> usize {
         self.buffer.band_len()
+    }
+
+    /// Samples per [`OnsetChunk`] this stream emits, if onset
+    /// capture is enabled. `None` when `onset_enabled: false` at
+    /// spawn time. Equal to `samples_per_band_chunk` whenever both
+    /// are enabled (same FFT-hop cadence).
+    #[must_use]
+    pub fn samples_per_onset_chunk(&self) -> Option<usize> {
+        self.samples_per_onset_chunk
+    }
+
+    /// Number of onset chunks captured so far. Returns 0 when
+    /// onset capture is disabled. Lock-free; equivalent to
+    /// `self.buffer().onset_len()`.
+    #[must_use]
+    pub fn onset_len(&self) -> usize {
+        self.buffer.onset_len()
     }
 
     /// Clone-the-Arc handle to the shared buffer. Cheap; the renderer
@@ -339,11 +394,13 @@ fn analysis_loop(
     samples_per_chunk: usize,
     sample_rate: u32,
     bands_enabled: bool,
+    onset_enabled: bool,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut block = vec![0.0f32; DRAIN_BLOCK_SAMPLES];
     let mut decimator = Decimator::new(samples_per_chunk);
     let mut band_decimator = bands_enabled.then(|| BandDecimator::new(sample_rate));
+    let mut onset_decimator = onset_enabled.then(|| OnsetDecimator::new(sample_rate));
     // Reusable scratch for chunks emitted in one drain iteration.
     // Sized to "worst case one drain", which is DRAIN_BLOCK_SAMPLES /
     // samples_per_chunk chunks. We initialize empty and let `push`
@@ -351,6 +408,8 @@ fn analysis_loop(
     let mut chunk_scratch: Vec<PeakChunk> =
         Vec::with_capacity(DRAIN_BLOCK_SAMPLES / samples_per_chunk.max(1) + 1);
     let mut band_scratch: Vec<BandPeakChunk> =
+        Vec::with_capacity(DRAIN_BLOCK_SAMPLES / BAND_SAMPLES_PER_CHUNK + 1);
+    let mut onset_scratch: Vec<OnsetChunk> =
         Vec::with_capacity(DRAIN_BLOCK_SAMPLES / BAND_SAMPLES_PER_CHUNK + 1);
 
     loop {
@@ -377,6 +436,14 @@ fn analysis_loop(
                 bd.feed(&block[..n], |c| band_scratch.push(c));
                 if !band_scratch.is_empty() {
                     buffer.push_band_chunks(&band_scratch);
+                }
+            }
+
+            if let Some(od) = onset_decimator.as_mut() {
+                onset_scratch.clear();
+                od.feed(&block[..n], |c| onset_scratch.push(c));
+                if !onset_scratch.is_empty() {
+                    buffer.push_onset_chunks(&onset_scratch);
                 }
             }
         }
@@ -419,6 +486,7 @@ mod tests {
             samples_per_chunk: 64,
             buffer_capacity_secs: 1,
             bands_enabled: false,
+            onset_enabled: false,
         };
         assert!(matches!(
             PeakStream::spawn(rx, cfg),
@@ -434,6 +502,7 @@ mod tests {
             samples_per_chunk: 0,
             buffer_capacity_secs: 1,
             bands_enabled: false,
+            onset_enabled: false,
         };
         assert!(matches!(
             PeakStream::spawn(rx, cfg),
@@ -447,6 +516,7 @@ mod tests {
         assert_eq!(cfg.samples_per_chunk, DEFAULT_SAMPLES_PER_CHUNK);
         assert_eq!(cfg.buffer_capacity_secs, DEFAULT_BUFFER_CAPACITY_SECS);
         assert!(cfg.bands_enabled, "M9.5b: bands on by default");
+        assert!(cfg.onset_enabled, "M10.5l: onset on by default");
     }
 
     // -------- End-to-end decimation --------
@@ -461,6 +531,7 @@ mod tests {
             samples_per_chunk: 64,
             buffer_capacity_secs: 1,
             bands_enabled: false,
+            onset_enabled: false,
         };
         let stream = PeakStream::spawn(rx, cfg).expect("spawn");
 
@@ -490,6 +561,7 @@ mod tests {
             samples_per_chunk: 64,
             buffer_capacity_secs: 1,
             bands_enabled: false,
+            onset_enabled: false,
         };
         let stream = PeakStream::spawn(rx, cfg).expect("spawn");
 
@@ -562,11 +634,39 @@ mod tests {
             samples_per_chunk: 64,
             buffer_capacity_secs: 1,
             bands_enabled: false,
+            onset_enabled: false,
         };
         let stream = PeakStream::spawn(rx, cfg).expect("spawn");
         assert!(stream.samples_per_band_chunk().is_none());
         assert_eq!(stream.band_len(), 0);
         assert!(!stream.buffer().has_bands());
+        assert!(stream.samples_per_onset_chunk().is_none());
+        assert_eq!(stream.onset_len(), 0);
+        assert!(!stream.buffer().has_onset());
+    }
+
+    #[test]
+    fn onset_on_produces_onset_chunks() {
+        let (mut tx, rx) = ring(8192);
+        let cfg = PeakStreamConfig::at(48_000);
+        assert!(cfg.onset_enabled);
+        let stream = PeakStream::spawn(rx, cfg).expect("spawn");
+        assert_eq!(
+            stream.samples_per_onset_chunk(),
+            Some(BAND_SAMPLES_PER_CHUNK)
+        );
+        assert!(stream.buffer().has_onset());
+
+        let buf = vec![0.5f32; 4096];
+        let n = tx.push_slice(&buf);
+        assert_eq!(n, 4096);
+
+        let ok = wait_until(Duration::from_secs(2), || stream.onset_len() >= 4);
+        assert!(
+            ok,
+            "expected ≥4 onset chunks within 2s, got {}",
+            stream.onset_len()
+        );
     }
 
     #[test]

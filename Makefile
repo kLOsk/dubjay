@@ -108,6 +108,21 @@ app-release:
 	$(MAKE) app APP_CONFIG=Release
 
 run-app: app
+	@# `open` only focuses an already-running instance — it will NOT
+	@# relaunch with the freshly-built binary / metallib. Send a
+	@# graceful AppleScript quit to any prior instance, then wait for
+	@# it to exit, then launch. `osascript ... quit` is a no-op (exit
+	@# code 0) if Dub isn't running, so this is safe on a cold start.
+	@osascript -e 'tell application "Dub" to quit' >/dev/null 2>&1 || true
+	@for i in 1 2 3 4 5 6 7 8; do \
+	    if ! pgrep -x Dub >/dev/null 2>&1; then break; fi; \
+	    sleep 0.25; \
+	done
+	@if pgrep -x Dub >/dev/null 2>&1; then \
+	    echo "[run-app] Dub did not quit gracefully; force-killing"; \
+	    pkill -x Dub || true; \
+	    sleep 0.25; \
+	fi
 	@echo "Launching $(APP_BUNDLE)"
 	open $(APP_BUNDLE)
 

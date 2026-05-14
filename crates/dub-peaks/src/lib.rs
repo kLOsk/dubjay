@@ -94,14 +94,18 @@
 mod band_decimator;
 mod buffer;
 mod decimator;
+mod filtered;
 mod offline;
+mod onset;
 mod stream;
 pub mod synthetic;
 
 pub use band_decimator::BandDecimator;
-pub use buffer::{BandPeakSnapshot, PeakBuffer, PeakSnapshot};
+pub use buffer::{BandPeakSnapshot, OnsetSnapshot, PeakBuffer, PeakSnapshot};
 pub use decimator::Decimator;
+pub use filtered::FilteredDecimator;
 pub use offline::{compute_offline_peaks, OfflinePeaks};
+pub use onset::OnsetDecimator;
 pub use stream::{PeakStream, PeakStreamConfig, PeakStreamError};
 
 /// Number of frequency bands carried by each [`BandPeakChunk`].
@@ -189,6 +193,132 @@ impl BandPeakChunk {
 }
 
 impl Default for BandPeakChunk {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+/// One spectral-flux onset value at the FFT-hop cadence (M10.5l).
+///
+/// Emitted by [`OnsetDecimator`] in parallel with [`BandPeakChunk`]:
+/// same time alignment, same hop period
+/// ([`BAND_SAMPLES_PER_CHUNK`] / [`dub_spectral::HOP_SIZE`]), one
+/// number per FFT hop instead of eight.
+///
+/// The value is the **log-band-weighted positive spectral flux** for
+/// the hop ending at the chunk boundary — exactly the ODF samples
+/// `dub_bpm` consumes for tempo estimation. The renderer interprets
+/// it as a "did something just hit" confidence after a sigmoid
+/// mapping (see [`crate::onset`] module doc).
+///
+/// `#[repr(C)]` so the FFI surface can hand a `&[OnsetChunk]` to
+/// Metal as a packed 4-byte stride for upload to a per-vertex
+/// attribute buffer.
+///
+/// ## Wire format
+///
+/// * Size: 1 × `f32` = **4 bytes**.
+/// * Indexing: chunk `k` covers the same audio range as band chunk
+///   `k` (i.e. samples `[k × samples_per_band_chunk,
+///   (k + 1) × samples_per_band_chunk)`).
+/// * Values: non-negative. Silence ≈ 0; loud transient hits land
+///   in the ~ 5–15 range depending on the spectral content (the
+///   `ln(1 + λ · |X|)` compression bounds the dynamic range but
+///   does not normalise across tracks).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OnsetChunk {
+    /// Log-band-weighted positive spectral flux for this hop.
+    /// Non-negative; silence is exactly `0.0`.
+    pub flux: f32,
+}
+
+impl OnsetChunk {
+    /// All-zeros chunk. Used as the [`Default`], the
+    /// [`OnsetDecimator`] reset state, and the renderer's silence
+    /// placeholder.
+    pub const ZERO: Self = Self { flux: 0.0 };
+}
+
+impl Default for OnsetChunk {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+/// One chunk of **time-domain band-filtered peak amplitudes**
+/// (M10.5p Stage 3).
+///
+/// Produced by [`FilteredDecimator`] at the same cadence as the
+/// broadband [`PeakChunk`] (default [`DEFAULT_SAMPLES_PER_CHUNK`] =
+/// 64 samples), so the renderer indexes both streams 1:1.
+///
+/// Each `_min` / `_max` pair is the most-negative / most-positive
+/// sample of the corresponding band-filtered signal over the
+/// chunk's source range:
+///
+/// | Field        | Band          | Filter                          |
+/// |--------------|---------------|---------------------------------|
+/// | `lf_*`       | ≤ 250 Hz      | 2-pole Butterworth LP @ 250 Hz  |
+/// | `mf_*` *v2*  | 250–4000 Hz   | (v2 — bandpass; currently 0)    |
+/// | `hf_*` *v2*  | ≥ 4 kHz       | (v2 — HP; currently 0)          |
+///
+/// ## Why this exists (and how it differs from [`BandPeakChunk`])
+///
+/// `BandPeakChunk` carries **frequency-domain magnitudes** (μ-law-
+/// compressed STFT outputs), which the Serato-faithful colour
+/// palette uses to map "what frequencies are present" to hue.
+///
+/// `FilteredPeakChunk` carries **time-domain peak amplitudes** of
+/// the same audio after band-pass filtering. This preserves the
+/// *temporal shape* of transients — a kick's filtered-LF envelope
+/// is a tall attack-decay spike against a low background of
+/// sustained bass; a snare's filtered-LF envelope is small (most
+/// snare energy is above the LF cutoff). The DJ-landmarks palette
+/// uses this for the kick-pop gate, where μ-law'd magnitudes had
+/// flattened the kick-vs-sustained-bass distinction.
+///
+/// See module-level docs at [`crate::filtered`] for the design
+/// rationale and Mixxx reference.
+///
+/// ## Wire format
+///
+/// * Size: 6 × `f32` = **24 bytes**, `#[repr(C)]`.
+/// * Stride: matches the broadband peak chunk cadence; the renderer
+///   can index `filtered[k]` for the same chunk `k` as `broadband[k]`.
+/// * Values: signed amplitudes in `[-1.0, 1.0]` (the same range as
+///   the input audio). Silence is `(0.0, 0.0)` for every band.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilteredPeakChunk {
+    /// Most-negative LF-filtered sample in the chunk's source range.
+    pub lf_min: f32,
+    /// Most-positive LF-filtered sample in the chunk's source range.
+    pub lf_max: f32,
+    /// Most-negative MF-filtered sample. v1: always `0.0`.
+    pub mf_min: f32,
+    /// Most-positive MF-filtered sample. v1: always `0.0`.
+    pub mf_max: f32,
+    /// Most-negative HF-filtered sample. v1: always `0.0`.
+    pub hf_min: f32,
+    /// Most-positive HF-filtered sample. v1: always `0.0`.
+    pub hf_max: f32,
+}
+
+impl FilteredPeakChunk {
+    /// All-zeros chunk. Used as `Default`, the [`FilteredDecimator`]
+    /// reset state, and the renderer's silence placeholder.
+    pub const ZERO: Self = Self {
+        lf_min: 0.0,
+        lf_max: 0.0,
+        mf_min: 0.0,
+        mf_max: 0.0,
+        hf_min: 0.0,
+        hf_max: 0.0,
+    };
+}
+
+impl Default for FilteredPeakChunk {
     fn default() -> Self {
         Self::ZERO
     }

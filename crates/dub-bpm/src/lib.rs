@@ -50,6 +50,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod beats;
 mod confidence;
 mod estimator;
 mod offline;
@@ -59,6 +60,7 @@ pub mod synthetic;
 mod tempo;
 mod tracker;
 
+pub use beats::{analyze_beat_grid, BeatGrid};
 pub use confidence::{
     ConfidenceTracker, TrackerEvent, TrackerState, LOCK_CONSECUTIVE, LOCK_THRESHOLD,
     LOCK_TOLERANCE_BPM, LOST_LOCKED_CONSECUTIVE, LOST_TENTATIVE_CONSECUTIVE, REJECT_TOLERANCE_BPM,

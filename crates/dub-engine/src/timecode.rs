@@ -320,6 +320,25 @@ impl LiftPolicy {
         self.last_locked_rate
     }
 
+    /// Force the policy into its disengaged state without altering
+    /// `last_locked_rate`. Used by M10.6b Panic Play (PRD §6.1.2):
+    /// when the engine engages panic mode mid-track, it forces the
+    /// policy to disengage so the *next* `LiftIntent::Locked` is by
+    /// definition a fresh re-engagement (carrier-alive + confidence
+    /// above the engage threshold). Without this hook, a panic
+    /// engaged while the policy still considered itself locked would
+    /// auto-cancel on the very next block — the PRD requires the
+    /// held playhead position to be the new zero reference for
+    /// LFSR motion, so the policy must be reset to "looking for a
+    /// fresh lock" state before that re-lock is interpreted.
+    ///
+    /// Allocation-free, pure field assignment. Safe to call from
+    /// the audio thread.
+    pub fn force_disengaged(&mut self) {
+        self.engaged = false;
+        self.consecutive_below = 0;
+    }
+
     /// Advance the state machine by one decoder block.
     ///
     /// **Amplitude gate.** If `out.amplitude < amplitude_threshold`
@@ -455,6 +474,29 @@ impl TimecodeInput {
     #[must_use]
     pub fn last_output(&self) -> Option<DecodeOutput> {
         self.last_output
+    }
+
+    /// Read-only access to the per-input [`LiftPolicy`]. Engine
+    /// uses this on the audio thread to read `last_locked_rate`
+    /// when engaging Panic-Play (M10.6b) without going through the
+    /// `drive()` path. Diagnostic tools (`dub scope`, `dub
+    /// calibrate`) own their own policy instances and don't go
+    /// through this accessor.
+    #[must_use]
+    pub fn policy(&self) -> &LiftPolicy {
+        &self.policy
+    }
+
+    /// Mutable access to the per-input [`LiftPolicy`]. Engine uses
+    /// this on the audio thread to call
+    /// [`LiftPolicy::force_disengaged`] when engaging Panic-Play
+    /// (M10.6b). RT-safe — `force_disengaged` is two field writes.
+    /// Crate-internal (`pub(crate)`) because no caller outside the
+    /// engine has a legitimate reason to mutate a live policy;
+    /// diagnostic tools build their own policy and step it
+    /// directly.
+    pub(crate) fn policy_mut(&mut self) -> &mut LiftPolicy {
+        &mut self.policy
     }
 
     /// Drain whatever input audio has arrived since the last call,
@@ -815,5 +857,78 @@ mod policy_tests {
         };
         let err = cfg.validate(48_000.0).unwrap_err();
         assert!(matches!(err, AttachError::InvalidAmplitudeThreshold { .. }));
+    }
+
+    // M10.6b — force_disengaged() Panic-Play foundation.
+
+    #[test]
+    fn force_disengaged_clears_engaged_flag_and_below_counter() {
+        // Engage the policy, then trickle it into the sticky window
+        // (still engaged but `consecutive_below > 0`). force_disengaged
+        // should reset both `engaged` and the sticky counter.
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out(1.0, 0.9));
+        assert!(p.is_engaged());
+        p.step(out(0.0, 0.0));
+        assert_eq!(p.consecutive_below(), 1);
+
+        p.force_disengaged();
+
+        assert!(
+            !p.is_engaged(),
+            "force_disengaged must clear the engaged flag"
+        );
+        assert_eq!(
+            p.consecutive_below(),
+            0,
+            "force_disengaged must reset the sticky counter so the \
+             next step doesn't accidentally trip the disengage threshold"
+        );
+    }
+
+    #[test]
+    fn force_disengaged_preserves_last_locked_rate() {
+        // The Panic-Play path reads `last_locked_rate` *after* the
+        // force-disengage. The value must survive the call so the
+        // held playhead continues at the rate the turntable was
+        // running at the moment the DJ panicked.
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out(1.05, 0.95));
+        assert!((p.last_locked_rate() - 1.05).abs() < 1e-9);
+
+        p.force_disengaged();
+
+        assert!(
+            (p.last_locked_rate() - 1.05).abs() < 1e-9,
+            "force_disengaged must leave last_locked_rate untouched"
+        );
+    }
+
+    #[test]
+    fn force_disengaged_requires_engage_threshold_to_re_lock() {
+        // After force-disengage, a sample in the *lukewarm* band
+        // (above disengage, below engage) must NOT re-engage —
+        // the policy is back to the cold-start contract. This is
+        // the property that lets Panic-Play auto-resume only on a
+        // *clean* LFSR re-lock (PRD §6.1.2).
+        let mut p = make(0.8, 0.5, 4);
+        p.step(out(1.0, 0.9));
+        assert!(p.is_engaged());
+
+        p.force_disengaged();
+        let i = p.step(out(1.0, 0.7));
+        assert!(
+            matches!(i, LiftIntent::DropoutHoldRate { .. }),
+            "lukewarm confidence must not re-engage from \
+             force-disengaged state"
+        );
+        assert!(!p.is_engaged());
+
+        // But an engage-threshold sample re-locks immediately, which
+        // is exactly the signal the engine watches for to auto-cancel
+        // panic mode.
+        let i = p.step(out(1.0, 0.9));
+        assert!(matches!(i, LiftIntent::Locked { rate } if (rate - 1.0).abs() < 1e-9));
+        assert!(p.is_engaged());
     }
 }
