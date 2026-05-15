@@ -1,8 +1,8 @@
-# Dub — Shipped Milestones (M0 → M10.2)
+# Dub — Shipped Milestones (M0 → M10.8)
 
 > Companion to [`docs/PRD.md`](PRD.md). The PRD's milestone table keeps shipped rows
 > short; this doc holds the detailed write-ups, design history, and rationale
-> for each milestone that has landed. Forward-looking milestones (M9 onward)
+> for each milestone that has landed. Forward-looking milestones (M11 onward)
 > stay in the PRD.
 >
 > **Why split?** Shipped milestones accumulate prose that's load-bearing for
@@ -12,7 +12,7 @@
 > working memory. Moved verbatim here; nothing has been rewritten or
 > summarized away.
 
-**Currently shipped:** M0 through M9 (live waveform-peak capture on Thru), M0.5 (Apple shell + smoke screen), M9.5 (dub-spectral extraction + 8-band band-peak capture), M10 — split into M10-A (UniFFI `DubEngine` surface) and M10-B (Metal-rendered broadband waveform live on screen), M10.1 (multi-colour fragment shader mixing 8 bands into RGB with broadband-RMS luminance), and M10.2 (partial — deck B wired up, palette presets, honest silence/clipping; onset glow / beat-aware saturation / constant-Q bass split / mip pyramids each remain independently shippable polish bullets per the plan). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite. The Apple project builds end-to-end via `./scripts/bootstrap.sh && xcodebuild build -scheme Dub`.
+**Currently shipped:** M0 → M9 (engine, two-deck, timecode, Thru, BPM, peaks), M0.5 (Apple shell), M9.5 (`dub-spectral` + 8-band capture), M10/M10.1/M10.2 (FFI + Metal renderer + first multi-colour waveform), M10.3 (Performance shell + design tokens), M10.4 (vertical waveform + symmetric two-pane layout), M10.5 (file playback dev loop) including sub-milestones M10.5a–g (FFI + Apple shell + background load + initial polish + zoom + anti-alias), the M10.5h–p shader exploration ladder (HDR / bloom / onset / kick / DJ-landmark experiments — *all rolled back in the M10.8 baseline freeze*, see [§M10.8](#m108)), M10.5c (Track Overview + horizontal-orientation shader), M10.5n (playhead-vs-audio drift root-cause fix), M10.6a–d (Casual Play UI, Panic Play engine + FFI + UI + transport-cluster redesign), M10.7 (Phase-Drift Trail), and M10.8 (Track Preparation Mode shell + Serato-parity waveform baseline freeze). Workspace passes `cargo clippy --workspace --all-targets -- -D warnings` and the full `cargo test --workspace` suite. The Apple project builds end-to-end via `./scripts/bootstrap.sh && xcodebuild build -scheme Dub`.
 
 ## Table of contents
 
@@ -46,6 +46,20 @@
 - [M10-B — Metal renderer + first live broadband waveform](#m10b)
 - [M10.1 — Multi-colour fragment shader](#m101)
 - [M10.2 — Polish: deck B, palette presets, honest silence/clipping](#m102)
+- [M10.2 remainder — superseded by M10.5h–p, then rolled back in M10.8](#m102-remainder)
+- [M10.3 — Performance shell](#m103)
+- [M10.4 — Vertical waveform + symmetric two-pane layout](#m104)
+- [M10.5 — File playback dev loop (M10.5a + M10.5b)](#m105)
+- [M10.5c — Track Overview waveform + horizontal-orientation shader](#m105c)
+- [M10.5d — Background load (decode + peaks off-thread)](#m105d)
+- [M10.5e — Waveform polish (compression + past-region dim + brighter floor)](#m105e)
+- [M10.5f — Waveform 2× zoom-in](#m105f)
+- [M10.5g — Waveform anti-alias + temporal smoothing](#m105g)
+- [M10.5h → M10.5p — Shader exploration ladder (rolled back in M10.8)](#m105hp)
+- [M10.5n — Playhead-vs-audio drift root-cause fix (survives M10.8)](#m105n)
+- [M10.6a–d — Mouse transport, Panic Play, transport-cluster redesign](#m106)
+- [M10.7 — Phase-Drift Trail](#m107)
+- [M10.8 — Track Preparation Mode shell + Serato-parity waveform baseline freeze](#m108)
 
 ---
 
@@ -1266,4 +1280,334 @@ The plan's remaining polish bullets are each independently shippable as follow-u
 
 ---
 
-*End of shipped milestone history. Forward-looking polish (M10.2 remainder onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*
+<a id="m102-remainder"></a>
+## M10.2 remainder — superseded by the M10.5h–p shader ladder, then rolled back in M10.8
+
+**Status:** retired (all four bullets superseded) &nbsp;·&nbsp; **Resolution:** see [§M10.8](#m108) for the current Serato-parity baseline that replaced the shader ladder.
+
+All four originally-deferred polish bullets from M10.2 (`SHIPPED.md` [§M10.2 *What it does not ship*](#m102)) were re-homed onto the M10.5h–p shader ladder rather than being shipped as M10.2 follow-ups:
+
+- **Onset glow** → M10.5l (additive HDR overshoot driven by the new `OnsetDecimator`).
+- **Beat-aware saturation** → M10.5m(a) (luma-rotation in fragment, riding the same `onsetConf` data as M10.5l).
+- **Constant-Q bass split (9-band)** → M10.5m(b) (deferred to M11 — gnarliest piece; held until DJ-curated content lands to validate the colour change).
+- **Mip pyramids** → M10.5k (planned, paired with the M10.5j on-disk sidecar so the pyramid is on-disk too).
+
+The new ladder also added three pieces that weren't on the M10.2 remainder list and turned out to be load-bearing for "great, not mediocre" on 2026 hardware: M10.5h (HDR off-screen target + separable Gaussian bloom + ACES tonemap), M10.5i (continuous filled-envelope geometry), and M10.5j (sidecar cache so a re-load is ~1 ms instead of ~150 ms).
+
+**Final disposition:** in M10.8, the entire M10.5h–p shader ladder (HDR, bloom, ACES tonemap, multi-pass post-processing, the `WaveformTuning` / `WaveformTuningPanel` runtime knob surface, the onset-driven brightness layer, the kick-emphasis tint, the time-domain `FilteredPeakChunk` ring) was **deleted from the runtime** in favour of a single-pass Serato-parity shader. See [§M10.8](#m108) for the current baseline and the future-work guardrail. The shader-ladder write-ups below are preserved as design archaeology — they explain why specific approaches were tried and what they cost, which is load-bearing for any future polish work that wants to revisit those ideas without re-running the same dead ends.
+
+---
+
+<a id="m103"></a>
+## M10.3 — Performance shell
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 3 days
+
+Launching `Dub.app` shows the real Performance View (per PRD §9.2): a thin status strip, two two-row deck headers, the Metal waveform in the wide centre region, and correctly-sized placeholders for the FX bar (lit by M15 / M16) and library (lit by M11). The dev toolbar (device picker / channels / palette) moves behind a `⌘,` Preferences sheet so the performance surface stays mouse-free at rest.
+
+`apple/Dub/DesignSystem/Tokens.swift` becomes the single source of truth for colour / type / spacing; the Figma file documented in PRD §9 reverts to a reference artefact (it does not gate any future UI work). Deck-header BPM / pitch / key / FX columns render as `—` placeholders until their FFI accessors land — surfacing the M8 BPM tracker over UniFFI is a trivial follow-up, pitch / key / FX wait on M13 / M14 / M15. Snapshot tests (`swift-snapshot-testing`) deferred to M18 polish; the M10.3 demo is visual eyes-on.
+
+---
+
+<a id="m104"></a>
+## M10.4 — Vertical waveform + symmetric two-pane layout
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 1–2 days
+
+Two bugs in the M10.3 build, fixed together:
+
+**(a)** the Metal renderer is rotated from horizontal to **vertical** per PRD §9.1 (forward play = waveform marches upward through the playhead at 25 % from the top; reverse play = marches downward; direction follows engine rate sign with no inference). Touches `Shaders.metal` (vertex shader emits Y-instanced quads), `WaveformRenderer.swift` (buffer layout + view projection), `WaveformView.swift` (frame sizing tall not wide), and `PerformanceView.swift` (waveform region becomes `HSplitView` of two tall columns).
+
+**(b)** Symmetric layout invariant: both deck waveform panes are always rendered side-by-side. In single-deck mode (deck B `chB` empty in Preferences) deck B's pane shows an idle placeholder matching the deck B header's `OFF` state instead of vanishing.
+
+Status strip gains live battery + wall-clock per PRD §9.3 (`IOPSCopyPowerSourcesInfo`-driven battery, system clock for wall time). **Demo criterion:** every screenshot from M10.4 forward is in the canonical orientation.
+
+---
+
+<a id="m105"></a>
+## M10.5 — File playback dev loop (M10.5a + M10.5b)
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 4–5 days
+
+The dev-loop unblocker — Dub becomes testable without an SL3. Splits into **M10.5a** (Rust + FFI) and **M10.5b** (Apple shell).
+
+**M10.5a — shipped:** new `DubEngine` surface (`start_engine` for output-only sessions, `load_track`, `play`, `pause`, `seek`, `position` → `PositionInfo`, `track_info` → `TrackInfo`); `dub-peaks` gains `compute_offline_peaks` so whole-track peaks compute synchronously at load time; the FFI's per-deck `PeakSource` enum routes `peaks_extend` through either the live Thru stream (M9) or the offline File buffer (M10.5a) transparently; `FFI_VERSION` 4→5.
+
+**M10.5b — shipped (Apple shell):** auto-detect lifecycle (multi-channel input → Timecode mode via `start_thru_two_deck`; built-in only → Prep mode shell via `start_engine`); single-pass renderer refactor (`chunksAbovePlayhead` uniform, vertex shader linear y-map across full NDC, M10.4 behaviour preserved when no future peaks are present); drag-and-drop a file from Finder onto either deck pane → loads + deck header switches source pill to `FILE` and populates title / duration / track-time; 30 Hz position polling drives the deck-header time row; slim FS browser replaces the `LIBRARY — M11` placeholder (folder picker + single-click selection, **no double-click load**); `Space` loads the FS-browser-selected file into the non-master, stopped deck per PRD §6.4 (or into deck A in any single-deck mode — Prep, single-channel Timecode — since "non-master" isn't meaningful when only one deck exists). If the target deck is playing, the pane flashes red for 200 ms with a "deck is playing — lift the needle" overlay; **master-deck tracking** wires up per PRD §6.4 with a `MASTER` chip in the master deck's header. Preferences sheet is auto-apply: changing mode / device / channels restarts the engine immediately, no Apply button. App auto-starts on launch in the auto-detected mode.
+
+**Auto-detect is permission-safe:** routes through `DubEngine::has_external_audio_interface` which queries CoreAudio transport-type metadata only (USB / Thunderbolt / FireWire / PCI / AVB) — `listInputDevices` is *not* called when Prep mode is picked, so the macOS microphone-permission prompt only ever fires when the user explicitly engages Timecode mode against an external interface.
+
+Renderer gains a per-deck **peak-generation counter** (`DubEngine::peaks_generation`, atomic, survives stop/start cycles) so a Thru → File swap on a drag-and-drop load forces the renderer to reset its ring + cadence cache before re-ingesting from the new source — without this signal the length-monotonicity heuristic gets stuck rendering stale Thru chunks indefinitely. `FFI_VERSION` 5→7 (one bump for `peaks_generation`, one for `has_external_audio_interface`).
+
+**No library DB, no metadata indexing, no crates, no other keyboard transport, no overview waveform** (that's M10.5c) — those are M11 / per-feature future milestones.
+
+---
+
+<a id="m105c"></a>
+## M10.5c — Track Overview waveform + horizontal-orientation shader
+
+**Status:** shipped (a + b) &nbsp;·&nbsp; **Estimate:** 2 days
+
+The two pieces of M10.5b shakedown that didn't fit in the shell pass.
+
+**M10.5c-a — shipped:** `TrackOverviewView` (SwiftUI `Canvas`) slotted on each deck's outside edge with playhead-bracket tracking + File-mode click-to-jump per the description below.
+
+**M10.5c-b — shipped:** `orientation: u32` uniform plumbed end-to-end (Metal `Uniforms` struct, Swift `WaveformUniforms`, `WaveformRenderer.orientation` property, `WaveformView(orientation:)` parameter, host `WaveformMetalView` pipes the value into the renderer and forces a uniform refresh on change, playhead overlay swaps between horizontal hairline / vertical hairline based on orientation). Default remains `.vertical` so every M10.4 / M10.5b call site renders bit-identical pixels.
+
+**Track Overview** (PRD §9.6.1): per-deck thin vertical strip on the deck's outside edge (`DubLayout.deckOverviewWidth ≈ 36 px`) showing the *whole* track top→bottom with a playhead-bracket indicator at the current `position(deck)`. Renders via SwiftUI `Canvas` (not Metal — overview is a low-cadence, fully-known-up-front signal that doesn't benefit from GPU instancing; `Canvas` keeps the pipeline simpler and the shader inventory smaller). Reads broadband peaks via `peaks_extend(deck, 0)` once at load, decimates to ≈ 300 buckets (the strip's pixel height at typical window sizes), redraws only when the playhead chunk changes (≈ 30 Hz from the existing position poll). **Click-to-jump** plumbed for File mode immediately; Timecode-mode behaviour gated on M10.6's Panic-Play wiring.
+
+**Horizontal-orientation Metal uniform:** adds `orientation: u32` (0 = vertical, 1 = horizontal) to `WaveformUniforms` and the matching `Shaders.metal` constant buffer; the vertex shader picks the NDC x↔y assignment based on the uniform. Vertical orientation is the default and the M10.4 / M10.5b behaviour is bit-identical; horizontal flips the playhead from "25 % from top" to "25 % from left" with the future to the right of the playhead. Lights up Prep mode's horizontal layout in M10.8 without that milestone needing to touch the shader. No FFI version bump (renderer-only).
+
+---
+
+<a id="m105d"></a>
+## M10.5d — Background load (decode + peaks off-thread)
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 0.5 days
+
+The perceived "loading is slow" pain was the FFI's `load_track` doing synchronous `Track::load_from_path` (symphonia decode → `Vec<f32>` of the whole file) plus `compute_offline_peaks` (broadband + 3-band ring fills across all samples) **under the engine-state mutex** on the SwiftUI main actor. Two compounding effects: (1) the call blocked the main actor for ~50–300 ms depending on track length, freezing the UI; (2) the engine-state mutex stayed held throughout, so every concurrent `position()` / `peaks_extend()` / `track_info()` call (the 30 Hz UI poll + waveform poll) blocked behind the loader too — Swift-side dispatch alone would not have helped.
+
+**Rust fix** in `crates/dub-ffi/src/lib.rs`: split `load_track` into three phases. Phase 1 takes the mutex briefly to verify `EngineState::Running`. The guard drops. Phase 2 does the slow decode + peaks compute **mutex-free** — the rest of the API stays responsive throughout. Phase 3 re-acquires the mutex, re-checks `Running` (the engine could have been stopped during decode; if so, the freshly-built `Arc<Track>` + peak vectors drop on the caller's thread, harmless), then installs the new track + peaks and bumps `peak_generation_seq` while still holding the guard (no torn-read window — a renderer that sees the new peaks also sees the new generation). The generation atomic lives on `DubEngine` directly, not inside the `Mutex<EngineState>`, so the access doesn't recurse.
+
+**Swift fix** in `apple/Dub/MainView.swift` + `Performance/PerformanceView.swift`: `WaveformAppModel.loadTrack(side:url:)` becomes `async`, dispatches the FFI call onto a `Task.detached(priority: .userInitiated)` so it doesn't pin the SwiftUI main actor either. New `DeckState.isLoading: Bool` tracks in-flight loads; concurrent load on the same deck red-flashes the deck pane and surfaces "Deck *X* is already loading — wait or load onto the other deck". Optimistic UI: the new file's title fills in immediately and the deck-header source pill flips to a new `Source.loading` variant ("LOADING…", amber dot) before decode starts — the user sees the deck respond to the drop instantly, even though the audio swap lands ~tens of ms later. A *replace*-load (new file decoded while a previous one is resident) keeps the old waveform + transport toggle live during decode and swaps in atomically when `peak_generation_seq` bumps. `loadBrowserSelectionIntoTargetDeck()` becomes `async` to match; the Space-key NSEvent handler awaits inside its existing `Task { @MainActor in ... }` wrapper.
+
+No FFI bump.
+
+---
+
+<a id="m105e"></a>
+## M10.5e — Waveform polish (compression + past-region dim + brighter floor)
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 0.5 days
+
+> **Note:** the soft-amplitude compression and past-region dim shipped here survive into the M10.8 baseline conceptually but live in different code paths after the M10.8 shader rewrite. The exact constants below describe the pre-M10.8 shader.
+
+The "ugly waveform" pain: linear amplitude makes typical -14 LUFS music live in the inner ~30 % of the deck column; uniform brightness across past/future kills the depth cue from the bottom→top scroll; thin RMS-driven palette saturation washes out under projector lighting.
+
+**Shader-level** fixes in `apple/Dub/Waveform/Shaders.metal`: (1) **soft amplitude compression** `displayAmp = sign(x) * |x|^0.55` applied to `lo` / `hi` *after* the honest-state `clipping` / `silence` flags read the raw values — peaks at 0.3 now render at ~0.50, peaks at 0.7 at ~0.82, and an already-clipped 1.0 stays at 1.0. Visually fills the column on most masters without lying about the underlying signal. (2) **Past-region dim** routed through `VertexOut.flags.w`: the vertex stage sets it to 1.0 for chunks above the playhead, 0.0 below; the fragment multiplies the final RGB by `mix(1.0, 0.62, isPast)`. Applied uniformly to all three palette branches *and* to the honest-state clipping/silence colours so the depth cue stays consistent across visualisation modes. (3) **Brighter luminance floor**: the final RMS-driven luminance clamp moves 0.45 → 0.55 with a slightly gentler gain (1.6 → 1.4) so brick-walled tracks don't pin every chunk to 1.0 — preserves transient contrast through the loud parts. The Serato-faithful palette's `normaliseColour` floor lifts 0.45 → 0.55; the monochrome palette's intensity floor lifts 0.35 → 0.45.
+
+**SwiftUI overlay** in `apple/Dub/Waveform/WaveformView.swift`: faint zero-crossing hairline (`DubColor.divider.opacity(0.55)`, 1 px) along the amplitude=0 axis — vertical line at mid-width in vertical orientation, horizontal line at mid-height in horizontal (Prep) orientation. Layered under the deck-tinted playhead overlay so the playhead always wins where they cross. Helps the eye read symmetry around silence and gives sparse-waveform sections an anchor.
+
+No FFI changes; no shader uniform changes (everything piggybacks on existing `Uniforms` / `VertexOut`).
+
+---
+
+<a id="m105f"></a>
+## M10.5f — Waveform 2× zoom-in
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 0.1 days
+
+The deck-column waveform was too zoomed-out at the M10.5b sizing: ≈ 4 chunks per pixel meant ~6 s of audio crammed into the visible future region, hard to read transient relationships at mix-in time. One-line fix in `apple/Dub/Waveform/WaveformRenderer.swift`: `nonisolated private static let chunksPerPixel: Double = 4.0` → `2.0`. The constant feeds both (a) the renderer's per-frame `chunksVisible` math (drives the M10.4 NDC mapping in `Shaders.metal`) and (b) `WaveformRenderer.secsPerPixel(sampleRate:)` (drives the M10.6a click-scrub gesture's px → secs conversion), so the click-scrub gesture stays calibrated automatically. The change exposed a latent aliasing pattern — see M10.5g for the follow-up. No FFI changes.
+
+---
+
+<a id="m105g"></a>
+## M10.5g — Waveform anti-alias + temporal smoothing
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 0.5 days
+
+The remaining ugliness after M10.5e + M10.5f was a **"venetian blind" stripe pattern** between adjacent chunks. Two compounding root causes: (1) M10.5f's 2× zoom-in put each chunk's quad at ≈ 0.5 px tall on the time axis, and the pipeline had **no MSAA**, so amplitude-edge rasterisation stepped in hard integer-pixel jumps; (2) per-chunk min/max are inherently jittery across consecutive chunks at the engine's native 64-sample cadence (≈ 1.45 ms / chunk at 44.1 kHz), so neighbouring rows drew quads with slightly-different widths and a 1–2 px height — the eye sees the row boundaries as stripes.
+
+**Shader fix** in `apple/Dub/Waveform/Shaders.metal`: per-instance vertex stage now reads `chunks[iid-1]`, `chunks[iid]`, `chunks[iid+1]` (clamped at `iid==0` and `iid==chunksVisible-1`) and convolves min / max / rms with a `[1, 2, 1] / 4` Gaussian kernel. The result drives the rendered quad and `VertexOut.rms`; the honest-state `clipping` / `silence` flags continue to read the *raw centre* chunk so a single hot or silent chunk still lights up unattenuated — smoothing is visual-only, never on the depth-of-information surface. The temporal lowpass softens chunk-to-chunk amplitude jitter that the eye reads as stripes, without changing the broad envelope shape the DJ uses to read transients.
+
+**Pipeline fix** in `apple/Dub/Waveform/WaveformRenderer.swift` + `apple/Dub/Waveform/WaveformView.swift`: 4× MSAA enabled end-to-end. New `nonisolated public static let WaveformRenderer.sampleCount = 4` is referenced both by the `MTLRenderPipelineDescriptor.rasterSampleCount` (renderer-owned pipeline) and `MTKView.sampleCount` (host-owned view); Metal validates these match at draw time. Cost on Apple Silicon is negligible — the multisample texture sits in tile memory, the resolve happens at the end of the render pass, no extra command-encoder plumbing required.
+
+The combination produces a continuous, smoothly-shaded envelope at all zoom levels instead of the previous stripe pattern. No FFI changes; no shader uniform changes. The MSAA path and the temporal-smoothing principle both survive into the M10.8 Serato-parity baseline; the post-processing stack added on top by M10.5h–p does not.
+
+---
+
+<a id="m105hp"></a>
+## M10.5h → M10.5p — Shader exploration ladder (rolled back in M10.8)
+
+**Status:** shipped iteratively, then **rolled back wholesale in the M10.8 baseline freeze** — see [§M10.8](#m108) for the current shader.
+
+Between M10.5g and the M10.8 freeze the renderer accumulated a deep stack of shader experiments aimed at matching (and at times exceeding) Serato's visual richness. Real-world dogfooding against side-by-side Serato screenshots showed the stack was not converging on a DJ-effective waveform: dense music collapsed into a uniform yellow soup, transients didn't pop, the runtime tuning panel grew several knobs that the operator should never have needed to touch, and each subsequent layer was paying for problems introduced by the previous one. The M10.8 cleanup deleted the entire post-processing ladder (HDR off-screen target, separable Gaussian bloom, ACES tonemap, the `WaveformTuning` `@Published` knob surface and its `WaveformTuningPanel` GUI, the time-domain filtered-peaks ring, the onset-driven brightness layer, the kick-emphasis tint, the dj-landmarks monochrome palette, the various other palettes) in favour of a single-pass Serato-parity shader with calibrated equal-loudness band biases / gains, three perceptually-tuned colour anchors, and a sub-bass-aware quiet greying gate.
+
+These write-ups are preserved here as design archaeology — they document what was tried, what the calibration cost looked like, and why each layer eventually came down. Any future polish work that wants to revisit one of these ideas should read the relevant section first to avoid re-running the same dead end.
+
+### M10.5h — HDR + bloom render pipeline — *shipped, then rolled back in M10.8*
+
+The single biggest visual upgrade in the M10.5 polish ladder. Before: single-pass renderer writing straight to `bgra8Unorm`, fragment colours clamped at 1.0, no headroom for transient overshoot, no post-processing. After: **five-pass HDR pipeline** in the renderer with sub-pixel-accurate MSAA on the offscreen primary, real Gaussian bloom on transient overshoot, and ACES tonemap on the final composite.
+
+**What shipped:** (1) `Shaders.metal` waveform fragment gains an HDR overshoot block — `hdrBoost = in.rms * in.rms * 3.5` multiplies the post-luminance colour with a quadratic curve calibrated against real-music RMS distributions (typical loud mid rms ≈ 0.30 → boost 0.32 → clear halo; transient peak rms ≈ 0.45 → boost 0.71 → strong halo; quiet pad rms ≈ 0.15 → boost 0.08 → faint wash; silence rms ≈ 0.05 → boost 0.009 → no bloom). The overshoot is applied *before* the past-region `pastDim` multiply so past transients still glow proportionally (just dimmer).
+
+**Calibration notes** (six iterations of `bandMix` retuning to land on legible per-band colours — kick / mid / hi-hat across `(1.0, 0.10, 0.05)` / `(0.10, 1.00, 0.15)` / `(0.05, 0.30, 1.00)` near-spectral anchors, double-square ratio amplification with inverse-pink-noise band weighting `× 1.2` mid / `× 1.8` high to compensate for the `dub-spectral` μ-law compression curve and the natural pink-noise spectrum slope, plus a per-band 3-tap `[1, 2, 1] / 4` smoothing kernel on the band-RMS values so adjacent chunks paint the same colour) — preserved in the archived M10.5h plan-of-record. The key empirical finding: the upstream `dub-spectral` μ-law compression (`ln(1 + λ · |X|)`, chosen in M8.1 to stop hi-hats out-voting kicks in the BPM ODF) pulls all band RMS values into a narrow `[~0, ~6]` compressed range; downstream colour mixing must work in compressed space, not linear, or every per-band correction over-compensates and flips the colour distribution. This finding survived into the M10.8 baseline and drives its `bandBias` / `bandGain` calibration.
+
+**Pipeline additions** that came down in M10.8: new shader trio (`fullscreenVertex`, `brightPassFragment`, `gauss1dFragment`, `compositeFragment`), four pipeline states (`waveformPipeline` re-targeted to `rgba16Float` MSAA + `brightPassPipeline` + `gaussPipeline` + `compositePipeline`), four offscreen textures (`hdrPrimaryMS`, `hdrPrimaryResolved`, `bloomA`, `bloomB` at half-res), seven-pass `draw(in:)` (waveform → bright-pass → H-Gauss → V-Gauss → H-Gauss → V-Gauss → composite/tonemap). Memory cost ~12 MB per deck at typical drawable sizes. The post-processing stack is what M10.8 deletes; the per-band-smoothing finding survives.
+
+### M10.5i — Continuous filled envelope — *shipped, then rolled back in M10.8*
+
+Eliminated the "looks like a peak meter, not a waveform" problem from the original M10.4 / M10.5b layout by replacing one instanced-quad-per-chunk draw with two connected `.triangleStrip` draws (one per region — past + future) whose vertices encode `(amplitudeEdge, timeCentre)` pairs. K chunks produce a single C0-continuous filled shape spanning K-1 trapezoidal slices, eliminating the inter-chunk seams. Calibration-A added a second pass per region for the "Serato two-layer envelope" look (outer min/max envelope at exponent 0.55, inner brighter RMS body at exponent 0.35, 1.6× HDR boost on the inner body so ACES tonemap pulls the core toward "white-hot at the centre, hue-saturated at the edges"). The continuous-envelope geometry survives into the M10.8 baseline; the two-layer overlay and HDR boost do not — M10.8 paints a single Serato-style envelope with calibrated low/mid/high colours and no post-processing.
+
+### M10.5l — Onset-driven bloom intensity — *shipped, then rolled back in M10.8*
+
+Promoted the M10.2 "onset glow" bullet onto the M10.5h HDR pipeline. New `dub-peaks` `OnsetDecimator` mirroring `BandDecimator`'s surface, built on the same `SpectralFrameStream` primitive — same FFT-hop cadence (= `samples_per_band_chunk`, default 512 samples), single `f32` `OnsetChunk` per hop carrying the Klapuri-style log-band weighted spectral flux. **Why a sibling of `dub-bpm::onset` rather than re-exporting it:** the renderer needs the onset trail even when no `BpmStream` is running (File-mode playback, single-deck Prep), and tying the renderer to the BPM crate would couple two independent off-RT pipelines.
+
+**`dub-peaks` plumbing:** `PeakBuffer` gains an optional `OnsetStorage` mirror of `BandStorage`; `PeakStreamConfig.onset_enabled` (default `true`) implicitly enables `bands_enabled`; `PeakStream::spawn` drives an `OnsetDecimator` on the analysis thread alongside the existing `BandDecimator`; `compute_offline_peaks` does the same on the file-mode path. **`dub-ffi` surface:** `engine.onset_peaks_len(deck)`, `engine.onset_peaks_chunk_duration_secs(deck)`, `engine.onset_peaks_extend(deck, start)` — same shape as `band_peaks_*` but a 4-byte stride. `PeakSource` enum delegates to the live stream / offline buffer the same way it delegates bands. `FFI_VERSION` 8 → 9.
+
+**Apple renderer:** new `onsetChunksBuffer` ring (sized to `bandChunkCapacity` = 131 072 entries = 512 KB/deck), parallel `ingestNewOnsetChunks` pump, `WaveformUniforms.onsetChunkOffset` (per-region), onset buffer bound at vertex buffer slot 4. **Shader:** vertex stage looks up the onset chunk for each broadband chunk, applies the same 3-tap `[1, 2, 1] / 4` smoothing to the raw flux, maps via the calibrated sigmoid `onsetConf = clamp(1 - exp(-fluxSmoothed × 0.25), 0, 1)`. Forwarded through `VertexOut.onsetConf`; fragment multiplies `hdrBoost` by `(1.0 + 1.5 × onsetConf)`.
+
+M10.8 deletes the renderer-side onset consumption (no more `onsetConf` shader path) but the Rust-side `OnsetDecimator` + `OnsetStorage` + FFI plumbing remains in place for future, additive consumers — exactly the kind of "reversible" architecture the M10.8 guardrail asks for.
+
+### M10.5m(a) — Beat-aware saturation — *shipped, then rolled back in M10.8*
+
+The first half of the originally-planned M10.5m row, lifted out and shipped alongside M10.5l because both effects ride the same `onset_trail` data and live in the same fragment-shader pass. After `bandMix` runs and *before* the palette branch, the shader rotates the bandMix output toward its own Rec. 601 luma based on `onsetConf`: `colour = mix(float3(luma), colour, 0.4 + 0.6 × onsetConf)` — sustained pads desaturate to a wash, kicks/snares paint full vibrant hue. Combined with M10.5l, drum hits + transients pop as saturated colour shapes against a near-monochromatic background of held notes / pads / silence. Rolled back in M10.8; the broader Serato-parity calibration in M10.8 makes the colour distribution legible without this overlay.
+
+### M10.5o — Kick prominence layer (band[1] visual emphasis) — *shipped, then rolled back in M10.8*
+
+Problem: in the M10.5l + M10.5m(a) baseline, a kick chunk and a sustained bassline chunk at the same broadband RMS read as visually indistinguishable — both paint at similar luminance + chroma since the bandMix output is a per-band *ratio* (a chunk dominated by bass paints red regardless of *how much* bass), and the bloom layer only fires on onsets. User wanted the 80–250 Hz "kick range" to **visually stand out** independent of onset / total amplitude.
+
+**Implementation (~50 LoC across 4 files, all behind a single uniform):** new `kickEmphasis: float` in `Uniforms` + matching field in `WaveformUniforms` (taking the struct from 60 → 64 bytes, perfectly filling `uniformStridePerRegion`), sourced from a new `kickEmphasis` `@Published` knob on `WaveformTuning` (default 0.6, range 0.0–1.5) with a corresponding live slider in `WaveformTuningPanel`. Fragment shader applies three combined effects, all multiplied through `kickStrength = clamp(in.bandLow.y × kickEmphasis, 0.0, 1.0)`: (1) saturation override bumping `chromaScale` toward `min(chromaScale + kickStrength × 0.8, 1.0)`; (2) red-orange tint mixing the bandMix output toward `(1.0, 0.30, 0.05)` by `kickStrength × 0.55`; (3) additive HDR bloom `hdrBoost += in.rms × kickStrength × 0.6` gating on `in.rms` so quiet rumble doesn't paint but sustained loud sub-bass *does*.
+
+M10.8 deletes the layer entirely (no `kickEmphasis` uniform, no `WaveformTuning`, no `WaveformTuningPanel`); the broader Serato-parity calibration in M10.8 paints kicks pink-red via its low-band anchor + kick-push logic instead.
+
+<a id="m105n"></a>
+### M10.5n — Playhead-vs-audio drift root-cause fix — *shipped, survives M10.8*
+
+**Symptom (reported during M10.5l shakedown):** the audible kick happens slightly before the corresponding chunk crosses the playhead, AND the gap visibly widens as the track plays — small at the start, ~1 s by track-end on a 4-minute track. Initially mis-diagnosed as a steady-state `display_present − audio_buffer` differential (which is real but tiny: 5–20 ms constant) and "fixed" with a manual `avOffsetMs` slider in the tuning panel. The slider masked the problem but didn't solve it — a value tuned at 0:30 is wrong at 3:30 because the actual error is **linear in track time**, not constant.
+
+**True root cause:** peak chunks are cadenced in **track frames** (the offline analyzer in `dub-peaks` produces one chunk per 64 *track* samples), but the renderer was indexing them in **engine frames** with an integer-rounded conversion. The path was: `peaksChunkDurationSecs = 64 / track_sr` (correct, exact, e.g. `64/44100 = 0.0014512 s`) → `samplesPerPeakChunk = round(peaksChunkDurationSecs × engine_sr) = round(69.66) = 70` (the bug — drops 0.35 samples per chunk = 0.49 % per-chunk error) → `chunk = elapsed_secs × engine_sr / samplesPerPeakChunk`. On a 44.1 kHz track / 48 kHz engine the per-chunk error of 0.49 % compounds to **~804 chunks of drift over 240 s of playback ≈ 1.17 s of accumulated visual lag**, exactly matching the reported symptom. (Same-SR tracks — e.g. 48 kHz track on 48 kHz engine — have zero drift because `peaksChunkDurationSecs × engine_sr` is already integer, so the bug was invisible on test fixtures.)
+
+**Fix (~5 LoC in renderer, no FFI change):** bypass the integer-rounded intermediate entirely. Store `peakChunkDurationSecs: Double` in `WaveformRenderer` from the engine's already-exact f64 report, and use it directly: `playheadChunk = floor(elapsed_secs / peakChunkDurationSecs)`. Verified by hand-calculation: on the 44.1 kHz / 48 kHz scenario the new formula matches the engine's actual playback position to within `f64` precision (~1e-9 s). **Slider removal:** `WaveformTuning.avOffsetMs` deleted, "AV sync" section removed from the tuning panel, the `dub.waveform.tuning.avOffsetMs` `UserDefaults` key one-shot-migrated to nil on launch so a `defaults read com.klos.dub` doesn't show a stale value.
+
+The root-cause fix survives the M10.8 cleanup unchanged (still in the renderer).
+
+### M10.5p — DJ-focused waveform redesign — *shipped (Stages 1 + 2 + 3 + 3.1), then rolled back in M10.8*
+
+**Problem statement (user-driven, 2026-05-13):** the M10.5h → M10.5o waveform stack delivered a *visually rich* renderer but a *DJ-ineffective* one. In loud / busy music ("bass + rapping + drums") the 7-band hue mix saturates toward a "yellowish glowing" soup because the per-band ratios all land near-equal once the music is dense. The DJ doesn't need spectral density: they need three landmarks. Quote: *"all DJ music is basically on a 4/4 rhythm. The other thing a DJ needs is to identify the drop (easy since this is mostly after a break and a buildup) and he needs to understand where the vocals come in and where they leave. This is basically all the dj needs from a waveform."*
+
+**Design pivot:** from "data-rich spectral visualisation" → "DJ landmarks only". Stage 1 shipped a monochrome envelope (new `WaveformPalette.djLandmarks`) and an offline beat-grid + tick overlay (`dub-bpm::analyze_beat_grid`, `FFI_VERSION` 9 → 10). The Stage 1 beat-grid overlay was subsequently removed and re-scoped into its own milestone (`M10.5p-grid`, deferred) after testing exposed that fixed-period synthetic grids drift on tempo-drifting material (live recordings, vinyl pressings, breakbeat samples). Stage 2 added transient prominence (kick gate `clamp(band[1].y × onsetConf, 0, 1)`, 0.55 cap on `base` brightness so sustained content stays dim, warm-amber tint on confirmed kicks). Stage 3 added a time-domain `FilteredPeakChunk` ring (`dub-peaks::filtered` module, 2-pole Butterworth LP biquad at 180 Hz on the LF channel, new `samples_per_filtered_chunk` cadence, `FFI_VERSION` 10 → 11) so kick attacks survive intact for a clean kick-vs-sustained-bass discrimination at the shader level instead of fighting the upstream μ-law compression. Stage 3.1 calibrated the filter cutoff, replaced the smoothing kernel on `lfPeak` with `max`-of-3 (smoothing was destroying kick dynamic range), and adjusted the amber-gate to `smoothstep(0.08, 0.30, kickGate) × kickEmphasis` with a brightness-tied amber luminance.
+
+M10.8 rolls back the entire `djLandmarks` palette branch, the beat-grid plumbing in `load_track` Phase 2 (already returning `BeatGrid::empty()` to save load time), the `WaveformTuning` slider surface, the kick-gate fragment-shader logic, and the time-domain `FilteredPeakChunk` ring on the *renderer* side. The Rust-side `dub-bpm::analyze_beat_grid` API, the FFI `BeatGrid` accessor, and the `dub-peaks::filtered::FilteredDecimator` + `FilteredPeakChunk` types remain in place as dormant data primitives — exactly the kind of reversible architecture the M10.8 guardrail asks for. A future, additive M10.8+ milestone can re-light any of them without re-running the Stage 1 → Stage 3.1 calibration tour.
+
+### M10.5p-grid — Beat-grid v2 (tempo drift, downbeat detection, manual phase correction) — *deferred*
+
+The first M10.5p Stage 1 ship bundled an offline beat-grid + tick overlay alongside the monochrome envelope. User testing exposed two issues that pushed the grid out into its own multi-sub-task milestone: (a) the overlay didn't visibly scroll with the playhead on first ship (a `Canvas`-caching bug; subsequently fixed) yet still relied on a static phase that doesn't survive tempo-drifting material, and (b) the "stuck two ticks" symptom revealed the deeper truth — *beat grids only work on tempo-locked production tracks*. Live recordings, classic vinyl pressings (which drift inherently), edits with manual cuts/loops, and tempo-aware DJ tools (Serato Pitch'n'Time, Traktor Flux) all produce material where a fixed-period synthetic grid drifts off the audible beats within bars.
+
+A v2 grid that handles those cases needs: **(g1)** per-beat phase tracking (a Viterbi-style decoder over the ODF rather than a single global phase pick); **(g2)** algorithmic downbeat detection (which beat is "the 1" of each bar — current Stage 1 just calls beat 0 the downbeat, which is wrong for any track that doesn't start exactly on the 1); **(g3)** manual phase correction UI (tap the waveform to nudge the discovered "1"; ⌘⇧← / ⌘⇧→ to shift the grid by ±1 ODF tick; half-tempo / double-tempo toggle for the M8.1 octave-ambiguity edge cases); **(g4)** library sidecar serialisation (compute the grid once, persist it, never recompute on re-load); **(g5)** a Thru-mode streaming variant (the offline `analyze_beat_grid` is file-only — a streaming `BpmStream` already exists but only emits BPM, no phase).
+
+When the grid milestone resurfaces, the one-line revert to re-enable Stage 1's coarse phase finder is documented in `dub-ffi/src/lib.rs` `load_track`. Until then, the waveform helps the DJ with no grid.
+
+### M10.5m(b) — 9-band sub-bass split — *deferred to M11*
+
+The second half of the originally-planned M10.5m row, parked for after M11 (Serato library import) lands so we have a real DJ-curated track set to validate the colour change. **Plan when revisited:** bump `dub-spectral::NUM_BANDS` from 8 to 9 by splitting the lowest log-band into sub-bass (30–60 Hz) and kick-band (60–200 Hz). Touches `dub-spectral` (band-layout constant, FFT-bin-grouping math), `dub-bpm` (every M8.1 genre fixture needs to be re-baked because the per-band magnitudes shift), `dub-peaks` `BandPeakChunk` (wire format gains a 9th f32 — `#[repr(C)]` size 32 → 36 bytes, breaking change for the M10.5j sidecar format → version bump), `dub-ffi` `peaks_extend` wire format documentation, shader `BandPeakChunk` struct + `bandMix`. The compute-side change is mechanical; the data-format breakage is the gnarly part — every dependent crate's tests need re-baselining and the sidecar format gets a `version: u32 = 2` bump with a v1 → v2 migration (drop v1 entries on first run; a one-time re-decode is acceptable in Phase A). `FFI_VERSION` += 1 when it lands.
+
+### M10.5j — On-disk waveform sidecar cache — *planned, not yet shipped*
+
+The "track-load feels instant" upgrade — what Serato (`.SeratoOverview`), Traktor (`.tg2`), rekordbox (`.pdb` + analysis blobs) all do under the hood. Today every track load runs `Track::load_from_path` + `compute_offline_peaks`. M10.5d moved it off the engine mutex, but the work still happens once per load. **Plan:** new `dub-cache` library owning a versioned on-disk format (64-byte LE header + broadband peaks + band peaks + optional mip pyramid + CRC-32 footer), keyed by `sha-256(canonical_path || file_size || mtime_nanos)`, stored under `~/Library/Caches/com.klos.dub/waveforms/`. Lookup flow in `dub-ffi::load_track` Phase 1 stats the audio file, computes the cache key, tries to `mmap` the sidecar. Cache hit → skip decode entirely. Cache miss → decode + compute as today, then atomically write the sidecar via `<key>.tmp` → `<key>.dubpeaks` rename. Disk budget per track ~2.5 MB at 5 min; a 500-track library ≈ 1.25 GB cache (well below Serato's typical 3–5 GB). LRU eviction when the directory exceeds a configurable cap (default 4 GB).
+
+### M10.5k — Mip pyramid in `dub-peaks` — *planned, not yet shipped*
+
+Closes the loop on the final M10.2 deferred polish bullet (Mip pyramids). Today the renderer reads peaks at a single resolution (64-sample broadband cadence) and the `TrackOverviewView` re-decimates to ~300 buckets on the CPU at load — both work but neither lets us *zoom smoothly* or feed a future coarse-zoom view a coarser source. **Plan:** extend `OfflinePeaks` with `pub mips: Vec<MipLevel>` containing 5 levels (level 0 = full cadence, level 1 = ÷2, level 2 = ÷4, level 3 = ÷8, level 4 = ÷16). Same reduction kernel for bands (band RMS is mean-pooled). The M10.5j sidecar gains the mips after the level-0 payload. `TrackOverviewView` drops its CPU decimation entirely and reads mip-4 directly via a new mip-aware `peaks_extend_mip(deck, mip, start_idx)` accessor (`FFI_VERSION` += 1).
+
+---
+
+<a id="m106"></a>
+## M10.6a–d — Mouse transport, Panic Play, transport-cluster redesign
+
+**Status:** shipped (a, b, c, d) &nbsp;·&nbsp; **Estimate:** 3 days for a–d (M10.6e Repeat outstanding)
+
+Engine work concentrated in 10.6b, UI work split across the others. Together they deliver PRD §6.1's mouse-allowed transport, PRD §6.1.2 Panic Play (the **single most important reliability feature** in v1 from a "career night" perspective), and PRD §6.1.3 Casual Play.
+
+### M10.6a — Casual Play UI + zoomed click-scrub
+
+Deck-header transport-glyph cluster (Play/Pause toggle + Restart) added to Row 3 of `DeckHeader` — renders exactly when a file track is loaded (`timeRow != nil`), so it covers both Prep-mode and the Casual-Play-before-Timecode case. New `WaveformAppModel.{restart, scrub}(side:...)` methods plumbed into the header via a `DeckHeaderCallbacks` value (closures kept off `DeckHeaderState` to preserve `Equatable`). `WaveformView(onClickScrubRelativeSecs:)` installs an orientation-aware transparent hit-test layer beneath the playhead overlay; click → signed seconds-from-playhead via the same `chunksPerPixel × samplesPerPeakChunk / sampleRate` ratio the renderer uses, so a click lands on the visual chunk under the cursor. New nonisolated `WaveformRenderer.secsPerPixel(sampleRate:)` helper centralises that math. PRD §6.1 gating: the closure is wired only when `engineMode == .prep`; Timecode-mode panes pass `nil` so the gesture isn't installed at all (no fine-scrub on a timecode-controlled deck, regardless of Panic Play state). No FFI bump (renderer + UI only).
+
+### M10.6b — Panic Play engine + FFI
+
+New `LiftPolicy::force_disengaged()` (preserves `last_locked_rate` while clearing the engaged flag + sticky counter — the next `Locked` is by construction a fresh re-engagement). New engine-level `PanicPlayState { engaged, held_rate }` per deck; `PanicPlayState::normalise_held_rate` collapses negative / near-zero candidates to a positive forward rate per PRD §6.1.2 ("runs the audio track forward"). New `Command::DeckPanicPlay { idx }` / `DeckCancelPanicPlay { idx }`. `Engine::engage_panic_play(idx)` captures the held rate (preferring `LiftPolicy::last_locked_rate()` when a timecode input is attached, falling back to `deck.rate()` otherwise), force-disengages the policy, sets the deck rate + playing, and flips the new `DeckSharedState::is_panic_play` atomic.
+
+`Engine::drive_timecode_inputs` branches on panic state: in panic mode `Locked` intents auto-cancel (clean re-lock = "DJ dropped the needle back on the groove"), `DropoutHoldRate` intents are ignored (the whole point — the deck keeps playing while the needle is off the platter). `Engine::cancel_panic_play(idx)` pauses the deck and clears the flag; idempotent on non-engaged decks. `EngineHandle::DeckCommand::{panic_play, cancel_panic_play}` send the new commands; `DeckSnapshot.is_panic_play` exposes the atomic for the UI. FFI surfaces `panic_play(deck)` / `cancel_panic_play(deck)`; `PositionInfo` gains `is_panic_play` so the existing 30 Hz UI poll picks up the engine state. `FFI_VERSION` 7→8.
+
+**Test coverage:** 11 new tests — 3 policy tests (force-disengaged clears flag + counter, preserves last_locked_rate, requires engage-threshold to re-lock), 8 engine tests (engage from policy, fallback to deck rate, negative/below-floor normalisation, dropout-stays-panicked, Locked-clears-engaged, cancel-pauses-deck, cancel-idempotent, default-disengaged, alloc-free), plus 1 end-to-end test that engages panic and renders synthetic CV02 carrier blocks through `engine.render` to verify the auto-cancel path lands correctly. All 350+ workspace tests still green; clippy `-D warnings` clean.
+
+### M10.6c — Panic Play UI + Timecode overview un-gate
+
+`DeckState.isPanicPlay: Bool` field driven by the existing 30 Hz `PositionInfo.isPanicPlay` poll (engine remains the authority — UI also sets it optimistically on `panic(side:)` for zero-frame latency, but the poll over-writes it every tick so an engine-side auto-cancel on clean re-lock propagates within ≤33 ms). New `WaveformAppModel.{panic, cancelPanic, panicToggle}(side:)` wrap the M10.6b FFI methods with the same error-surfacing path as Play/Pause. `DeckHeaderState` grew `isPanicPlay` + (initially) `panicGlyphVisible` flags and a new `Source.tcHold` variant; `DeckHeaderState.from(...)` derives them: glyph visible iff `thruMode && hasTrack`, `source = .tcHold` when `thruMode && isPanicPlay`. `TrackOverviewView.handleTap` un-gates: the two-deck-Timecode early-return allows the seek when `deckState.isPanicPlay` is true (PRD §6.1 release condition). M10.6c's lifepreserver-glyph + dedicated Restart button were superseded by M10.6d below — the rest of the M10.6c plumbing (model layer, source pill, overview un-gate) stayed and is what M10.6d builds on. No FFI bump for c.
+
+### M10.6d — Transport-cluster redesign + library polish + cancel-doesn't-pause
+
+Fixes the "Play does nothing in Timecode mode" bug at the root: pressing the deck-header Play button in Timecode mode previously called `engine.play` which set `is_playing = true` only to be overwritten by the very next `drive_timecode_inputs` `DropoutHoldRate` block. The fix is to surface Panic Play *as* the Timecode-mode Play affordance — one button, Serato-style INT/ABS toggle. `DeckHeaderState.panicGlyphVisible` renamed to `useTimecodeToggle` to reflect its expanded role. `DeckHeader.transportGlyphs` collapses to a single `primaryButton` that branches: Prep mode → classic Play/Pause via `onPlay` / `onPause`; Timecode mode + track loaded → `onPanicToggle` only, icon flips between `play.fill` (currently following platter — tap to play internally) and `opticaldisc.fill` amber (currently internal — tap to re-engage timecode).
+
+M10.6c's lifepreserver glyph is gone (subsumed) and the M10.6a Restart button is gone (overview click-to-top covers it, PRD §6.1.3).
+
+**Engine semantics tweak:** `cancel_panic_play` no longer pauses the deck — it clears the engaged flag + atomic and hands transport authority back to the timecode driver. A healthy carrier produces an immediate Locked re-lock (deck stays audible, true INT→ABS hand-back). A silent carrier yields `DropoutHoldRate` on the next block which pauses the deck via the existing arm — same outcome as the pre-M10.6c "pause on held position" path, without the race against the next Locked sample. `Command::DeckCancelPanicPlay` / `EngineHandle::cancel_panic_play` / FFI `cancel_panic_play` doc comments updated. `WaveformAppModel.cancelPanic(side:)` no longer optimistically sets `isPlaying = false`; the next 30 Hz poll reflects whatever the engine decides.
+
+Replaced engine test `cancel_panic_play_pauses_deck_and_clears_shared` with `cancel_panic_play_clears_state_and_leaves_transport` + added 2 new tests: `cancel_panic_play_then_locked_intent_keeps_deck_playing` (synthetic CV02 carrier through `engine.drive_timecode_inputs` after cancel → deck stays playing at platter rate), `cancel_panic_play_then_silence_pauses_deck_via_dropout_path` (silent ringbuf → DropoutHoldRate → deck pauses naturally).
+
+**FileBrowser polish:** folders now require **double-click** to descend (single-click was too easy to trigger by accident while scanning); the drag-out preview is a small `waveform` glyph instead of the row's full song-name text. Workspace `cargo test` clean, clippy clean, xcodebuild clean. No FFI bump (Phase A pragmatism — behavior change, same signatures).
+
+### M10.6e — Repeat — *outstanding*
+
+LFSR run-out auto-trigger that engages the same engine state as Panic Play, plus a per-deck Repeat toggle in the deck header (PRD §5.4.2). Engine substrate (M10.6b) already supports the state; remaining work is the auto-trigger plumbing (timecode driver detects run-out → calls into `engage_panic_play`) and the per-deck toggle UI.
+
+---
+
+<a id="m107"></a>
+## M10.7 — Phase-Drift Trail
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 5 days
+
+Dub's headline beat-matching aid (PRD §9.4). New `dub-match` crate (sibling of `dub-bpm` / `dub-peaks` / `dub-spectral`): a `MatchStream` analysis thread consumes both decks' `dub-bpm` ODFs off-RT, computes a rolling cross-correlation over ≈ 2 bars with a ±1-beat lag window (~40 lag candidates × 200 frames per update), emits `MatchSample { phase_ms, confidence, timestamp }` at 30 Hz to an SPSC ring. Audio-thread cost: **zero** (ODFs already running).
+
+**FFI:** `matchExtend(start_idx) -> Vec<u8>` mirroring `peaks_extend`. **UI:** `apple/Dub/Performance/PhaseDriftView.swift` — Metal-rendered vertical strip ≈ 80 px wide in the centre gutter, time **bottom→top** matching the waveform direction discipline (PRD §9.1 / §9.4), dot brightness = confidence, dot colour blended from deck tints; numeric overlays `Δ BPM = +0.3` (top, slope-derived) and `Δ ms = +12` (bottom, instantaneous). Grid-agnostic by construction; degrades gracefully (dim dots) when ODFs are weak. `FFI_VERSION` bumps to 9.
+
+**Single mode only — no Preferences toggle for "numeric-only" variant in v1.**
+
+---
+
+<a id="m108"></a>
+## M10.8 — Track Preparation Mode shell + Serato-parity waveform baseline freeze
+
+**Status:** shipped &nbsp;·&nbsp; **Estimate:** 2 days for the Prep shell + 1–2 days for the baseline freeze and cleanup
+
+Two concurrent ships consolidated under M10.8: the Track Preparation Mode shell (the long-planned single-deck horizontal-waveform alternate root view), and the **Serato-parity waveform baseline freeze** that resolved the visual dead-ends of the M10.5h–p shader exploration ladder.
+
+### Track Preparation Mode shell
+
+Auto-detection of available audio interface at launch (PRD §3.1). If no multi-channel interface present, the app boots into Track Preparation Mode — alternate root view (`apple/Dub/Prep/PrepView.swift`) hosting a single-deck **horizontal** waveform full-width, with the whole-track overview band stacked above it, and the library prominent below. Manual override in Preferences (`Mode: Auto / Performance / Preparation`).
+
+**Shell only:** the mode renders the chrome and supports load + play / pause; **no** beatgrid editor, **no** hot-cue prep, **no** track gain tweaking yet (those are v1.x per PRD §3 — they'd substantially expand v1 scope and the user explicitly chose the shell-only option in the M10.3 planning round). The mode's *purpose* is visible from M10.8; its *tooling* arrives in v1.x.
+
+Sizing constants live in `apple/Dub/DesignSystem/Tokens.swift`:
+
+- `DubLayout.deckColumnWidth = 80` — Performance (Timecode) mode zoomed column.
+- `DubLayout.waveformPrepHeight = 140` — Prep mode horizontal zoomed strip.
+- `DubLayout.deckOverviewHeight = 60` — Prep mode horizontal overview band stacked above the zoomed strip.
+- `DubLayout.deckOverviewWidth = 36` — Performance mode vertical overview column on each deck's outside edge (unchanged from M10.5c).
+
+`TrackOverviewView` is now orientation-aware (its `OverviewSizing` `ViewModifier` picks vertical-column vs horizontal-band sizing from a `WaveformOrientation` property); `PerformanceView` derives `waveformOrientation` from `engineMode` and stacks the Prep overview band horizontally above the playing waveform. `WaveformAppModel.palette` defaults to `.serato`.
+
+### Serato-parity waveform baseline freeze
+
+The M10.5h–p shader exploration ladder (HDR, bloom, ACES tonemap, onset-driven brightness, kick-emphasis tint, dj-landmarks palette, time-domain `FilteredPeakChunk` ring, the `WaveformTuning` `@Published` knob surface and its `WaveformTuningPanel` GUI) was rolled back wholesale in favour of a single-pass Serato-parity shader that matches the visual reference the user repeatedly compared Dub against (the Westside Connection breakdown / drop screenshot referenced through the M10.5p session).
+
+**Current shader characteristics** (frozen baseline, see PRD §9.6.0):
+
+- **Height** comes from per-pixel-column broadband `PeakChunk` max aggregation (the vertex shader aggregates `chunksPerColumn = 2` chunks per visual column at the Performance-mode `chunksPerPixel = 2` zoom, producing a `pixelsPerDrawnColumn = 2` strip with the visible-future-region transients visually doubled vs the M10.5b sizing).
+- **Colour** comes from 8 log-spaced `dub-spectral` bands grouped into calibrated low / mid / high channels in the **log-compressed domain** (`bandBias` `float3(9.45, 7.75, 5.75)`, `bandGain` `float3(1.00, 0.82, 1.00)` — these are the M8.1 μ-law-curve domain values, not linear amplitudes; this was the load-bearing finding from the M10.5h calibration tour).
+- **Anchors** tuned against the Serato reference: `lowColor = (1.00, 0.12, 0.24)` pink-red kicks, `midColor = (0.08, 0.94, 0.22)` green mid / presence instruments, `highColor = (0.58, 0.36, 1.00)` lavender hi-hats. Mixed via `weights = pow(saturate(calibrated / chromaMax), 1.45)` — the 1.45 power enhances the dominant band so two-band content reads as a clear blend rather than a muddy secondary.
+- **Quiet greying** is gated by broadband amplitude (`in.peak`) **and** sub-bass focus (`in.subBass`, carrying `b0` ≈ <80 Hz at 44.1 kHz) **and** weak audible mid/high (`audibleMidTop`). Three-axis gating prevents the early single-axis attempts (broadband-only, then spectral-low-only) from greying out audibly significant mid-range content while still greying decay tails of sub-bass-only sections (mirrors what Serato does on the same reference clip).
+- **Kick push:** loud low-band transients (`smoothstep(0.18, 0.42, in.peak) * smoothstep(0.25, 1.10, calibrated.x)`) boost `calibrated.x *= 1.35` and dim `calibrated.y *= 0.78`, ensuring kicks paint pink-red rather than drifting toward orange/green even when the mid/high bands also have content.
+- **MSAA** stays at 4× (M10.5g, survives).
+- **No HDR, no bloom, no tonemap, no `WaveformTuning` runtime knobs.** Single-pass renderer writes straight to `bgra8Unorm`.
+
+The previous palette presets and `WaveformPalette` enum are gone; the per-track-palette state in `WaveformAppModel` is fixed at `.serato` and the Preferences `paletteSection` has been removed.
+
+### Future-work guardrail (PRD §9.6.0)
+
+Future waveform work must be **additive and reversible** relative to this baseline:
+
+- Do not reintroduce the removed HDR / bloom / tuning-panel stack in-place.
+- Do not rewrite the baseline shader without first preserving this version behind a small, explicit switch or an isolated follow-up commit.
+- If a polish experiment fails, reverting that experiment should return exactly to this M10.8 baseline.
+
+The Rust-side `OnsetDecimator`, `BeatGrid`, and `FilteredDecimator` data primitives remain available for future, additive consumers without re-running their calibration tours.
+
+### Commit boundary
+
+The freeze was committed as `4a31363` (`feat(apple,engine): freeze M10.8 waveform baseline`). The corresponding PRD additions live in [§9.6.0](PRD.md#960-waveform-baseline-freeze-m108-cleanup) and the sizing table in [§9.6.1](PRD.md#961-sizing).
+
+---
+
+*End of shipped milestone history. Forward-looking polish (M11 onward) lives in [`docs/PRD.md` §12](PRD.md#12-milestones).*

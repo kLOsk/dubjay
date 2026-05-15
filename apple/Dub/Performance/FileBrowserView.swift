@@ -61,6 +61,54 @@ struct BrowserEntry: Identifiable, Hashable {
     }
 }
 
+/// Per-folder cache of container-tag metadata (M10.5r). Reading
+/// ID3 / Vorbis / MP4-atom tags goes through `readTrackMetadata`
+/// which opens the file, probes the metadata block, closes — ~1 ms
+/// on a warm filesystem but ~1 000 files × 1 ms = a visible second
+/// on first folder load, so we move the work off the main actor
+/// and stream results in as they arrive.
+///
+/// Lives as an `ObservableObject` so the view can react to per-row
+/// completions without forcing a full re-render of the listing.
+@MainActor
+final class BrowserMetadataCache: ObservableObject {
+    /// Cached lookups keyed by file URL. `nil` value means "no tags
+    /// found in the file" (distinct from "not yet probed", which is
+    /// represented by the URL not being in the dictionary). The
+    /// distinction matters because the loader skips re-probing
+    /// URLs that already resolved to `nil` — saves a wasted file
+    /// open on every scroll.
+    @Published private(set) var entries: [URL: TrackMetadata?] = [:]
+
+    private var inFlight: Set<URL> = []
+
+    /// Request a metadata read for `url`. Idempotent — repeated
+    /// calls before completion coalesce, and calls *after*
+    /// completion return immediately without touching disk.
+    func request(_ url: URL) {
+        if entries[url] != nil { return }
+        if inFlight.contains(url) { return }
+        inFlight.insert(url)
+        Task.detached(priority: .utility) { [weak self] in
+            let result = readTrackMetadata(path: url.path)
+            await self?.applyResult(url: url, result: result)
+        }
+    }
+
+    private func applyResult(url: URL, result: TrackMetadata?) {
+        entries[url] = result
+        inFlight.remove(url)
+    }
+
+    /// Drop everything we've cached. Called on folder change so we
+    /// don't keep megabytes of stale entries around as the user
+    /// browses through a deep music tree.
+    func reset() {
+        entries.removeAll()
+        inFlight.removeAll()
+    }
+}
+
 /// Slim browser view bound to the app model. Tracks its own current
 /// directory + listing; only the **selection** flows back into the
 /// model so `Space` can load it.
@@ -70,6 +118,9 @@ struct FileBrowserView: View {
 
     @State private var currentDirectory: URL = FileBrowserView.defaultDirectory()
     @State private var entries: [BrowserEntry] = []
+    /// M10.5r per-folder tag-metadata cache. Rebuilt on every
+    /// folder change (see `reload()` + `currentDirectory` observer).
+    @StateObject private var metadata = BrowserMetadataCache()
     /// M10.5d snappy-click bookkeeping. Stacking two `.onTapGesture`
     /// handlers (count: 1 + count: 2) forces SwiftUI to defer the
     /// single-tap handler until the system double-click interval
@@ -172,6 +223,9 @@ struct FileBrowserView: View {
         // chain) worked. Tapping is handled by `.onTapGesture`
         // *after* `.onDrag` so AppKit tries drag first and falls
         // through to tap when the pointer hasn't moved.
+        let tags: TrackMetadata? = entry.isDirectory
+            ? nil
+            : (metadata.entries[entry.url] ?? nil)
         HStack(spacing: DubSpacing.md) {
             Image(systemName: entry.isDirectory ? "folder" : "waveform")
                 .foregroundStyle(
@@ -179,11 +233,20 @@ struct FileBrowserView: View {
                         ? DubColor.textSecondary
                         : DubColor.textPrimary
                 )
-            Text(entry.displayName)
-                .font(DubFont.body)
-                .foregroundStyle(DubColor.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(rowTitleText(entry: entry, tags: tags))
+                    .font(DubFont.body)
+                    .foregroundStyle(DubColor.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let subtitle = rowSubtitleText(entry: entry, tags: tags) {
+                    Text(subtitle)
+                        .font(DubFont.micro)
+                        .foregroundStyle(DubColor.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
             Spacer(minLength: 0)
             if !entry.isDirectory {
                 Text(entry.ext)
@@ -196,6 +259,11 @@ struct FileBrowserView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(isSelected ? DubColor.surface2 : Color.clear)
         .contentShape(Rectangle())
+        .onAppear {
+            if !entry.isDirectory {
+                metadata.request(entry.url)
+            }
+        }
         .if(!entry.isDirectory) { view in
             // AppKit drag path: NSItemProvider lets the OS use the
             // row's snapshot as the drag image, anchored under the
@@ -242,6 +310,46 @@ struct FileBrowserView: View {
 
     private func reload() {
         entries = Self.listing(at: currentDirectory)
+        // M10.5r: drop the previous folder's tag cache so we don't
+        // keep megabytes of strings around as the user browses
+        // through a deep music tree. Per-row `onAppear` rebuilds
+        // entries lazily as rows scroll back into view.
+        metadata.reset()
+    }
+
+    /// Primary text for a browser row. **Files**: container-tag
+    /// title when present, else the file's basename without the
+    /// extension. **Folders**: the folder name. The fallback keeps
+    /// the browser useful on untagged libraries (loose WAV stems,
+    /// freshly-decoded YouTube rips, etc.).
+    private func rowTitleText(entry: BrowserEntry, tags: TrackMetadata?) -> String {
+        if entry.isDirectory {
+            return entry.displayName
+        }
+        if let title = tags?.title, !title.isEmpty {
+            return title
+        }
+        return entry.url.deletingPathExtension().lastPathComponent
+    }
+
+    /// Secondary text for a browser row. **Files** with a tag-derived
+    /// artist render it; files without (untagged) render the original
+    /// filename so the basename → title fallback in `rowTitleText`
+    /// doesn't lose information. Folders render no subtitle.
+    private func rowSubtitleText(entry: BrowserEntry, tags: TrackMetadata?) -> String? {
+        if entry.isDirectory { return nil }
+        if let artist = tags?.artist, !artist.isEmpty {
+            // Album would crowd the row; we render artist only.
+            return artist
+        }
+        // Untagged file: show the full filename as the secondary
+        // line if it differs from the displayed title (e.g. the
+        // basename was abbreviated for the title row).
+        let basename = entry.displayName
+        if basename != rowTitleText(entry: entry, tags: tags) {
+            return basename
+        }
+        return nil
     }
 
     private func goUp() {

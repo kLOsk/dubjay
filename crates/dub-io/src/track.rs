@@ -9,8 +9,8 @@ use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey, Tag};
+use symphonia::core::probe::{Hint, ProbeResult};
 
 /// Errors that can occur while loading a track.
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +72,111 @@ pub struct Track {
     channels: u8,
     frames: usize,
     bpm: Option<f64>,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+}
+
+/// Lightweight metadata-only snapshot of an audio file. Returned by
+/// [`read_metadata`] for library browsing where decoding the whole
+/// file would be wasteful.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackMetadata {
+    /// Track title (`TIT2` ID3 / `TITLE` Vorbis / `©nam` MP4).
+    pub title: Option<String>,
+    /// Track artist (`TPE1` ID3 / `ARTIST` Vorbis / `©ART` MP4).
+    pub artist: Option<String>,
+    /// Album (`TALB` / `ALBUM` / `©alb`).
+    pub album: Option<String>,
+}
+
+impl TrackMetadata {
+    /// `true` when no field carries any tag text.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.artist.is_none() && self.album.is_none()
+    }
+}
+
+/// Read tag metadata from an audio file *without* decoding samples.
+///
+/// Uses symphonia's probe to locate the metadata revision attached to
+/// the container (`ID3v2` for MP3, MP4 atoms for AAC / ALAC, Vorbis
+/// comments for FLAC / OGG, RIFF INFO for WAV). Cheap: opens the file,
+/// reads the metadata block, closes the file.
+///
+/// Returns [`TrackMetadata::default`] when the file has no recognised
+/// tags. Returns [`LoadError::Io`] / [`LoadError::Format`] for the
+/// same cases [`Track::load_from_path`] would.
+///
+/// Intended for library browsing — the file-browser populates each
+/// row's title / artist columns by calling this function lazily and
+/// caching by URL.
+///
+/// # Errors
+///
+/// * [`LoadError::Io`] when the file can't be opened.
+/// * [`LoadError::Format`] when symphonia can't probe the file's
+///   container.
+pub fn read_metadata(path: impl AsRef<Path>) -> Result<TrackMetadata, LoadError> {
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    )?;
+    Ok(extract_metadata(probed))
+}
+
+fn extract_metadata(mut probed: ProbeResult) -> TrackMetadata {
+    let mut out = TrackMetadata::default();
+    // Container-level metadata (ID3 in MP3, MP4 atoms in m4a, RIFF
+    // INFO in WAV). `metadata.get()` is consumed via `current()`;
+    // we walk the most recent revision.
+    if let Some(meta) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
+        merge_metadata(&mut out, meta);
+    }
+    // Format-level metadata (Vorbis comments for OGG/FLAC, some
+    // MP4 atoms). Symphonia keeps these on the format reader.
+    if let Some(meta) = probed.format.metadata().current() {
+        merge_metadata(&mut out, meta);
+    }
+    out
+}
+
+fn merge_metadata(out: &mut TrackMetadata, revision: &MetadataRevision) {
+    for tag in revision.tags() {
+        copy_tag(out, tag);
+    }
+}
+
+fn copy_tag(out: &mut TrackMetadata, tag: &Tag) {
+    let Some(key) = tag.std_key else { return };
+    let value = tag.value.to_string();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let owned = trimmed.to_string();
+    match key {
+        StandardTagKey::TrackTitle if out.title.is_none() => out.title = Some(owned),
+        // `Artist` (TPE1 / TPE2-when-only-TPE2 is present in some
+        // libraries) takes precedence over `AlbumArtist` (TPE2)
+        // — the second arm only fills the slot when the first
+        // didn't.
+        StandardTagKey::Artist | StandardTagKey::AlbumArtist if out.artist.is_none() => {
+            out.artist = Some(owned);
+        }
+        StandardTagKey::Album if out.album.is_none() => out.album = Some(owned),
+        _ => {}
+    }
 }
 
 impl Track {
@@ -95,6 +200,9 @@ impl Track {
             channels,
             frames,
             bpm: None,
+            title: None,
+            artist: None,
+            album: None,
         })
     }
 
@@ -120,12 +228,24 @@ impl Track {
             hint.with_extension(ext);
         }
 
-        let probed = symphonia::default::get_probe().format(
+        let mut probed = symphonia::default::get_probe().format(
             &hint,
             mss,
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )?;
+
+        // Snapshot any container-level metadata before we move
+        // `probed.format` below. Vorbis-style format-level tags are
+        // read again after decode (the format reader may surface
+        // additional revisions once it has walked the headers).
+        let mut metadata = TrackMetadata::default();
+        if let Some(meta) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
+            merge_metadata(&mut metadata, meta);
+        }
+        if let Some(meta) = probed.format.metadata().current() {
+            merge_metadata(&mut metadata, meta);
+        }
 
         let mut format = probed.format;
         let primary = format
@@ -209,12 +329,23 @@ impl Track {
         }
 
         let frames = samples.len() / usize::from(channels);
+
+        // The format reader may have surfaced additional Vorbis-style
+        // metadata revisions while walking packets; merge them in
+        // after decode completes.
+        if let Some(meta) = format.metadata().current() {
+            merge_metadata(&mut metadata, meta);
+        }
+
         Ok(Self {
             samples: Arc::from(samples.into_boxed_slice()),
             sample_rate,
             channels,
             frames,
             bpm: None,
+            title: metadata.title,
+            artist: metadata.artist,
+            album: metadata.album,
         })
     }
 
@@ -234,6 +365,27 @@ impl Track {
     #[must_use]
     pub fn bpm(&self) -> Option<f64> {
         self.bpm
+    }
+
+    /// Track title from container metadata (ID3 `TIT2`, Vorbis
+    /// `TITLE`, MP4 `©nam`, …). `None` when the file is untagged.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Track artist from container metadata. Falls back to album
+    /// artist when only that tag was present.
+    #[must_use]
+    pub fn artist(&self) -> Option<&str> {
+        self.artist.as_deref()
+    }
+
+    /// Album name from container metadata. `None` when the file is
+    /// untagged.
+    #[must_use]
+    pub fn album(&self) -> Option<&str> {
+        self.album.as_deref()
     }
 
     /// Number of audio frames (one frame = one sample per channel).
@@ -386,6 +538,47 @@ mod tests {
                 let _ = track.frame(idx);
             }
         }
+    }
+
+    #[test]
+    fn read_metadata_on_untagged_wav_returns_empty() {
+        // Plain hound-generated WAV has no INFO chunk → all tag
+        // slots remain `None`, `is_empty()` is `true`. Guards the
+        // "no metadata returns Some(default), not Err" contract.
+        let path = std::env::temp_dir().join("dub-io-test-untagged.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for _ in 0..480 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let metadata = super::read_metadata(&path).expect("metadata probe");
+        assert!(metadata.is_empty());
+        assert!(metadata.title.is_none());
+        assert!(metadata.artist.is_none());
+        assert!(metadata.album.is_none());
+
+        // Round-trip through Track also exposes None.
+        let track = Track::load_from_path(&path).expect("load WAV");
+        assert!(track.title().is_none());
+        assert!(track.artist().is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_metadata_on_missing_file_returns_err() {
+        let bogus = std::env::temp_dir().join("dub-io-test-does-not-exist.wav");
+        let result = super::read_metadata(&bogus);
+        assert!(matches!(result, Err(LoadError::Io(_))));
     }
 
     #[test]

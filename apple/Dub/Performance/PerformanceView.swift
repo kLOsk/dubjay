@@ -103,7 +103,8 @@ struct PerformanceView: View {
             engineRunning: model.isRunning,
             deckEnabled: enabled,
             thruMode: model.engineMode == .timecode,
-            isMaster: model.masterDeck == side)
+            isMaster: model.masterDeck == side,
+            prepMode: model.engineMode == .prep)
     }
 
     /// M10.6a Casual-Play transport callbacks for the deck header.
@@ -282,7 +283,7 @@ struct PerformanceView: View {
                     engine: model.engine, deckIdx: deckIdx,
                     palette: model.palette, side: side,
                     orientation: orientation,
-                    onClickScrubRelativeSecs: clickScrubCallback(side: side))
+                    scrubHandler: scrubHandler(side: side))
                     .background(DubColor.surface0)
             } else {
                 idlePane(side: side)
@@ -304,17 +305,35 @@ struct PerformanceView: View {
         }
     }
 
-    /// PRD §6.1 click-scrub gating: enabled in **File mode only**;
-    /// **disabled in Timecode mode regardless of Panic Play state**
-    /// (fine-scrub via mouse on a timecode-controlled deck would
-    /// race with the needle and confuse the operator). M10.6a wires
-    /// the Prep-mode shell; revisiting in M10.6c if the Casual-Play-
-    /// in-Timecode-mode case needs nuance. `nil` return → no
-    /// gesture installed at all, which is what `WaveformView`
-    /// expects.
-    private func clickScrubCallback(side: DeckSide) -> ((TimeInterval) -> Void)? {
-        guard model.engineMode == .prep else { return nil }
-        return { secs in model.scrub(side: side, relativeSecs: secs) }
+    /// M10.5s vinyl-style scratch on the zoomed waveform. Returns
+    /// a handler in both Prep and Performance modes — the user's
+    /// "find the exact start of the kick" workflow needs audio
+    /// under the cursor regardless of engine mode (PRD §1 update;
+    /// rate-driven mouse scratching for cueing is allowed as a
+    /// usability gesture). Returns `nil` only when the deck has no
+    /// track loaded (the WaveformView still renders, but the
+    /// gesture would have nothing to scratch).
+    ///
+    /// The handler shape (`onBegan` + `onOffsetChanged` + `onEnded`)
+    /// lets the host own the rate-from-velocity polling timer + the
+    /// Panic-Play-around-scratch bookkeeping in
+    /// `WaveformAppModel.scratch*`. The view only reports raw
+    /// pointer offsets in audio seconds; the host does all the
+    /// derivative maths.
+    private func scrubHandler(side: DeckSide) -> WaveformScrubHandler? {
+        let deck = (side == .a) ? model.deckA : model.deckB
+        guard deck.hasTrack else { return nil }
+        return WaveformScrubHandler(
+            onBegan: { [weak modelRef = model] in
+                modelRef?.scratchBegin(side: side)
+            },
+            onOffsetChanged: { [weak modelRef = model] offsetSecs in
+                modelRef?.scratchPointerOffset(
+                    side: side, offsetSecs: offsetSecs)
+            },
+            onEnded: { [weak modelRef = model] in
+                modelRef?.scratchEnd(side: side)
+            })
     }
 
     /// Red flash overlay surfaced for ~200 ms when a load is

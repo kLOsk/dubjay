@@ -41,7 +41,9 @@ use dub_audio::{AudioInput, AudioOutput, InputOptions, OutputOptions};
 // crate-local and doesn't need the upstream `BeatGrid as CoreBeatGrid`
 // alias until computation comes back online.
 use dub_engine::{Engine, EngineHandle, ThruInputConfig, INTERNAL_MIXER_ROUTING};
-use dub_io::Track;
+use dub_io::{
+    read_metadata as read_track_metadata_from_disk, Track, TrackMetadata as IoTrackMetadata,
+};
 use dub_peaks::{
     compute_offline_peaks, BandPeakChunk, FilteredPeakChunk, OfflinePeaks, OnsetChunk, PeakChunk,
     PeakStream, PeakStreamConfig,
@@ -108,7 +110,24 @@ uniffi::setup_scaffolding!();
 ///       beats_per_bar). Used to draw discrete beat ticks atop the
 ///       new monochrome envelope and (eventually) gate the kick
 ///       emphasis to on-grid kicks only.
-pub const FFI_VERSION: u32 = 11;
+/// `11`: M10.5r tag-metadata pipeline. `TrackInfo` now returns the
+///       title / artist read from container tags (ID3v2 for MP3,
+///       MP4 atoms for AAC/ALAC, Vorbis comments for FLAC/OGG, RIFF
+///       INFO for WAV). New stateless [`read_track_metadata`] FFI
+///       function lets the library / file-browser pull the same
+///       tags off-disk without loading the track. New
+///       [`TrackMetadata`] Record carries them.
+/// `12`: M10.5s mouse-scratch primitive — [`DubEngine::set_deck_rate`]
+///       exposes the engine's per-deck `DeckSetRate` command with
+///       musical-→-engine SR conversion baked in. Used by the Apple
+///       shell's drag-to-scratch state machine on the zoomed
+///       waveform to drive the deck's playback rate from mouse
+///       velocity (PRD §1 / §6.1 mouse-scrub policy).
+///   14. M10.5t — `PositionInfo.playhead_secs_unclamped` added so
+///       the Apple shell can render a real platter's lead-in /
+///       lead-out groove when a scratch pushes the playhead
+///       outside `[0, duration_secs]` (PRD §6.1 / §9.6).
+pub const FFI_VERSION: u32 = 14;
 
 /// Returns a static greeting string. The Apple shell calls this on launch
 /// to verify it linked the Rust core successfully.
@@ -892,6 +911,69 @@ impl DubEngine {
         running.handle.deck(idx).pause().map_err(map_command_error)
     }
 
+    /// Set deck `deck_idx`'s **musical** playback rate (M10.5s).
+    ///
+    /// `1.0` = normal forward at the track's native pitch. `2.0` =
+    /// double-speed forward (octave up). `-1.0` = reverse at unity
+    /// (rewinding at native speed). `0.0` = playhead frozen (deck
+    /// still consumes audio frames but produces a constant sample —
+    /// see the mouse-scratch UI for the gate that pauses the deck
+    /// on prolonged near-zero rates so the user doesn't hear a DC
+    /// thump).
+    ///
+    /// **Sample-rate conversion is done here.** The user supplies a
+    /// rate in "audio seconds per real second" (= musical speed);
+    /// the engine internally drives source frames per output frame.
+    /// We multiply by `track_sr / engine_sr` so callers don't have
+    /// to know about engine SR. When no track is loaded we still
+    /// send the command — the engine treats it as a no-op so the UI
+    /// doesn't have to special-case empty decks.
+    ///
+    /// **Timecode-mode interaction.** Without Panic Play the
+    /// timecode driver overwrites the rate every block, so this
+    /// call is effectively a one-block hint that disappears
+    /// immediately. To drive rate from outside the timecode pipeline
+    /// (e.g. mouse-scratch) callers must engage [`Self::panic_play`]
+    /// first; that decouples the deck from the platter and lets
+    /// `set_deck_rate` stick. The scratch state machine in the
+    /// Apple shell does exactly this.
+    ///
+    /// Cheap: one SPSC channel push to the audio thread.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::play`].
+    pub fn set_deck_rate(&self, deck_idx: u64, rate: f64) -> Result<(), EngineError> {
+        let idx = deck_idx_to_usize(deck_idx)?;
+        let mut state = lock_state(&self.state);
+        let EngineState::Running(running) = &mut *state else {
+            return Err(EngineError::EngineNotRunning);
+        };
+
+        // SR conversion: convert musical rate (audio_secs / real_sec)
+        // into source frames per output frame. When the track SR
+        // isn't yet known we send the musical rate as-is; the deck's
+        // own resampler will handle the engine-side rate either way.
+        let engine_rate = match running.file_tracks[idx].as_ref() {
+            Some(track) => {
+                let track_sr = f64::from(track.sample_rate());
+                let engine_sr = f64::from(running.sample_rate);
+                if engine_sr > 0.0 {
+                    rate * track_sr / engine_sr
+                } else {
+                    rate
+                }
+            }
+            None => rate,
+        };
+
+        running
+            .handle
+            .deck(idx)
+            .set_rate(engine_rate)
+            .map_err(map_command_error)
+    }
+
     /// M10.6b Panic-Play engage (PRD §6.1.2).
     ///
     /// Tells the engine to ignore the deck's timecode input until
@@ -1031,14 +1113,16 @@ impl DubEngine {
         } else {
             0.0
         };
-        let elapsed_secs = if sr > 0.0 {
-            (snap.position_frames / sr).max(0.0).min(duration_secs)
+        let playhead_secs_unclamped = if sr > 0.0 {
+            snap.position_frames / sr
         } else {
             0.0
         };
+        let elapsed_secs = playhead_secs_unclamped.max(0.0).min(duration_secs);
         let remaining_secs = (duration_secs - elapsed_secs).max(0.0);
         PositionInfo {
             elapsed_secs,
+            playhead_secs_unclamped,
             remaining_secs,
             duration_secs,
             is_playing: snap.is_playing,
@@ -1063,8 +1147,8 @@ impl DubEngine {
         let running = state.as_running()?;
         let track = running.file_tracks[idx].as_ref()?;
         Some(TrackInfo {
-            title: String::new(),
-            artist: String::new(),
+            title: track.title().unwrap_or_default().to_string(),
+            artist: track.artist().unwrap_or_default().to_string(),
             duration_secs: track.duration_seconds(),
             sample_rate: track.sample_rate(),
             channels: u32::from(track.channels()),
@@ -1416,7 +1500,22 @@ impl EngineState {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PositionInfo {
     /// Wall-clock seconds elapsed from track start (≥ 0, ≤ duration).
+    /// Clamped for safe use in time displays and seek targets that
+    /// must stay inside the track. Renderers that want to draw the
+    /// playhead in a lead-in / lead-out empty-groove region should
+    /// read [`Self::playhead_secs_unclamped`] instead.
     pub elapsed_secs: f64,
+    /// M10.5t. Raw playhead position in seconds, NOT clamped to
+    /// `[0, duration_secs]`. Goes negative when the user has
+    /// scratched the deck backwards past the start of the file,
+    /// and exceeds `duration_secs` when scratching past the end.
+    /// The audio thread is already happy to render silence outside
+    /// the track's frame range ([`Deck::read_stereo_at`] returns
+    /// `(0, 0)` there); this field lets the UI mirror that
+    /// behaviour visually instead of pinning the playhead bracket
+    /// to the nearest edge. Time-display consumers should keep
+    /// using `elapsed_secs`.
+    pub playhead_secs_unclamped: f64,
     /// Wall-clock seconds remaining until track end (≥ 0).
     pub remaining_secs: f64,
     /// Wall-clock total track duration (= `track.frames /
@@ -1446,6 +1545,7 @@ pub struct PositionInfo {
 impl PositionInfo {
     const EMPTY: Self = Self {
         elapsed_secs: 0.0,
+        playhead_secs_unclamped: 0.0,
         remaining_secs: 0.0,
         duration_secs: 0.0,
         is_playing: false,
@@ -1502,17 +1602,20 @@ impl BeatGrid {
     // straight field copy with `beats_per_bar: u32::from(g.beats_per_bar)`.
 }
 
-/// Metadata for a File-mode loaded track (M10.5).
+/// Metadata for a File-mode loaded track (M10.5 / M10.5r).
 ///
-/// Returned by [`DubEngine::track_info`]. Title / artist are
-/// best-effort and may be empty in M10.5 (M11 will plumb them from
-/// library metadata or codec tags).
+/// Returned by [`DubEngine::track_info`]. Title / artist are read
+/// from the container's tag block at load time (ID3v2 / MP4 atoms /
+/// Vorbis comments / RIFF INFO depending on format). Empty strings
+/// mean "no tag of that kind present"; the Apple shell falls back
+/// to the file stem in that case.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TrackInfo {
-    /// Track title. Empty in M10.5 (M11 plumbs this from library /
-    /// codec metadata).
+    /// Track title read from container metadata. Empty when the
+    /// file is untagged.
     pub title: String,
-    /// Artist. Empty in M10.5; same plumbing target as `title`.
+    /// Track artist read from container metadata. Empty when the
+    /// file is untagged.
     pub artist: String,
     /// Total duration in seconds.
     pub duration_secs: f64,
@@ -1524,6 +1627,75 @@ pub struct TrackInfo {
     /// `None` in M10.5 (M11 / M11.5 will run analysis at load time
     /// or pull from the library).
     pub bpm: Option<f64>,
+}
+
+/// Stateless tag snapshot for a file on disk (M10.5r).
+///
+/// Returned by [`read_track_metadata`]. Lets the Apple shell's
+/// library / file-browser show title + artist next to each row
+/// without paying the full decode-into-RAM cost a `load_track`
+/// requires. Empty strings mean "no tag of that kind present" in
+/// the container.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrackMetadata {
+    /// Track title (ID3 `TIT2` / Vorbis `TITLE` / MP4 `©nam` / RIFF
+    /// `INAM`). Empty if the container has no title tag.
+    pub title: String,
+    /// Track artist (ID3 `TPE1` / Vorbis `ARTIST` / MP4 `©ART` /
+    /// RIFF `IART`). Falls back to the album-artist tag (`TPE2`)
+    /// when only that is present. Empty when neither is present.
+    pub artist: String,
+    /// Album name. Empty when not tagged. Reserved for the M11
+    /// library import — the M10.5r browser doesn't render this
+    /// yet, but the field is plumbed through so the library work
+    /// doesn't have to bump `FFI_VERSION` again.
+    pub album: String,
+}
+
+impl TrackMetadata {
+    /// `true` when no tag field carries text. The Apple shell uses
+    /// this to fall back to the file stem on the file-browser row.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_empty() && self.artist.is_empty() && self.album.is_empty()
+    }
+
+    fn from_io(io: IoTrackMetadata) -> Self {
+        Self {
+            title: io.title.unwrap_or_default(),
+            artist: io.artist.unwrap_or_default(),
+            album: io.album.unwrap_or_default(),
+        }
+    }
+}
+
+/// Read tag metadata for a file on disk without decoding samples
+/// (M10.5r).
+///
+/// Used by the Apple shell's file browser to populate per-row
+/// title / artist columns. Cheap: opens the file, reads the
+/// container's tag block, closes the file. ~1 ms per typical
+/// MP3 / FLAC on a warm filesystem.
+///
+/// Returns `None` when:
+///
+/// * `path` is unreadable or doesn't exist
+/// * the file is in a format symphonia can't probe
+/// * the file has no recognised tags at all (otherwise an empty
+///   `TrackMetadata` would force callers to add a second `is_empty`
+///   check; returning `None` lets the caller treat both cases as
+///   "no metadata to render" in a single conditional)
+///
+/// Off-RT only — opens a file handle, allocates inside symphonia.
+/// Never call from the audio thread.
+#[uniffi::export]
+#[must_use]
+pub fn read_track_metadata(path: String) -> Option<TrackMetadata> {
+    match read_track_metadata_from_disk(&path) {
+        Ok(io) if io.is_empty() => None,
+        Ok(io) => Some(TrackMetadata::from_io(io)),
+        Err(_) => None,
+    }
 }
 
 /// Helper: lock the engine-state mutex, recovering from a poisoned
@@ -1799,7 +1971,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffi_version_is_eleven_after_filtered_peaks() {
+    fn ffi_version_is_fourteen_after_unclamped_playhead() {
         // Bump tripwire: M10-A 1→2 (DubEngine), M10.1 2→3
         // (sample_rate), M10.2 3→4 (start_thru_two_deck), M10.5 4→5
         // (start_engine, load_track, play, pause, seek, position,
@@ -1813,8 +1985,14 @@ mod tests {
         // M10.5p 9→10 (beat_grid + BeatGrid record),
         // M10.5p Stage 3 10→11 (filtered_peaks_len /
         // filtered_peaks_extend / filtered_peaks_chunk_duration_secs
-        // + FilteredPeakChunk wire format).
-        assert_eq!(FFI_VERSION, 11);
+        // + FilteredPeakChunk wire format),
+        // M10.5r 11→12 (read_track_metadata + TrackMetadata record;
+        // TrackInfo.title / TrackInfo.artist now populated from
+        // container tags),
+        // M10.5s 12→13 (set_deck_rate — mouse-scratch primitive),
+        // M10.5t 13→14 (PositionInfo.playhead_secs_unclamped — UI
+        // shell can render lead-in / lead-out empty-groove regions).
+        assert_eq!(FFI_VERSION, 14);
     }
 
     #[test]

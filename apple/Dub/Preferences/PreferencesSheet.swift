@@ -32,13 +32,37 @@ struct PreferencesSheet: View {
             } else {
                 prepModeNote
             }
+            loadBehaviourSection
             Spacer(minLength: 0)
             Divider()
             footer
         }
         .padding(DubSpacing.xl)
-        .frame(width: 520, height: 540)
+        .frame(width: 520, height: 600)
         .background(DubColor.surface0)
+    }
+
+    /// Load-into-playing-deck guard toggle (M10.5r). PRD §5.5 + §6.4
+    /// default the engine to refusing a load on a running deck; this
+    /// toggle lets the user opt out of the safety rule in
+    /// Performance mode. The note explicitly calls out that Prep
+    /// mode is unaffected — Prep is a single-deck rehearsal shell
+    /// where the rule never applied.
+    private var loadBehaviourSection: some View {
+        section(title: "TRACK LOADING") {
+            VStack(alignment: .leading, spacing: DubSpacing.xs) {
+                Toggle(isOn: $model.allowLoadIntoRunningDeckInPerformance) {
+                    Text("Allow loading onto a playing deck (Performance mode)")
+                        .font(DubFont.body)
+                        .foregroundStyle(DubColor.textPrimary)
+                }
+                .toggleStyle(.switch)
+                Text("When off, a drop / Space-load onto a deck that is currently playing flashes the pane red — the DJ has to lift the needle or pause first (PRD §5.5). Prep mode always allows the load regardless of this setting.")
+                    .font(DubFont.micro)
+                    .foregroundStyle(DubColor.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var modeSection: some View {

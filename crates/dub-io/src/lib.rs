@@ -15,7 +15,7 @@
 
 mod track;
 
-pub use track::{LoadError, Track};
+pub use track::{read_metadata, LoadError, Track, TrackMetadata};
 
 /// Library version reported by the crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

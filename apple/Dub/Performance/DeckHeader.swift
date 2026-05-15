@@ -104,10 +104,30 @@ struct DeckHeaderState: Equatable {
         case loading
     }
 
-    struct TimeRow: Equatable {
-        let elapsedText: String   // "01:23"
-        let totalText: String     // "03:45"
-        let remainingText: String // "-02:22"
+    /// Time-row layout the deck header should render (M10.5r).
+    ///
+    /// Two variants. **Performance mode** shows only the remaining
+    /// time — the DJ's "30 seconds left to mix" cue (PRD §6.1). The
+    /// header is space-constrained in the two-deck split and the
+    /// total + elapsed values aren't actionable mid-set, so we
+    /// drop them. **Prep mode** shows both elapsed and remaining
+    /// because the rehearsal surface has the screen real-estate
+    /// and the DJ uses elapsed time for hot-cue placement.
+    enum TimeRow: Equatable {
+        /// Performance-mode minimal display: `"-02:22"` only.
+        case remainingOnly(remainingText: String)
+        /// Prep-mode full display: `"01:23 · -02:22"`.
+        case elapsedAndRemaining(elapsedText: String, remainingText: String)
+
+        /// True when the time row should render at all. Equivalent
+        /// to the old `timeRow != nil` check; kept on the enum so
+        /// callers don't have to pattern-match in three places.
+        var hasTime: Bool {
+            switch self {
+            case .remainingOnly: return true
+            case .elapsedAndRemaining: return true
+            }
+        }
     }
 
     /// Convenience: idle / cold-launch state.
@@ -156,7 +176,7 @@ struct DeckHeader: View {
         VStack(alignment: .leading, spacing: DubSpacing.sm) {
             row1
             row2
-            if let time = state.timeRow {
+            if let time = state.timeRow, time.hasTime {
                 timeRow(time)
             }
         }
@@ -220,19 +240,21 @@ struct DeckHeader: View {
     private func timeRow(_ time: DeckHeaderState.TimeRow) -> some View {
         HStack(spacing: DubSpacing.md) {
             transportGlyphs
-            Text(time.elapsedText)
-                .font(DubFont.numericInline)
-                .foregroundStyle(DubColor.textPrimary)
-            Text("/")
-                .font(DubFont.numericInline)
-                .foregroundStyle(DubColor.textTertiary)
-            Text(time.totalText)
-                .font(DubFont.numericInline)
-                .foregroundStyle(DubColor.textSecondary)
-            Spacer(minLength: 0)
-            Text(time.remainingText)
-                .font(DubFont.numericInline)
-                .foregroundStyle(DubColor.textSecondary)
+            switch time {
+            case .remainingOnly(let remainingText):
+                Spacer(minLength: 0)
+                Text(remainingText)
+                    .font(DubFont.numericInline)
+                    .foregroundStyle(DubColor.textPrimary)
+            case .elapsedAndRemaining(let elapsedText, let remainingText):
+                Text(elapsedText)
+                    .font(DubFont.numericInline)
+                    .foregroundStyle(DubColor.textPrimary)
+                Spacer(minLength: 0)
+                Text(remainingText)
+                    .font(DubFont.numericInline)
+                    .foregroundStyle(DubColor.textSecondary)
+            }
         }
         .monospacedDigit()
     }
@@ -474,15 +496,31 @@ extension DeckHeaderState {
     /// Build a header state from the model's per-deck snapshot plus
     /// the engine-wide flags. Keeps all derivation in one place so
     /// the view stays declarative.
+    ///
+    /// `prepMode` controls the time-row variant (M10.5r): Prep mode
+    /// gets `elapsedAndRemaining`, Performance mode gets
+    /// `remainingOnly`. The DJ asked for the minimal "-MM:SS" cue
+    /// in Performance because the two-deck split is space-tight,
+    /// and the full elapsed-vs-remaining split in Prep because the
+    /// single-deck rehearsal surface has the screen real-estate.
     static func from(
         side: DeckSide,
         deckState: DeckState,
         engineRunning: Bool,
         deckEnabled: Bool,
         thruMode: Bool,
-        isMaster: Bool
+        isMaster: Bool,
+        prepMode: Bool
     ) -> DeckHeaderState {
         guard engineRunning, deckEnabled else { return .idle }
+
+        // Title comes from container tag metadata when present,
+        // falling back to the file stem (DeckState.displayName) so
+        // an untagged file still reads as "what did I just load".
+        // Artist is tag-only — no "Artist Unknown" placeholder; the
+        // header just hides the chip on untagged files.
+        let resolvedTitle = deckState.trackTitle ?? deckState.displayName
+        let resolvedArtist = deckState.trackArtist
 
         // M10.5d: cold load (no previous track) — render the
         // header with the new title + LOADING pill but no time row
@@ -493,7 +531,7 @@ extension DeckHeaderState {
             return DeckHeaderState(
                 isLive: true,
                 source: .loading,
-                trackTitle: deckState.displayName,
+                trackTitle: resolvedTitle,
                 trackArtist: nil,
                 formatChip: nil,
                 timeRow: nil,
@@ -504,10 +542,15 @@ extension DeckHeaderState {
         }
 
         if deckState.hasTrack {
-            let time = DeckHeaderState.TimeRow(
-                elapsedText: DeckTimeFormat.format(deckState.elapsedSecs),
-                totalText:   DeckTimeFormat.format(deckState.durationSecs),
-                remainingText: DeckTimeFormat.format(deckState.remainingSecs, signed: true))
+            let time: DeckHeaderState.TimeRow
+            if prepMode {
+                time = .elapsedAndRemaining(
+                    elapsedText: DeckTimeFormat.format(deckState.elapsedSecs),
+                    remainingText: DeckTimeFormat.format(deckState.remainingSecs, signed: true))
+            } else {
+                time = .remainingOnly(
+                    remainingText: DeckTimeFormat.format(deckState.remainingSecs, signed: true))
+            }
             // M10.6c: in Timecode mode + Panic Play engaged, the
             // source pill flips from FILE → TC · HOLD (PRD §6.1.2).
             // M10.5d: a replace-load (new file decoded while the
@@ -529,8 +572,8 @@ extension DeckHeaderState {
             return DeckHeaderState(
                 isLive: true,
                 source: source,
-                trackTitle: deckState.displayName,
-                trackArtist: nil,
+                trackTitle: resolvedTitle,
+                trackArtist: resolvedArtist,
                 formatChip: deckState.formatChip,
                 timeRow: time,
                 isMaster: isMaster,
@@ -597,18 +640,31 @@ extension DeckHeaderState {
         .padding()
 }
 
-#Preview("Deck B — File, mid-track") {
+#Preview("Deck B — File, mid-track (Performance)") {
     DeckHeader(side: .b, state: DeckHeaderState(
         isLive: true, source: .file,
         trackTitle: "Stakes Is High",
-        trackArtist: nil,
+        trackArtist: "De La Soul",
         formatChip: "MP3 · 44.1 kHz · stereo",
-        timeRow: DeckHeaderState.TimeRow(
-            elapsedText: "01:23",
-            totalText: "03:45",
-            remainingText: "-02:22"),
+        timeRow: .remainingOnly(remainingText: "-02:22"),
         isMaster: false, isPlaying: true,
         isPanicPlay: false, useTimecodeToggle: true))
+        .frame(width: 720)
+        .background(DubColor.surface0)
+        .padding()
+}
+
+#Preview("Deck A — File, mid-track (Prep)") {
+    DeckHeader(side: .a, state: DeckHeaderState(
+        isLive: true, source: .file,
+        trackTitle: "Stakes Is High",
+        trackArtist: "De La Soul",
+        formatChip: "MP3 · 44.1 kHz · stereo",
+        timeRow: .elapsedAndRemaining(
+            elapsedText: "01:23",
+            remainingText: "-02:22"),
+        isMaster: true, isPlaying: true,
+        isPanicPlay: false, useTimecodeToggle: false))
         .frame(width: 720)
         .background(DubColor.surface0)
         .padding()
@@ -620,10 +676,7 @@ extension DeckHeaderState {
         trackTitle: "Stakes Is High",
         trackArtist: nil,
         formatChip: "MP3 · 44.1 kHz · stereo",
-        timeRow: DeckHeaderState.TimeRow(
-            elapsedText: "01:23",
-            totalText: "03:45",
-            remainingText: "-02:22"),
+        timeRow: .remainingOnly(remainingText: "-02:22"),
         isMaster: true, isPlaying: true,
         isPanicPlay: true, useTimecodeToggle: true))
         .frame(width: 720)

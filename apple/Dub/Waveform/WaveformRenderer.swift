@@ -453,26 +453,40 @@ final class WaveformRenderer: NSObject {
         let drawnBelowPixels = futurePixels / pixelsPerDrawnColumn
         let agg = Int(WaveformRenderer.chunksPerColumn)
 
-        // Playhead chunk + chunks past it.
+        // Playhead chunk + chunks past it. In File mode this is
+        // computed off the *unclamped* playhead seconds so a hard
+        // mouse-scratch can push the playhead into the empty-groove
+        // region before `t = 0` or after `t = duration_secs` and
+        // the bars slide past the playhead naturally (PRD §9.6
+        // "Empty-groove rendering at track edges"). The variable
+        // is signed so that the ring-offset math below stays
+        // well-defined on negative global chunk indices.
         let pos = engine.position(deckIdx: deckIdx)
         let peaksLenGlobal = totalChunksAppended
         let hasFuture = pos.hasTrack
-        let playheadChunk: UInt64
+        let playheadChunkSigned: Int64
         if hasFuture {
-            // File mode. Map elapsed seconds → chunk via the exact
-            // f64 chunk duration to bypass the integer-rounded
-            // ~0.5 %-per-chunk drift the old code accumulated.
             if peakChunkDurationSecs > 0 {
-                let chunkF = (pos.elapsedSecs / peakChunkDurationSecs).rounded(.down)
-                let chunkClamped = max(0.0, min(chunkF, Double(peaksLenGlobal &- 1)))
-                playheadChunk = UInt64(chunkClamped)
+                let chunkF = (pos.playheadSecsUnclamped / peakChunkDurationSecs).rounded(.down)
+                playheadChunkSigned = Int64(max(-Double(Int64.max / 2),
+                                                min(Double(Int64.max / 2), chunkF)))
             } else {
-                playheadChunk = peaksLenGlobal == 0 ? 0 : peaksLenGlobal &- 1
+                playheadChunkSigned = peaksLenGlobal == 0 ? 0 : Int64(peaksLenGlobal &- 1)
             }
         } else {
-            // Thru mode (or empty deck). The newest chunk is the
-            // playhead.
-            playheadChunk = peaksLenGlobal == 0 ? 0 : peaksLenGlobal &- 1
+            playheadChunkSigned = peaksLenGlobal == 0 ? 0 : Int64(peaksLenGlobal &- 1)
+        }
+        // Legacy unsigned variant for code paths that only ever
+        // address inside `[0, peaksLen)` (e.g. the
+        // chunksAvailableBehind / Ahead fall-back). Clamped here
+        // so the legacy paths never see a negative chunk index.
+        let playheadChunkClamped: UInt64
+        if playheadChunkSigned <= 0 {
+            playheadChunkClamped = 0
+        } else if UInt64(playheadChunkSigned) >= peaksLenGlobal && peaksLenGlobal > 0 {
+            playheadChunkClamped = peaksLenGlobal &- 1
+        } else {
+            playheadChunkClamped = UInt64(playheadChunkSigned)
         }
 
         let chunksAvailableBehind: Int
@@ -481,23 +495,57 @@ final class WaveformRenderer: NSObject {
             chunksAvailableBehind = 0
             chunksAvailableAhead = 0
         } else {
-            chunksAvailableBehind = min(Int(playheadChunk) + 1, WaveformRenderer.chunkCapacity)
+            chunksAvailableBehind =
+                min(Int(playheadChunkClamped) + 1, WaveformRenderer.chunkCapacity)
             if hasFuture {
                 chunksAvailableAhead = min(
-                    Int(peaksLenGlobal &- 1 &- playheadChunk),
+                    Int(peaksLenGlobal &- 1 &- playheadChunkClamped),
                     WaveformRenderer.chunkCapacity)
             } else {
                 chunksAvailableAhead = 0
             }
         }
 
-        // Cap drawn columns by what's actually available, rounding
-        // down so the shader never reads partial-aggregation chunks
-        // past the end of the buffered region.
-        let drawnAbove =
-            max(0, min(drawnAbovePixels, chunksAvailableBehind / agg))
-        let drawnBelow =
-            max(0, min(drawnBelowPixels, chunksAvailableAhead / agg))
+        // Empty-groove headroom (PRD §9.6): when the ring buffer
+        // has enough unused (zero-initialised) slots past the
+        // loaded peak range, let the past and future regions draw
+        // their full pixel extent regardless of how close the
+        // playhead is to a track edge. Slots ≥ `peaksLenGlobal`
+        // are guaranteed zero by `reset()` + the bounded
+        // `ingestNewChunks` writer, and so are the slots reached
+        // by wrapping the past region's chunk index below 0 (they
+        // fall in the same `[peaksLen, chunkCapacity)` zero zone
+        // when there is enough headroom). The shader then renders
+        // those columns as flat silence — the visual "empty
+        // groove" before a track's first frame and after its
+        // last, mirroring a real platter's lead-in / lead-out and
+        // letting the user push the playhead off the edges of the
+        // track without the past/future regions collapsing.
+        //
+        // The condition needs to keep both edges' worth of
+        // headroom clear; tracks long enough to violate it
+        // (typically > ~25 min at the broadband 64-sample chunk
+        // cadence) fall back to the pre-existing collapse-at-
+        // edges behaviour rather than risk wrapping a column back
+        // into real loaded data.
+        let drawnAboveFull = max(0, drawnAbovePixels)
+        let drawnBelowFull = max(0, drawnBelowPixels)
+        let neededHeadroom =
+            UInt64(drawnAboveFull * agg + drawnBelowFull * agg) &+ peaksLenGlobal
+        let zeroPadFits =
+            hasFuture
+            && peaksLenGlobal > 0
+            && neededHeadroom < UInt64(WaveformRenderer.chunkCapacity)
+
+        let drawnAbove: Int
+        let drawnBelow: Int
+        if zeroPadFits {
+            drawnAbove = drawnAboveFull
+            drawnBelow = drawnBelowFull
+        } else {
+            drawnAbove = max(0, min(drawnAbovePixels, chunksAvailableBehind / agg))
+            drawnBelow = max(0, min(drawnBelowPixels, chunksAvailableAhead / agg))
+        }
         // Raw chunk count behind the playhead — needed to derive
         // the past region's `chunkOffset`. The future region starts
         // at `playheadChunk + 1` regardless of aggregation, so no
@@ -515,24 +563,59 @@ final class WaveformRenderer: NSObject {
         // Per-region chunk + band offsets. The shader's vertex
         // stage addresses raw chunks as `chunkOffset + chunkInWindow
         // × chunksPerColumn`, so `chunkOffset` is in *raw* units
-        // here.
-        let pastFirstGlobal: UInt64 =
-            (playheadChunk &+ 1) &- UInt64(rawAbove)
-        let pastFirstRingOffset =
-            Int(pastFirstGlobal % UInt64(WaveformRenderer.chunkCapacity))
-        let futureFirstGlobal: UInt64 = playheadChunk &+ 1
-        let futureFirstRingOffset =
-            Int(futureFirstGlobal % UInt64(WaveformRenderer.chunkCapacity))
+        // here. The signed-Int64 arithmetic + Euclidean modulo lets
+        // negative global chunk indices (playhead pushed past the
+        // start of the file) and overshoot indices (playhead past
+        // the end) wrap into the zero-initialised tail of the ring
+        // buffer rather than aliasing into loaded peak data. See
+        // §9.6 "Empty-groove rendering at track edges" + the
+        // `zeroPadFits` headroom check above for why this is safe
+        // for tracks ≤ ~25 min at the broadband chunk cadence.
+        let capacitySigned = Int64(WaveformRenderer.chunkCapacity)
+        let bandCapacitySigned = Int64(WaveformRenderer.bandChunkCapacity)
+        let bandPerSampleSigned = max(Int64(samplesPerBandChunk), 1)
+        let samplesPerPeakSigned = Int64(samplesPerPeakChunk)
 
-        let bandPerSample = max(UInt64(samplesPerBandChunk), 1)
-        let pastFirstSample = pastFirstGlobal &* UInt64(samplesPerPeakChunk)
-        let pastFirstBandGlobal = pastFirstSample / bandPerSample
+        func euclideanMod(_ value: Int64, _ modulus: Int64) -> Int {
+            let raw = value % modulus
+            return Int(raw < 0 ? raw + modulus : raw)
+        }
+
+        let pastFirstGlobalSigned: Int64 =
+            (playheadChunkSigned &+ 1) &- Int64(rawAbove)
+        let pastFirstRingOffset =
+            euclideanMod(pastFirstGlobalSigned, capacitySigned)
+        let futureFirstGlobalSigned: Int64 = playheadChunkSigned &+ 1
+        let futureFirstRingOffset =
+            euclideanMod(futureFirstGlobalSigned, capacitySigned)
+
+        let pastFirstSampleSigned =
+            pastFirstGlobalSigned &* samplesPerPeakSigned
+        // Signed `/` rounds toward zero, but we need floor for the
+        // band index so a negative `pastFirstSampleSigned` maps to
+        // the band chunk *containing* it (the slot the ring would
+        // hold if the band stream extended into negative time).
+        // Without the floor adjustment we'd round toward 0 and
+        // sample one slot *closer* to 0 than the broadband region
+        // does, breaking the band ↔ broadband alignment by one
+        // chunk on the very first column of the empty-groove
+        // region.
+        let pastFirstBandGlobalSigned: Int64 = {
+            let q = pastFirstSampleSigned / bandPerSampleSigned
+            let r = pastFirstSampleSigned % bandPerSampleSigned
+            return (r < 0) ? (q - 1) : q
+        }()
         let pastFirstBandRingOffset =
-            Int(pastFirstBandGlobal % UInt64(WaveformRenderer.bandChunkCapacity))
-        let futureFirstSample = futureFirstGlobal &* UInt64(samplesPerPeakChunk)
-        let futureFirstBandGlobal = futureFirstSample / bandPerSample
+            euclideanMod(pastFirstBandGlobalSigned, bandCapacitySigned)
+        let futureFirstSampleSigned =
+            futureFirstGlobalSigned &* samplesPerPeakSigned
+        let futureFirstBandGlobalSigned: Int64 = {
+            let q = futureFirstSampleSigned / bandPerSampleSigned
+            let r = futureFirstSampleSigned % bandPerSampleSigned
+            return (r < 0) ? (q - 1) : q
+        }()
         let futureFirstBandRingOffset =
-            Int(futureFirstBandGlobal % UInt64(WaveformRenderer.bandChunkCapacity))
+            euclideanMod(futureFirstBandGlobalSigned, bandCapacitySigned)
 
         // 3. Fill both region slots in the per-frame uniform buffer.
         //

@@ -67,10 +67,19 @@ struct DeckState: Equatable {
     /// §6.1.3.
     var atEnd: Bool = false
 
-    /// Filename stem of the loaded track. Title / artist tags are
-    /// M11 work — for M10.5b we show the file basename so the DJ
-    /// can tell which track they loaded.
+    /// Filename stem of the loaded track. Used as the deck-header
+    /// title fallback when the container has no ID3 / Vorbis /
+    /// MP4 title tag.
     var displayName: String? = nil
+
+    /// Track title parsed from the container's tag block (M10.5r).
+    /// `nil` when the file is untagged — the deck header falls
+    /// back to `displayName`.
+    var trackTitle: String? = nil
+
+    /// Track artist parsed from the container's tag block (M10.5r).
+    /// `nil` when the file is untagged.
+    var trackArtist: String? = nil
 
     /// Format / SR chip ("MP3 · 44.1 kHz · 2 ch"). `nil` until a
     /// track loads.
@@ -80,7 +89,23 @@ struct DeckState: Equatable {
     var durationSecs: Double = 0
 
     /// Wall-clock elapsed from track start. 0 if no track.
+    /// Clamped to `[0, durationSecs]` so it's safe to use in time
+    /// displays and as a seek target. The waveform renderer uses
+    /// `playheadSecsUnclamped` instead so the playhead can drift
+    /// into the lead-in / lead-out empty groove during a hard
+    /// scratch off either edge (PRD §6.1 / §9.6).
     var elapsedSecs: Double = 0
+
+    /// M10.5t. Raw playhead position in seconds, NOT clamped to
+    /// `[0, durationSecs]`. Goes negative when a mouse-scratch
+    /// has pushed the deck backwards past `t = 0`, and exceeds
+    /// `durationSecs` when it has been pushed past the end. The
+    /// audio thread already renders silence outside the track's
+    /// frame range; this field lets the waveform render the
+    /// playhead in the empty-groove region instead of pinning it
+    /// to the nearest edge. **Only the renderer should read it.**
+    /// Time-display consumers stay on `elapsedSecs`.
+    var playheadSecsUnclamped: Double = 0
 
     /// Wall-clock remaining to track end. 0 if no track.
     var remainingSecs: Double = 0
@@ -154,6 +179,31 @@ final class WaveformAppModel: ObservableObject {
     /// computed at launch; user can override in Preferences.
     @Published var engineMode: EngineMode = .timecode
 
+    /// Allow loading a track onto a *playing* deck while in
+    /// Performance / Timecode mode. The PRD's default policy (§5.5,
+    /// §6.4) is "no — the DJ must lift the needle / pause first",
+    /// surfaced as a 200 ms red flash on the rejected pane. Some
+    /// users want the rule relaxed (e.g. they're rehearsing
+    /// transitions and want to drop a new file mid-play without
+    /// pausing first). This toggle lets them opt out of the safety
+    /// rule. **Prep mode always allows it** regardless of this
+    /// setting — Prep is a single-deck rehearsal shell where the
+    /// "deck is playing in front of a crowd" concern doesn't apply.
+    ///
+    /// Persisted in `UserDefaults` under
+    /// `dub.allowLoadIntoRunningDeckInPerformance`. The setting
+    /// applies on the next load attempt; in-flight loads are not
+    /// retroactively affected.
+    @Published var allowLoadIntoRunningDeckInPerformance: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                allowLoadIntoRunningDeckInPerformance,
+                forKey: Self.kAllowLoadIntoRunningDeck)
+        }
+    }
+
+    private static let kAllowLoadIntoRunningDeck = "dub.allowLoadIntoRunningDeckInPerformance"
+
     // MARK: Live engine state
 
     @Published private(set) var isRunning: Bool = false
@@ -206,6 +256,8 @@ final class WaveformAppModel: ObservableObject {
 
     init() {
         self.engine = DubEngine()
+        self.allowLoadIntoRunningDeckInPerformance =
+            UserDefaults.standard.bool(forKey: Self.kAllowLoadIntoRunningDeck)
         applyAutoDetect()
         // Only enumerate input devices when we actually need them
         // (Timecode mode). Prep mode never touches the input HAL,
@@ -398,6 +450,7 @@ final class WaveformAppModel: ObservableObject {
         next.atEnd = pos.atEnd
         next.durationSecs = pos.durationSecs
         next.elapsedSecs = pos.elapsedSecs
+        next.playheadSecsUnclamped = pos.playheadSecsUnclamped
         next.remainingSecs = pos.remainingSecs
         next.isPanicPlay = pos.isPanicPlay
         // Clear stale error flash once it elapses; the deck pane
@@ -443,11 +496,20 @@ final class WaveformAppModel: ObservableObject {
 
     /// Load a track onto `side` (M10.5d background-load).
     ///
-    /// Refuses (and red-flashes the deck pane) if the target deck
-    /// is currently playing (PRD §5.5 + §6.4 — the user must lift
-    /// the needle / pause first) **or** if another load is already
-    /// in flight on the same deck (avoids racing two decoders
-    /// against each other and stomping the deck's `Arc<Track>`).
+    /// **Refuses (and red-flashes the deck pane) when** the target
+    /// deck is currently playing **and** the load-into-playing-deck
+    /// guard is active (PRD §5.5 + §6.4 — the user must lift the
+    /// needle / pause first). M10.5r relaxed the guard:
+    ///
+    /// * Prep mode always allows the load — Prep is a single-deck
+    ///   rehearsal shell, not a stage workflow.
+    /// * Performance / Timecode mode respects
+    ///   `allowLoadIntoRunningDeckInPerformance` — the user opts in
+    ///   from Preferences if they want to drop tracks mid-play.
+    ///
+    /// Also refuses when another load is already in flight on the
+    /// same deck (avoids racing two decoders against each other
+    /// and stomping the deck's `Arc<Track>`).
     ///
     /// **Concurrency.** `engine.loadTrack` is the Rust FFI, which
     /// in M10.5d does its decode + offline-peaks compute outside
@@ -471,7 +533,7 @@ final class WaveformAppModel: ObservableObject {
             return false
         }
         let target = state(for: side)
-        if target.isPlaying {
+        if target.isPlaying, !canLoadIntoPlayingDeck() {
             flashLoadError(side: side)
             return false
         }
@@ -481,12 +543,17 @@ final class WaveformAppModel: ObservableObject {
             return false
         }
 
-        // Optimistic UI: header pill flips to LOADING + new title
-        // appears before the decode work starts.
+        // Optimistic UI: header pill flips to LOADING + new file
+        // basename appears before the decode work starts. We clear
+        // the old tag-derived title / artist so the header doesn't
+        // show stale metadata from the previous track during the
+        // ~50 ms decode window.
         var starting = target
         starting.isLoading = true
         starting.sourceURL = url
         starting.displayName = url.deletingPathExtension().lastPathComponent
+        starting.trackTitle = nil
+        starting.trackArtist = nil
         starting.errorFlashUntil = nil
         setState(starting, for: side)
 
@@ -513,6 +580,8 @@ final class WaveformAppModel: ObservableObject {
             if let info = engine.trackInfo(deckIdx: deckIdx) {
                 next.durationSecs = info.durationSecs
                 next.formatChip = formatChip(for: url, info: info)
+                next.trackTitle = info.title.isEmpty ? nil : info.title
+                next.trackArtist = info.artist.isEmpty ? nil : info.artist
             }
             setState(next, for: side)
             recomputeMaster()
@@ -562,11 +631,22 @@ final class WaveformAppModel: ObservableObject {
         }
         let candidate = spaceLoadTarget()
         let target = state(for: candidate)
-        if target.isPlaying {
+        if target.isPlaying, !canLoadIntoPlayingDeck() {
             flashLoadError(side: candidate)
             return
         }
         _ = await loadTrack(side: candidate, url: url)
+    }
+
+    /// `true` when a load is allowed to land on a deck that is
+    /// currently playing. See `loadTrack(side:url:)` for the policy:
+    /// Prep mode always allows; Performance mode checks
+    /// `allowLoadIntoRunningDeckInPerformance`.
+    private func canLoadIntoPlayingDeck() -> Bool {
+        switch engineMode {
+        case .prep:     return true
+        case .timecode: return allowLoadIntoRunningDeckInPerformance
+        }
     }
 
     /// The deck Space-load targets in the current engine config.
@@ -644,16 +724,321 @@ final class WaveformAppModel: ObservableObject {
         let deck = state(for: side)
         guard deck.hasTrack, deck.durationSecs > 0 else { return }
         let target = max(0, min(deck.durationSecs, deck.elapsedSecs + relativeSecs))
+        seekDeck(side: side, absoluteSecs: target)
+    }
+
+    // MARK: - Vinyl-style mouse scratch (M10.5s)
+    //
+    // PRD §1 / §6.1 — the zoomed-waveform drag is a *scratch*
+    // gesture: audio plays only while the mouse is moving, and only
+    // at the rate the mouse is moving (left = reverse, right /
+    // down = forward). Mouse-still ⇒ silence, identical to a record
+    // sitting under a stationary stylus. The previous M10.5r
+    // implementation was a seek-and-play loop that ran the deck at
+    // 1× under the cursor — that violated the "feels like a
+    // turntable" expectation and is gone as of M10.5s.
+    //
+    // Implementation:
+    //
+    //   1. `scratchBegin(side:)` — capture pre-scratch transport.
+    //      In Timecode mode, engage Panic Play so the timecode
+    //      driver doesn't fight `setDeckRate` every block. Pin
+    //      `is_playing = true` (so the audio thread renders the
+    //      deck), `rate = 0` (so the playhead is frozen until the
+    //      first move). Spin up a 60 Hz polling timer.
+    //   2. `scratchPointerOffset(side:offsetSecs:)` — the view
+    //      reports the cursor's running offset (in audio seconds)
+    //      from the drag's start point. The timer reads this
+    //      between ticks; nothing else.
+    //   3. Timer tick — compute `rate = Δoffset / Δrealtime` since
+    //      the previous tick and `setDeckRate(rate)`. When the
+    //      mouse is held still both deltas collapse to ~0 and the
+    //      deck reads the same sample frame block-after-block,
+    //      which the platter de-click in the engine smooths to
+    //      silence.
+    //   4. `scratchEnd(side:)` — stop the timer, cancel Panic Play
+    //      (if we engaged it), restore the pre-scratch transport
+    //      (rate = 1.0, set_playing to whatever it was before).
+    //
+    // **Position drift.** We deliberately don't seek during the
+    // drag — the engine's own playhead integration accumulates
+    // `rate × block_size` per block, so position naturally tracks
+    // the cursor. Seeking every tick would fire a 2 ms de-click
+    // on every block (`set_position_frames` ramps amplitude to
+    // zero and back), turning the scratch into a tremolo. Drift
+    // is bounded by the rate-conversion accuracy of
+    // `set_deck_rate`'s SR math; in practice it's <10 ms over a
+    // multi-second scratch, well below the visual resolution of
+    // the waveform.
+
+    /// Per-deck scratch state. `nil` ⇒ no scratch in flight on
+    /// that side. Stored as a class so the polling timer's `[weak
+    /// self]` closure doesn't need to chase a per-side enum case
+    /// on every tick.
+    ///
+    /// M10.5t rework: the rate is now derived **per-event** in
+    /// `scratchPointerOffset(side:offsetSecs:)` from the elapsed
+    /// real-time since the previous event, then low-pass filtered
+    /// with an exponential moving average. The old 60 Hz polling
+    /// timer's aliasing (sampling a high-rate event stream at a
+    /// fixed cadence produced periodic rate spikes that read as
+    /// audible "jumping" — confirmed in pre-M10.5t dogfood) is
+    /// gone. The timer that remains is a low-rate watchdog whose
+    /// only job is to ramp the rate to zero when the cursor
+    /// stops moving (no `onChanged` event for > stallThresholdSecs)
+    /// so a stationary mouse plays silence like a stationary
+    /// platter.
+    private final class ScratchState {
+        let side: DeckSide
+        let priorIsPlaying: Bool
+        let engagedPanic: Bool
+        /// Most recent cursor offset (in audio seconds) reported
+        /// by the gesture overlay. Reset to 0 on begin.
+        var lastEventOffsetSecs: Double = 0
+        /// Wall-clock time of the most recent `scratchPointerOffset`
+        /// call. Used both to compute `Δt` for the per-event rate
+        /// and by the watchdog to detect "cursor still".
+        var lastEventAt: Date
+        /// Smoothed instantaneous rate. Updated by each gesture
+        /// event and ramped toward zero by the watchdog timer
+        /// when no event fires for a while. Cached so the
+        /// watchdog doesn't have to round-trip through the engine
+        /// to check what rate is currently in flight.
+        var smoothedRate: Double = 0
+
+        init(side: DeckSide, priorIsPlaying: Bool, engagedPanic: Bool, startedAt: Date) {
+            self.side = side
+            self.priorIsPlaying = priorIsPlaying
+            self.engagedPanic = engagedPanic
+            self.lastEventAt = startedAt
+        }
+    }
+
+    /// In-flight scratch per deck. Keyed by side so deck A and B
+    /// can be scratched independently (rare in practice — the
+    /// user has one mouse — but the model doesn't enforce
+    /// exclusivity, the view layer does).
+    private var scratchStates: [DeckSide: ScratchState] = [:]
+
+    /// Watchdog timer that ramps the rate toward zero on each
+    /// deck whose cursor has been still for longer than
+    /// `scratchStallThresholdSecs`. Runs only while ≥ 1 scratch
+    /// is in flight; lazily torn down by `scratchEnd`.
+    private var scratchTimer: Timer?
+    /// Watchdog fires at this cadence. Must be << the typical
+    /// gesture event rate so we don't fight the per-event rate
+    /// path on a steady drag, but fast enough that "cursor held
+    /// still after a fast scratch" responds within one perceptual
+    /// frame.
+    private static let scratchTickIntervalSecs: TimeInterval = 1.0 / 60.0
+    /// If no `scratchPointerOffset` event has fired within this
+    /// window, the watchdog treats the cursor as "still" and
+    /// ramps the deck's rate toward zero. 25 ms is comfortably
+    /// longer than the inter-arrival time of a smooth drag
+    /// (≈ 8–17 ms on a 60–120 Hz event stream) so a normal drag
+    /// never trips it, but short enough that letting go of a
+    /// pushed scratch produces immediate silence rather than
+    /// drifting at the last-seen velocity.
+    private static let scratchStallThresholdSecs: TimeInterval = 0.025
+    /// Per-event EMA factor applied to the instantaneous rate.
+    /// `0.35` was chosen empirically: high enough that fast
+    /// direction changes still feel direct (one event lands ~⅓ of
+    /// the new direction in the output rate), low enough that
+    /// single-event outliers from coalesced or jittered cursor
+    /// motion don't get punched through into the engine. Lower
+    /// values feel mushy / lagged; higher values reintroduce the
+    /// pre-M10.5t "jumping".
+    private static let scratchRateEMAAlpha: Double = 0.35
+    /// Multiplicative decay applied to the smoothed rate on each
+    /// watchdog tick when the cursor is still. Picked so the rate
+    /// halves in ~3 ticks (≈ 50 ms): fast enough to read as
+    /// "let go of the platter" but smooth enough that the engine
+    /// doesn't see a discontinuity that the platter de-click
+    /// might otherwise punch through to the speakers.
+    private static let scratchRateStallDecay: Double = 0.7
+
+    /// Begin a vinyl-style scratch on `side`. Captures the pre-
+    /// scratch transport, engages Panic Play (Timecode mode only),
+    /// freezes the playhead via `rate = 0` + `playing = true`, and
+    /// spins up the rate-from-velocity polling timer.
+    ///
+    /// Idempotent on a deck that's already scratching — the second
+    /// begin is a no-op so the lazy-begin pattern in the gesture
+    /// overlay (begin on every `onChanged` until we see one)
+    /// doesn't clobber the captured prior state.
+    func scratchBegin(side: DeckSide) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack else { return }
+        if scratchStates[side] != nil { return }
+
+        let prior = deck.isPlaying
+        var engagedPanic = false
+        if engineMode == .timecode && !deck.isPanicPlay {
+            // Decouple from the timecode driver so our setDeckRate
+            // sticks. `panic` updates `isPanicPlay` optimistically.
+            panic(side: side)
+            engagedPanic = true
+        }
+
         do {
-            try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: target)
+            try engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 0.0)
+        } catch {
+            surfaceError("Scratch start failed: \(error.localizedDescription)")
+            return
+        }
+
+        if !state(for: side).isPlaying {
+            do {
+                try engine.play(deckIdx: side.ffiDeckIdx)
+                var s = state(for: side)
+                s.isPlaying = true
+                setState(s, for: side)
+            } catch {
+                surfaceError("Scratch start failed: \(error.localizedDescription)")
+            }
+        }
+
+        scratchStates[side] = ScratchState(
+            side: side,
+            priorIsPlaying: prior,
+            engagedPanic: engagedPanic,
+            startedAt: Date())
+        ensureScratchTimerRunning()
+    }
+
+    /// Report the mouse cursor's running offset (in audio seconds)
+    /// from the scratch's start point. Positive = forward; negative
+    /// = reverse. Each call drives an immediate per-event rate
+    /// update so the engine never sees a 60 Hz-aliased velocity
+    /// (M10.5t — pre-rework this lived in `scratchTick` and produced
+    /// audible "jumping" when the event stream and the tick clock
+    /// beat against each other).
+    func scratchPointerOffset(side: DeckSide, offsetSecs: Double) {
+        guard let state = scratchStates[side] else { return }
+        let now = Date()
+        let dt = now.timeIntervalSince(state.lastEventAt)
+        let delta = offsetSecs - state.lastEventOffsetSecs
+        state.lastEventOffsetSecs = offsetSecs
+        state.lastEventAt = now
+
+        // First event after begin has `delta == 0` (offsetSecs is 0
+        // by definition at the drag's start). Skip the rate update
+        // — using `dt` here would compute a zero rate based on a
+        // potentially long gap since scratchBegin, and using the
+        // raw `delta` would compute a meaningless rate from an
+        // artificial zero baseline. The next event provides the
+        // first real velocity sample.
+        guard dt > 0, abs(delta) > 0 else { return }
+
+        // Reject impossible inter-event gaps. macOS occasionally
+        // batches multiple cursor events into one onChanged
+        // callback after a stall (e.g. the app was descheduled);
+        // those produce a huge delta over a near-zero dt that
+        // would saturate the rate clamp at ±8× on a single sample.
+        // Treat dt < 1 ms as "coalesced event" and use the most
+        // recent realistic dt instead.
+        let effectiveDt = max(dt, 0.001)
+        let instantRate = delta / effectiveDt
+        // EMA smoothing — see `scratchRateEMAAlpha` rationale.
+        let alpha = Self.scratchRateEMAAlpha
+        let smoothed =
+            alpha * instantRate + (1.0 - alpha) * state.smoothedRate
+        // Clamp to a sane range so a glitched event burst doesn't
+        // send the playhead off to lunch. ±8× is the upper bound
+        // a turntablist would ever hand-spin a platter at; the
+        // engine itself accepts wider but the resampler quality
+        // falls off past ~4×.
+        let clamped = max(-8.0, min(8.0, smoothed))
+        state.smoothedRate = clamped
+        try? engine.setDeckRate(
+            deckIdx: side.ffiDeckIdx,
+            rate: clamped)
+    }
+
+    /// End an in-flight scratch on `side`. Stops the watchdog
+    /// timer for this deck, sets rate back to 1.0, restores the
+    /// pre-scratch play / pause state, and cancels Panic Play if
+    /// we engaged it on `scratchBegin`. No-op on a side that
+    /// isn't currently scratching.
+    func scratchEnd(side: DeckSide) {
+        guard let state = scratchStates.removeValue(forKey: side) else { return }
+        // Restore the deck rate first so the brief window between
+        // here and the play / pause switch below renders at unity.
+        try? engine.setDeckRate(deckIdx: side.ffiDeckIdx, rate: 1.0)
+        if state.engagedPanic {
+            cancelPanic(side: side)
+        }
+        if !state.priorIsPlaying {
+            pause(side: side)
+        }
+        if scratchStates.isEmpty {
+            scratchTimer?.invalidate()
+            scratchTimer = nil
+        }
+    }
+
+    private func ensureScratchTimerRunning() {
+        if scratchTimer != nil { return }
+        let timer = Timer.scheduledTimer(
+            withTimeInterval: Self.scratchTickIntervalSecs, repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.scratchTick() }
+        }
+        // No tolerance — the watchdog catches cursor-still windows
+        // and needs predictable cadence to ramp the rate down on
+        // a known schedule.
+        RunLoop.main.add(timer, forMode: .common)
+        scratchTimer = timer
+    }
+
+    private func scratchTick() {
+        guard !scratchStates.isEmpty else {
+            scratchTimer?.invalidate()
+            scratchTimer = nil
+            return
+        }
+        let now = Date()
+        for (_, state) in scratchStates {
+            let stalledFor = now.timeIntervalSince(state.lastEventAt)
+            guard stalledFor > Self.scratchStallThresholdSecs else { continue }
+            // Cursor is still — ramp the rate toward zero. The
+            // multiplicative decay produces a brief audible
+            // run-out (matching how a real platter coasts after
+            // the DJ lifts their finger) rather than slamming to
+            // a hard zero, which the audio thread's own platter
+            // de-click would otherwise need to absorb in one
+            // block.
+            if state.smoothedRate == 0 { continue }
+            var next = state.smoothedRate * Self.scratchRateStallDecay
+            if abs(next) < 0.01 { next = 0 }
+            state.smoothedRate = next
+            try? engine.setDeckRate(
+                deckIdx: state.side.ffiDeckIdx,
+                rate: next)
+        }
+    }
+
+    /// Shared seek + optimistic UI update. Used by the overview's
+    /// click-to-jump (PRD §6.1) and the Casual-Play restart path.
+    /// Surfaces engine errors in the status strip rather than
+    /// throwing.
+    func seekDeck(side: DeckSide, absoluteSecs: TimeInterval) {
+        guard isRunning else { return }
+        let deck = state(for: side)
+        guard deck.hasTrack, deck.durationSecs > 0 else { return }
+        let clamped = max(0, min(deck.durationSecs, absoluteSecs))
+        do {
+            try engine.seek(deckIdx: side.ffiDeckIdx, positionSecs: clamped)
             var s = state(for: side)
-            s.elapsedSecs = target
+            s.elapsedSecs = clamped
+            s.remainingSecs = max(0, s.durationSecs - clamped)
             s.atEnd = false
             setState(s, for: side)
         } catch let error as EngineError {
             surfaceError(describe(error))
         } catch {
-            surfaceError("Scrub failed: \(error.localizedDescription)")
+            surfaceError("Seek failed: \(error.localizedDescription)")
         }
     }
 

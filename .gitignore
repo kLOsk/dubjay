@@ -45,6 +45,7 @@ fuzz/artifacts/
 # Local logs / dumps
 *.log
 crashes/
+.cursor/settings.json
 
 # Env / secrets
 .env
